@@ -1,3 +1,5 @@
+"use strict";
+
 const {
   executeWormholeCommand,
 } = require("./wormholeCommandHandlers");
@@ -26,3 +28,4 @@ module.exports = {
   WORMHOLE_HELP_LINES,
   executeWormholeCommand,
 };
+

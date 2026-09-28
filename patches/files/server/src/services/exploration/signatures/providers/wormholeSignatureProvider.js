@@ -1,3 +1,9 @@
+"use strict";
+
+const {
+  toFiniteNumber,
+} = require("../../../../common/numbers");
+
 const path = require("path");
 const crypto = require("crypto");
 
@@ -10,7 +16,7 @@ const targetIdRuntime = require(path.join(
   "../targetIdRuntime",
 ));
 const {
-  getStateSnapshot,
+  listPairsForSystem,
 } = require("../../wormholes/wormholeRuntimeState");
 
 const AU_METERS =
@@ -22,11 +28,6 @@ const ATTRIBUTE_SCAN_WORMHOLE_STRENGTH =
 function toInt(value, fallback = 0) {
   const numeric = Number(value);
   return Number.isFinite(numeric) ? Math.trunc(numeric) : fallback;
-}
-
-function toFiniteNumber(value, fallback = 0) {
-  const numeric = Number(value);
-  return Number.isFinite(numeric) ? numeric : fallback;
 }
 
 function cloneVector(vector = null) {
@@ -93,8 +94,7 @@ function listWormholeSignatureCandidates(systemID, options = {}) {
     return [];
   }
 
-  const snapshot = getStateSnapshot();
-  return Object.values(snapshot.pairsByID || {})
+  return listPairsForSystem(numericSystemID, { clone: false })
     .filter(
       (pair) =>
         String(pair && pair.state || "").trim().toLowerCase() === "active" &&
@@ -103,18 +103,17 @@ function listWormholeSignatureCandidates(systemID, options = {}) {
           Math.max(0, toInt(pair && pair.expiresAtMs, 0)) >= nowMs
         ),
     )
-    .flatMap((pair) => ([
-      {
+    .map((pair) => {
+      const source = pair && pair.source;
+      const destination = pair && pair.destination;
+      return {
         pairID: toInt(pair && pair.pairID, 0),
         pairKind: String(pair && pair.kind || "").trim().toLowerCase() || "static",
-        endpoint: pair && pair.source,
-      },
-      {
-        pairID: toInt(pair && pair.pairID, 0),
-        pairKind: String(pair && pair.kind || "").trim().toLowerCase() || "static",
-        endpoint: pair && pair.destination,
-      },
-    ]))
+        endpoint: toInt(source && source.systemID, 0) === numericSystemID
+          ? source
+          : destination,
+      };
+    })
     .filter(
       (entry) =>
         toInt(entry && entry.endpoint && entry.endpoint.systemID, 0) === numericSystemID &&
@@ -193,3 +192,4 @@ module.exports = {
   listSignatureSites,
   listWormholeSignatureCandidates,
 };
+

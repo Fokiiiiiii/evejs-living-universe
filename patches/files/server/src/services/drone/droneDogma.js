@@ -1,7 +1,17 @@
-const path = require("path");
+"use strict";
 
 const {
+  round6,
+  toFiniteNumber,
+  toInt,
+} = require("../../common/numbers");
+
+const path = require("path");
+
+const log = require(path.join(__dirname, "../../utils/logger"));
+const {
   getAttributeIDByNames,
+  getDynamicItemAttributeOverrides,
   getEffectTypeRecord,
   getLoadedChargeByFlag,
   getFittedModuleItems,
@@ -20,7 +30,10 @@ const {
 const {
   findItemById,
   findShipItemById,
-} = require(path.join(__dirname, "../inventory/itemStore"));
+} = require(path.join(__dirname, "../inventory/simulationInventoryProjection"));
+const {
+  resolveItemByTypeID,
+} = require(path.join(__dirname, "../inventory/itemTypeRegistry"));
 const {
   buildLocationModifiedAttributeMap,
   collectShipModifierAttributes,
@@ -63,9 +76,16 @@ const ATTRIBUTE_THERMAL_DAMAGE = getAttributeIDByNames("thermalDamage") || 118;
 const ATTRIBUTE_ENTITY_FLY_RANGE = getAttributeIDByNames("entityFlyRange") || 416;
 const ATTRIBUTE_ENTITY_ATTACK_RANGE = getAttributeIDByNames("entityAttackRange") || 72;
 const ATTRIBUTE_ENTITY_CHASE_MAX_DISTANCE =
-  getAttributeIDByNames("entityChaseMaxDistance") || 613;
-const ATTRIBUTE_ORBIT_RANGE = getAttributeIDByNames("orbitRange") || 4161;
+  getAttributeIDByNames("entityChaseMaxDistance") || 665;
+const ATTRIBUTE_ORBIT_RANGE = getAttributeIDByNames("orbitRange") || 157;
 const ATTRIBUTE_MINING_AMOUNT = getAttributeIDByNames("miningAmount") || 77;
+// Residue. The name lookup is what resolves these; the numeric fallbacks are the
+// IDs the SDE actually uses (3153/3154), NOT the 2865/2864 pair the mining
+// module path falls back to -- those are stale there and must not be copied.
+const ATTRIBUTE_MINING_WASTE_MULTIPLIER =
+  getAttributeIDByNames("miningWastedVolumeMultiplier") || 3153;
+const ATTRIBUTE_MINING_WASTE_PROBABILITY =
+  getAttributeIDByNames("miningWasteProbability") || 3154;
 const ATTRIBUTE_ACCESS_DIFFICULTY_BONUS =
   getAttributeIDByNames("accessDifficultyBonus") || 902;
 const ATTRIBUTE_SHIELD_BONUS = getAttributeIDByNames("shieldBonus") || 68;
@@ -73,6 +93,12 @@ const ATTRIBUTE_ARMOR_DAMAGE_AMOUNT =
   getAttributeIDByNames("armorDamageAmount") || 84;
 const ATTRIBUTE_STRUCTURE_DAMAGE_AMOUNT =
   getAttributeIDByNames("structureDamageAmount") || 83;
+
+// Mirrors DRONE_CATEGORY_ID / ITEM_FLAGS.DRONE_BAY in
+// simulationInventoryProjection / itemStore; duplicated here to keep this
+// tick-path module free of their heavier import graphs.
+const DRONE_CATEGORY_ID = 18;
+const DRONE_BAY_FLAG_ID = 87;
 
 const COMBAT_EFFECT_NAMES = new Set(["targetattack"]);
 const ECM_EFFECT_NAMES = new Set(["entityecmfalloff"]);
@@ -97,11 +123,6 @@ const REPAIR_EFFECT_DEFINITIONS = Object.freeze({
   }),
 });
 
-function toInt(value, fallback = 0) {
-  const numeric = Number(value);
-  return Number.isFinite(numeric) ? Math.trunc(numeric) : fallback;
-}
-
 function firstPositiveInt(...values) {
   for (const value of values) {
     const numeric = toInt(value, 0);
@@ -112,13 +133,26 @@ function firstPositiveInt(...values) {
   return 0;
 }
 
-function toFiniteNumber(value, fallback = 0) {
-  const numeric = Number(value);
-  return Number.isFinite(numeric) ? numeric : fallback;
-}
-
-function round6(value) {
-  return Number(toFiniteNumber(value, 0).toFixed(6));
+function resolveDroneOrbitAttribute(attributes, droneItem, fallbackValue) {
+  const itemOverrides = getDynamicItemAttributeOverrides(droneItem);
+  if (
+    Object.prototype.hasOwnProperty.call(
+      itemOverrides,
+      ATTRIBUTE_ENTITY_FLY_RANGE,
+    )
+  ) {
+    return toFiniteNumber(attributes[ATTRIBUTE_ENTITY_FLY_RANGE], fallbackValue);
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(itemOverrides, ATTRIBUTE_ORBIT_RANGE) &&
+    toFiniteNumber(attributes[ATTRIBUTE_ORBIT_RANGE], 0) > 0
+  ) {
+    return toFiniteNumber(attributes[ATTRIBUTE_ORBIT_RANGE], fallbackValue);
+  }
+  return toFiniteNumber(
+    attributes[ATTRIBUTE_ENTITY_FLY_RANGE],
+    toFiniteNumber(attributes[ATTRIBUTE_ORBIT_RANGE], fallbackValue),
+  );
 }
 
 function buildDamageVector(attributes = {}) {
@@ -141,6 +175,24 @@ function fingerprintText(value) {
     hash = Math.imul(hash, 0x01000193) >>> 0;
   }
   return `${text.length}:${hash.toString(36)}`;
+}
+
+function collectControllerAbyssalLocationModifierSources(controllerEntity) {
+  if (!controllerEntity || typeof controllerEntity !== "object") {
+    return [];
+  }
+  try {
+    // Lazy to avoid activity-service -> drone-runtime -> drone-dogma load cycles.
+    const abyssalMgrService = require("../../abyssal").weatherPolicy;
+    return typeof abyssalMgrService.collectAbyssalLocationModifierSourcesForEntity === "function"
+      ? abyssalMgrService.collectAbyssalLocationModifierSourcesForEntity(
+        controllerEntity,
+      )
+      : [];
+  } catch (_) {
+    // ignored: the Abyssal weather policy is not loaded in this process; no location modifiers
+    return [];
+  }
 }
 
 function resolveDroneDogmaItem(droneEntity) {
@@ -260,7 +312,11 @@ function peekCharacterRecord(charId) {
   return cachedPeekCharacterRecord(charId);
 }
 
-function buildControllerDogmaFingerprint(controllerEntity, fittedItems = []) {
+function buildControllerDogmaFingerprint(
+  controllerEntity,
+  fittedItems = [],
+  options = {},
+) {
   const shipID = toInt(controllerEntity && controllerEntity.itemID, 0);
   const controllerOwnerID = toInt(
     controllerEntity &&
@@ -322,8 +378,15 @@ function buildControllerDogmaFingerprint(controllerEntity, fittedItems = []) {
         .map((booster) => `${toInt(booster && booster.typeID, 0)}:${toInt(booster && booster.slot, 0)}`)
         .join(",")
       : "";
+  const abyssalLocationModifierFingerprint = fingerprintText(
+    JSON.stringify(
+      Array.isArray(options.abyssalLocationModifierSources)
+        ? options.abyssalLocationModifierSources
+        : [],
+    ),
+  );
   return [
-    "v2",
+    "v3",
     getDogmaInvalidationVersion(),
     getSkillMutationVersion(),
     getExpertSystemMutationVersion(),
@@ -332,6 +395,7 @@ function buildControllerDogmaFingerprint(controllerEntity, fittedItems = []) {
     activeEffectFingerprint,
     activeImplantFingerprint,
     activeBoosterFingerprint,
+    abyssalLocationModifierFingerprint,
   ].join("#");
 }
 
@@ -394,13 +458,33 @@ function endDogmaTick() {
   dogmaTickActive = false;
 }
 
-function getControllerDogmaContext(controllerEntity) {
+// Notified whenever a controller's drone stat cache is REBUILT because its
+// fingerprint changed (refit, module on/off, implant, booster, system, or a
+// server-wide dogma/skill version bump). The FIRST build — when drones
+// launch — does not notify: the launch primes already advertise the bonused
+// values. Registered by droneRuntime, which owns the client push; kept as a
+// callback so this module stays out of the droneRuntime require cycle.
+let controllerDogmaCacheRebuiltHandler = null;
+function setControllerDogmaCacheRebuiltHandler(handler) {
+  controllerDogmaCacheRebuiltHandler = typeof handler === "function" ? handler : null;
+}
+
+// Ship-derived changes must also reach idle drones, which do not resolve stats
+// during their normal ticks. Keep ships without a drone cache on the cheap path.
+function refreshControllerDroneDogma(controllerEntity) {
+  if (controllerEntity && controllerEntity.droneDogmaCache) {
+    getControllerDogmaContext(controllerEntity, { validateWithinTick: true });
+  }
+}
+
+function getControllerDogmaContext(controllerEntity, options = {}) {
   const controllerShipID = toInt(controllerEntity && controllerEntity.itemID, 0);
   if (controllerShipID <= 0) {
     return null;
   }
 
   if (
+    options.validateWithinTick !== true &&
     dogmaTickActive &&
     controllerEntity &&
     controllerEntity.droneDogmaCache &&
@@ -453,7 +537,13 @@ function getControllerDogmaContext(controllerEntity) {
       : controllerOwnerID > 0
       ? getFittedModuleItems(controllerOwnerID, controllerShipID)
       : [];
-  const fingerprint = buildControllerDogmaFingerprint(controllerEntity, fittedItems);
+  const abyssalLocationModifierSources =
+    collectControllerAbyssalLocationModifierSources(controllerEntity);
+  const fingerprint = buildControllerDogmaFingerprint(
+    controllerEntity,
+    fittedItems,
+    { abyssalLocationModifierSources },
+  );
   const cached =
     controllerEntity &&
     controllerEntity.droneDogmaCache &&
@@ -493,6 +583,7 @@ function getControllerDogmaContext(controllerEntity) {
     ...getLocationModifierSourcesForSystem(
       controllerEntity && controllerEntity.systemID,
     ),
+    ...abyssalLocationModifierSources,
   ];
   const nextCache = {
     fingerprint,
@@ -509,7 +600,24 @@ function getControllerDogmaContext(controllerEntity) {
     operationalByTypeID: new Map(),
   };
   nextCache.dogmaTickEpoch = dogmaTickEpoch;
+  const previousCache = controllerEntity.droneDogmaCache || null;
   controllerEntity.droneDogmaCache = nextCache;
+  if (previousCache && controllerDogmaCacheRebuiltHandler) {
+    // The stat inputs changed since the last build. droneRuntime
+    // re-advertises in-space drone dogma from this one notification, so a
+    // change is paid once per ship instead of being swept per drone per tick.
+    try {
+      controllerDogmaCacheRebuiltHandler(controllerEntity);
+    } catch (error) {
+      // Display-only refresh; never break the tick/launch path it rides on,
+      // but say so, or a broken refresh leaves launched-drone tooltips stale
+      // with nothing in the logs.
+      log.warn(
+        `[DroneDogma] Drone tooltip refresh failed after a stat cache rebuild ` +
+          `ship=${controllerShipID}: ${error && error.message || error || "UNKNOWN_ERROR"}`,
+      );
+    }
+  }
   return nextCache;
 }
 
@@ -570,6 +678,13 @@ function buildDroneOperationalAttributes(droneEntity, controllerEntity) {
     context.activeModuleContexts,
     {
       additionalLocationModifierSources: context.additionalLocationModifierSources,
+      // A drone is the character's entity, not part of the ship's attribute
+      // location: it takes `charID` modifiers and no `shipID` ones. Without
+      // this, ship-MODULE skills that a drone happens to require leak in —
+      // Signal Dispersion put +25 % on ECM drone jam strength, Mining +
+      // Astrogeology +56 % on mining-drone yield, Salvaging +150 % on a
+      // salvage drone's access bonus.
+      ownedEntityTarget: true,
     },
   );
   if (!attributes || Object.keys(attributes).length === 0) {
@@ -586,6 +701,233 @@ function resolveDroneOperationalAttributes(droneEntity, controllerEntity) {
   return operational ? operational.attributes : null;
 }
 
+// ---------------------------------------------------------------------------
+// Tooltip-grade drone attribute resolution
+//
+// A drone tooltip must show the operational (skill/ship/module-bonused) map
+// whether the drone sits in a drone bay or is already launched into space.
+// Both tooltip paths — dogma ItemGetInfo / QueryAllAttributes (dogmaService)
+// and the OnGodmaPrimeItem pushes (invBrokerService, droneRuntime) — resolve
+// through resolveDroneTooltipAttributes so they cannot drift. A launched
+// drone item lives in the solar system (flagID 0, locationID = systemID) and
+// names its controlling ship on launcherID, which is how the controller is
+// found once the drone-bay flag no longer identifies it.
+// ---------------------------------------------------------------------------
+
+function isDroneCategoryItem(item) {
+  if (!item) {
+    return false;
+  }
+  const categoryID = toInt(item.categoryID, 0);
+  if (categoryID > 0) {
+    return categoryID === DRONE_CATEGORY_ID;
+  }
+  const typeID = toInt(item.typeID, 0);
+  if (typeID <= 0) {
+    return false;
+  }
+  const typeRecord = resolveItemByTypeID(typeID);
+  return Boolean(
+    typeRecord && toInt(typeRecord.categoryID, 0) === DRONE_CATEGORY_ID,
+  );
+}
+
+let cachedSpaceRuntimeModule = null;
+function getSpaceRuntimeModule() {
+  if (!cachedSpaceRuntimeModule) {
+    // Lazy: a top-level require of space/runtime here would drag the whole
+    // scene machinery (and back into droneRuntime) into droneDogma's load
+    // order before its own exports exist.
+    cachedSpaceRuntimeModule = require(path.join(__dirname, "../../space/runtime"));
+  }
+  return cachedSpaceRuntimeModule;
+}
+
+function resolveSceneForSession(session) {
+  if (!session) {
+    return null;
+  }
+  const spaceRuntime = getSpaceRuntimeModule();
+  if (!spaceRuntime || typeof spaceRuntime.getSceneForSession !== "function") {
+    return null;
+  }
+  try {
+    return spaceRuntime.getSceneForSession(session);
+  } catch (error) {
+    // ignored: a session whose scene cannot be read has no scene (null)
+    return null;
+  }
+}
+
+function resolveRuntimeControllerShipEntity(session, controllerShipID, options = {}) {
+  if (toInt(controllerShipID, 0) <= 0) {
+    return null;
+  }
+  if (
+    options.controllerEntity &&
+    toInt(options.controllerEntity.itemID, 0) === toInt(controllerShipID, 0)
+  ) {
+    return options.controllerEntity;
+  }
+  const scene = options.scene || resolveSceneForSession(session);
+  if (!scene || typeof scene.getEntityByID !== "function") {
+    return null;
+  }
+  const sceneEntity = scene.getEntityByID(controllerShipID);
+  return sceneEntity && sceneEntity.kind === "ship" ? sceneEntity : null;
+}
+
+function resolveDroneTooltipAttributes(item, session = null, options = {}) {
+  if (!item || !isDroneCategoryItem(item)) {
+    return null;
+  }
+
+  const itemFlagID = toInt(item.flagID, 0);
+  let controllerShipID = toInt(options.controllerShipID, 0);
+  if (controllerShipID <= 0) {
+    if (itemFlagID === DRONE_BAY_FLAG_ID) {
+      controllerShipID = toInt(item.locationID, 0);
+    } else if (itemFlagID === 0) {
+      controllerShipID = toInt(item.launcherID, 0);
+    }
+  }
+  if (controllerShipID <= 0) {
+    return null;
+  }
+
+  const charID = firstPositiveInt(
+    item.ownerID,
+    options.characterID,
+    session && (session.characterID ?? session.charid),
+  );
+  if (charID <= 0) {
+    return null;
+  }
+
+  const shipItem =
+    findShipItemById(controllerShipID) || findItemById(controllerShipID);
+  if (!shipItem) {
+    return null;
+  }
+
+  const runtimeShipEntity = resolveRuntimeControllerShipEntity(
+    session,
+    controllerShipID,
+    options,
+  );
+  const systemID = firstPositiveInt(
+    runtimeShipEntity && runtimeShipEntity.systemID,
+    session && (
+      session.solarsystemid2 ??
+      session.solarsystemid ??
+      (session._space && session._space.systemID)
+    ),
+    shipItem.spaceState && shipItem.spaceState.systemID,
+  );
+  // Resolve against the LIVE runtime ship when one exists: getControllerDogmaContext
+  // stores its rebuilt context cache on the object it is handed, so a copy here
+  // would make every drone re-resolve (and re-pay) the whole ship context. The
+  // live entity is read as-is: a ship whose identity fields were empty would
+  // resolve empty skills on the combat/mining snapshot paths too, and patching
+  // identity here would make the tooltip diverge from the simulation.
+  const controllerEntity = runtimeShipEntity || {
+    // No live ship in space (pilot docked, item-query path): a synthetic
+    // controller stands in. Its context cache is necessarily throwaway —
+    // there is no live entity to hang it on — which this infrequent query
+    // path already tolerated.
+    kind: "ship",
+    itemID: controllerShipID,
+    typeID: toInt(shipItem.typeID, 0),
+    ownerID: charID,
+    characterID: charID,
+    pilotCharacterID: charID,
+    session: session || null,
+    systemID,
+    // Empty, never stale: without a live ship there are no running-module
+    // projections to carry (the Industrial Core's charID-domain rows ride
+    // the live entity's map instead).
+    activeModuleEffects: new Map(),
+  };
+  const droneEntity = {
+    ...item,
+    kind: "drone",
+    ownerID: charID,
+    locationID: controllerShipID,
+    systemID,
+  };
+  return resolveDroneOperationalAttributes(droneEntity, controllerEntity);
+}
+
+// Deterministic identity of a resolved tooltip attribute map. The push path
+// compares this against what the client last received, so an irrelevant
+// fingerprint change (another character's refit, a module with no drone
+// modifiers cycling) costs one string compare and zero primes.
+function buildDroneTooltipAttributeStamp(attributes) {
+  if (!attributes) {
+    return "";
+  }
+  const parts = [];
+  for (const key of Object.keys(attributes).sort((a, b) => Number(a) - Number(b))) {
+    const value = attributes[key];
+    parts.push(
+      key + ":" + (value === null || value === undefined ? "" : String(value)),
+    );
+  }
+  return parts.join("|");
+}
+
+// The ECM half of a drone, in one place, so the pure-ECM drones and the faction
+// hybrids that also carry `targetAttack` cannot drift apart.
+//
+// `entityECMFalloff` (6695) declares NO falloffAttributeID — despite the name —
+// so a drone jam is a hard cutoff at `ECMRangeOptimal` (936), the same shape a
+// burst jammer has. The two durations are genuinely different attributes:
+// `ECMDuration` (929, 20 s) is the drone's own cycle, and `ecmJamDuration`
+// (2822, 5 s) is how long the victim stays jammed. Strength comes from the four
+// `scan*StrengthBonus` attributes (238-241), which every ECM drone declares
+// equal — every ECM drone is multispectral, with no racial matchup.
+function buildDroneJammerPayload(attributes, jammerEffectRecord) {
+  return {
+    effectID: toInt(jammerEffectRecord.effectID, 0),
+    effectName: String(jammerEffectRecord.name || ""),
+    effectGUID: String(jammerEffectRecord.guid || ""),
+    durationMs: Math.max(
+      1,
+      round6(toFiniteNumber(attributes[jammerEffectRecord.durationAttributeID], 20_000)),
+    ),
+    jamDurationMs: Math.max(
+      1,
+      round6(toFiniteNumber(attributes[ATTRIBUTE_ECM_JAM_DURATION], 5_000)),
+    ),
+    optimalRange: Math.max(
+      0,
+      round6(toFiniteNumber(attributes[jammerEffectRecord.rangeAttributeID], 0)),
+    ),
+    falloff: Math.max(
+      0,
+      round6(toFiniteNumber(attributes[jammerEffectRecord.falloffAttributeID], 0)),
+    ),
+    jammerStrengthBySensorType: Object.freeze({
+      gravimetric: Math.max(
+        0,
+        round6(toFiniteNumber(attributes[ATTRIBUTE_SCAN_GRAVIMETRIC_STRENGTH_BONUS], 0)),
+      ),
+      ladar: Math.max(
+        0,
+        round6(toFiniteNumber(attributes[ATTRIBUTE_SCAN_LADAR_STRENGTH_BONUS], 0)),
+      ),
+      magnetometric: Math.max(
+        0,
+        round6(toFiniteNumber(attributes[ATTRIBUTE_SCAN_MAGNETOMETRIC_STRENGTH_BONUS], 0)),
+      ),
+      radar: Math.max(
+        0,
+        round6(toFiniteNumber(attributes[ATTRIBUTE_SCAN_RADAR_STRENGTH_BONUS], 0)),
+      ),
+    }),
+  };
+}
+
 function resolveDroneCombatSnapshot(droneEntity, controllerEntity) {
   const context = getControllerDogmaContext(controllerEntity);
   const droneItem = resolveDroneDogmaItem(droneEntity);
@@ -600,9 +942,14 @@ function resolveDroneCombatSnapshot(droneEntity, controllerEntity) {
   }
 
   const effectRecord = resolveDroneEffectRecord(typeID, COMBAT_EFFECT_NAMES);
-  const jammerEffectRecord = effectRecord
-    ? null
-    : resolveDroneEffectRecord(typeID, ECM_EFFECT_NAMES);
+  // `targetAttack` and `entityECMFalloff` are not alternatives. The three
+  // published faction ECM drones — Inshore EC-300-I (92039), Nertic EC-600-I
+  // (92040) and Humboldt EC-900-I (92041) — declare BOTH, and their own SDE
+  // description says so: "the combat chassis of this light drone has been
+  // adapted to ALSO house ECM". Resolving the combat effect first and then
+  // refusing to look for the jammer left half the published ECM-drone roster
+  // shooting and never jamming.
+  const jammerEffectRecord = resolveDroneEffectRecord(typeID, ECM_EFFECT_NAMES);
   if (!effectRecord && !jammerEffectRecord) {
     context.combatByTypeID.set(cacheKey, null);
     return null;
@@ -631,32 +978,15 @@ function resolveDroneCombatSnapshot(droneEntity, controllerEntity) {
     return null;
   }
 
-  if (jammerEffectRecord) {
-    const durationMs = Math.max(
-      1,
-      round6(toFiniteNumber(attributes[jammerEffectRecord.durationAttributeID], 20_000)),
-    );
-    const optimalRange = Math.max(
-      0,
-      round6(toFiniteNumber(attributes[jammerEffectRecord.rangeAttributeID], 0)),
-    );
-    const falloff = Math.max(
-      0,
-      round6(
-        toFiniteNumber(
-          attributes[jammerEffectRecord.falloffAttributeID],
-          0,
-        ),
-      ),
-    );
+  const jammerPayload = jammerEffectRecord
+    ? buildDroneJammerPayload(attributes, jammerEffectRecord)
+    : null;
+
+  if (jammerEffectRecord && !effectRecord) {
+    const { durationMs, optimalRange, falloff } = jammerPayload;
     const orbitDistanceMeters = Math.max(
       500,
-      round6(
-        toFiniteNumber(
-          attributes[ATTRIBUTE_ENTITY_FLY_RANGE],
-          toFiniteNumber(attributes[ATTRIBUTE_ORBIT_RANGE], 500),
-        ),
-      ),
+      round6(resolveDroneOrbitAttribute(attributes, droneItem, 500)),
     );
     const attackRangeMeters = Math.max(
       optimalRange,
@@ -672,38 +1002,11 @@ function resolveDroneCombatSnapshot(droneEntity, controllerEntity) {
       ),
     );
     const snapshot = {
-      effectID: toInt(jammerEffectRecord.effectID, 0),
-      effectName: String(jammerEffectRecord.name || ""),
-      effectGUID: String(jammerEffectRecord.guid || ""),
+      ...jammerPayload,
       effectKind: "jammer",
-      durationMs,
-      jamDurationMs: Math.max(
-        1,
-        round6(toFiniteNumber(attributes[ATTRIBUTE_ECM_JAM_DURATION], 5_000)),
-      ),
-      optimalRange,
-      falloff,
       orbitDistanceMeters,
       attackRangeMeters,
       chaseRangeMeters,
-      jammerStrengthBySensorType: Object.freeze({
-        gravimetric: Math.max(
-          0,
-          round6(toFiniteNumber(attributes[ATTRIBUTE_SCAN_GRAVIMETRIC_STRENGTH_BONUS], 0)),
-        ),
-        ladar: Math.max(
-          0,
-          round6(toFiniteNumber(attributes[ATTRIBUTE_SCAN_LADAR_STRENGTH_BONUS], 0)),
-        ),
-        magnetometric: Math.max(
-          0,
-          round6(toFiniteNumber(attributes[ATTRIBUTE_SCAN_MAGNETOMETRIC_STRENGTH_BONUS], 0)),
-        ),
-        radar: Math.max(
-          0,
-          round6(toFiniteNumber(attributes[ATTRIBUTE_SCAN_RADAR_STRENGTH_BONUS], 0)),
-        ),
-      }),
     };
     context.combatByTypeID.set(cacheKey, snapshot);
     return snapshot;
@@ -741,12 +1044,7 @@ function resolveDroneCombatSnapshot(droneEntity, controllerEntity) {
   );
   const orbitDistanceMeters = Math.max(
     0,
-    round6(
-      toFiniteNumber(
-        attributes[ATTRIBUTE_ENTITY_FLY_RANGE],
-        toFiniteNumber(attributes[ATTRIBUTE_ORBIT_RANGE], 500),
-      ),
-    ),
+    round6(resolveDroneOrbitAttribute(attributes, droneItem, 500)),
   );
   const attackRangeMeters = Math.max(
     0,
@@ -781,6 +1079,9 @@ function resolveDroneCombatSnapshot(droneEntity, controllerEntity) {
     orbitDistanceMeters,
     attackRangeMeters,
     chaseRangeMeters,
+    // A faction hybrid runs its jammer on its OWN 20 s cycle, independent of the
+    // 4 s turret cycle above; the two share only the target.
+    ...(jammerPayload ? { jammer: Object.freeze(jammerPayload) } : {}),
   };
   context.combatByTypeID.set(cacheKey, snapshot);
   return snapshot;
@@ -836,18 +1137,27 @@ function resolveDroneMiningSnapshot(droneEntity, controllerEntity) {
     effectGUID: String(effectRecord.guid || ""),
     durationMs,
     miningAmountM3,
+    // Residue, read the same way the mining module snapshot reads it
+    // (services/mining/miningDogma.js): a raw percentage for the probability,
+    // a multiplier on the cycle's volume for the amount. Mining drones carry
+    // both in the SDE -- 34 % on a Mining Drone II, 60 % on an Excavator, all
+    // with a 1.0 multiplier -- and Mining Drone I carries 0, so an unpublished
+    // or residue-free drone still wastes nothing.
+    wasteVolumeMultiplier: Math.max(
+      0,
+      round6(toFiniteNumber(attributes[ATTRIBUTE_MINING_WASTE_MULTIPLIER], 0)),
+    ),
+    wasteProbability: Math.max(
+      0,
+      round6(toFiniteNumber(attributes[ATTRIBUTE_MINING_WASTE_PROBABILITY], 0)),
+    ),
     maxRangeMeters: Math.max(
       0,
       round6(toFiniteNumber(attributes[ATTRIBUTE_MAX_RANGE], 0)),
     ),
     orbitDistanceMeters: Math.max(
       0,
-      round6(
-        toFiniteNumber(
-          attributes[ATTRIBUTE_ORBIT_RANGE],
-          toFiniteNumber(attributes[ATTRIBUTE_ENTITY_FLY_RANGE], 200),
-        ),
-      ),
+      round6(resolveDroneOrbitAttribute(attributes, droneItem, 200)),
     ),
   };
   context.miningByTypeID.set(cacheKey, snapshot);
@@ -910,12 +1220,7 @@ function resolveDroneSalvageSnapshot(droneEntity, controllerEntity) {
     ),
     orbitDistanceMeters: Math.max(
       0,
-      round6(
-        toFiniteNumber(
-          attributes[ATTRIBUTE_ORBIT_RANGE],
-          toFiniteNumber(attributes[ATTRIBUTE_ENTITY_FLY_RANGE], 500),
-        ),
-      ),
+      round6(resolveDroneOrbitAttribute(attributes, droneItem, 500)),
     ),
   };
   context.salvageByTypeID.set(cacheKey, snapshot);
@@ -981,12 +1286,7 @@ function resolveDroneRepairSnapshot(droneEntity, controllerEntity) {
   );
   const orbitDistanceMeters = Math.max(
     0,
-    round6(
-      toFiniteNumber(
-        attributes[ATTRIBUTE_ORBIT_RANGE],
-        toFiniteNumber(attributes[ATTRIBUTE_ENTITY_FLY_RANGE], 500),
-      ),
-    ),
+    round6(resolveDroneOrbitAttribute(attributes, droneItem, 500)),
   );
   const attackRangeMeters = Math.max(
     orbitDistanceMeters,
@@ -1021,8 +1321,12 @@ function resolveDroneRepairSnapshot(droneEntity, controllerEntity) {
 
 module.exports = {
   beginDogmaTick,
+  refreshControllerDroneDogma,
   endDogmaTick,
   resolveDroneOperationalAttributes,
+  resolveDroneTooltipAttributes,
+  buildDroneTooltipAttributeStamp,
+  setControllerDogmaCacheRebuiltHandler,
   resolveDroneCombatSnapshot,
   resolveDroneMiningSnapshot,
   resolveDroneSalvageSnapshot,
@@ -1034,5 +1338,6 @@ module.exports = {
     resolveDroneDogmaItem,
     sumDamageVector,
     buildControllerDogmaFingerprint,
+    isDroneCategoryItem,
   },
 };

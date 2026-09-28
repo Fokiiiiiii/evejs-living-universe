@@ -50,23 +50,13 @@ if errorlevel 1 exit /b 1
 call :EnsureServerDependencies
 if errorlevel 1 exit /b 1
 
+echo   Are you also playing on this machine?
+echo.
+echo     [1] Server only  -  just run the server
+echo     [2] Server + Play -  run the server AND launch the game
+echo.
 set "PLAY_CHOICE=0"
-set "EVEJS_BACKGROUND_SERVER=0"
-if /i "%~1"=="--background" (
-  set "PLAY_CHOICE=1"
-  set "EVEJS_BACKGROUND_SERVER=1"
-) else if /i "%~1"=="--server-only" (
-  set "PLAY_CHOICE=1"
-) else if /i "%~1"=="--server-play" (
-  set "PLAY_CHOICE=2"
-) else (
-  echo   Are you also playing on this machine?
-  echo.
-  echo     [1] Server only  -  just run the server
-  echo     [2] Server + Play -  run the server AND launch the game
-  echo.
-  set /p "PLAY_CHOICE=  Choose [1/2]: "
-)
+set /p "PLAY_CHOICE=  Choose [1/2]: "
 
 echo.
 
@@ -79,7 +69,6 @@ if "%PLAY_CHOICE%"=="2" (
 
 set "EVEJS_PROXY_LOCAL_INTERCEPT=1"
 if not exist "%EVEJS_REPO_ROOT%\server\logs\node-reports" mkdir "%EVEJS_REPO_ROOT%\server\logs\node-reports" >nul 2>&1
-
 call :EnsureMarketServer
 if errorlevel 1 exit /b 1
 
@@ -94,7 +83,6 @@ if "%PLAY_CHOICE%"=="2" (
 
   echo   Launching Play.bat...
   echo.
-  set "EVEJS_SERVER_START_IN_PROGRESS=1"
   call "%EVEJS_REPO_ROOT%\Play.bat"
 ) else (
   echo   Starting server...
@@ -127,18 +115,15 @@ if not exist "%EVEJS_MARKET_BOOTSTRAP%" (
   echo.
   echo   [ERROR] Living Universe market bootstrap is missing:
   echo       %EVEJS_MARKET_BOOTSTRAP%
-  if "%EVEJS_BACKGROUND_SERVER%"=="0" pause
+  pause
   exit /b 1
 )
-
 powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%EVEJS_MARKET_BOOTSTRAP%" -RepoRoot "%EVEJS_REPO_ROOT%"
 set "EVEJS_MARKET_EXIT=!errorlevel!"
 if not "!EVEJS_MARKET_EXIT!"=="0" (
   echo.
   echo   [ERROR] Living Universe market startup failed with code !EVEJS_MARKET_EXIT!.
-  echo       First launch requires Rust and Visual Studio C++ Build Tools.
-  echo       If they are missing, run tools\InstallRustForMarket.bat once.
-  if "%EVEJS_BACKGROUND_SERVER%"=="0" pause
+  pause
   exit /b !EVEJS_MARKET_EXIT!
 )
 exit /b 0

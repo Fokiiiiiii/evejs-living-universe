@@ -1,3 +1,9 @@
+"use strict";
+
+const {
+  toFiniteNumber,
+} = require("../../common/numbers");
+
 const path = require("path");
 
 const config = require(path.join(__dirname, "../../config"));
@@ -17,6 +23,9 @@ const {
 const {
   buildDefinitionsForSpawnGroup,
 } = require(path.join(__dirname, "../../space/npc/npcSelection"));
+const {
+  ICE_MINING_POOL_ID,
+} = require(path.join(__dirname, "../../space/npc/miningNpcCatalog"));
 const {
   buildShipResourceState,
   getAttributeIDByNames,
@@ -47,6 +56,8 @@ const {
 } = require("./miningRuntimeState");
 const {
   buildMiningModuleSnapshot,
+  isMiningEffectRecord,
+  resolveMiningFamily,
 } = require("./miningDogma");
 const {
   resolveAggressorStandingProfile,
@@ -70,6 +81,7 @@ const DEFAULT_MINING_FLEET_QUERY_BY_BAND = Object.freeze({
   lowsec: "npc_mining_ops_lowsec",
   nullsec: "npc_mining_ops_nullsec",
 });
+const DEFAULT_ICE_MINING_FLEET_QUERY = ICE_MINING_POOL_ID;
 const DEFAULT_MINING_RESPONSE_QUERY = "npc_laser_hostiles";
 const DEFAULT_MINING_HAULER_QUERY = "npc_mining_hauler_highsec";
 const DEFAULT_MINING_HAULER_QUERY_BY_BAND = Object.freeze({
@@ -89,29 +101,24 @@ const DEFAULT_MINING_HAULER_INITIAL_DELAY_MS = 5_400_000;
 const DEFAULT_MINING_HAULER_REPEAT_DELAY_MS = 1_800_000;
 const DEFAULT_MINING_MINER_CARGO_CAPACITY_M3 = 35_000;
 const DEFAULT_MINING_HAULER_CARGO_CAPACITY_M3 = 65_000;
+const DEFAULT_MANAGED_MINING_DEFENSE_MAX_ACTIVE_DRONES = 20;
+const DEFAULT_MANAGED_MINING_DEFENSE_MAX_BOUNTY_ISK = 30_000;
+const DEFAULT_MANAGED_MINING_DEFENSE_REQUIRED_OVERMATCH = 3;
+const DEFAULT_MANAGED_MINING_DEFENSE_RETREAT_COOLDOWN_MS = 30_000;
+const DEFAULT_MANAGED_MINING_DEFENSE_RETREAT_SHIELD_RATIO = 0.65;
+const DEFAULT_MANAGED_MINING_DEFENSE_SCAN_INTERVAL_MS = 5_000;
+const DEFAULT_MANAGED_MINING_DEFENSE_SCAN_RANGE_METERS = 100_000;
 const DEFAULT_MINING_JETCAN_CAPACITY_M3 = 27_500;
 const DEFAULT_MINING_JETCAN_LIFETIME_MS = 2 * 60 * 60 * 1000;
 const DEFAULT_MINING_SUPPORT_PICKUP_RANGE_METERS = 2_500;
 const DEFAULT_MINING_SUPPORT_PICKUP_SETTLE_MS = 8_000;
-const MINING_JETTISON_EFFECT_GUID = "effects.Jettison";
-const MINING_TRACTOR_EFFECT_NAME = "tractorBeamCan";
-const MINING_JETCAN_DESTRUCTION_EFFECT_ID = 3;
-const DEFAULT_MINING_AGGRESSION_MEMORY_MS = 180_000;
-const DEFAULT_MINING_RESPONSE_COOLDOWN_MS = 60_000;
-const DEFAULT_MINING_RESPONSE_RETREAT_DELAY_MS = 120_000;
 const FLEET_HANGAR_CAPACITY_ATTRIBUTE_ID =
   getAttributeIDByNames("fleetHangarCapacity") || 912;
-const MINING_CARGO_FULL_EPSILON_M3 = 0.000001;
-const DEFAULT_MANAGED_MINING_DEFENSE_REQUIRED_OVERMATCH = 3;
-const DEFAULT_MANAGED_MINING_DEFENSE_MAX_BOUNTY_ISK = 30_000;
-const DEFAULT_MANAGED_MINING_DEFENSE_RETREAT_SHIELD_RATIO = 0.65;
-const DEFAULT_MANAGED_MINING_DEFENSE_MAX_ACTIVE_DRONES = 20;
-const DEFAULT_MANAGED_MINING_DEFENSE_SCAN_RANGE_METERS = 100_000;
-const DEFAULT_MANAGED_MINING_DEFENSE_SCAN_INTERVAL_MS = 5_000;
-const DEFAULT_MANAGED_MINING_DEFENSE_RETREAT_COOLDOWN_MS = 30_000;
-const MINING_FLEET_COMMAND_BURST_AFFINITY_BASE = 1_500_000_000;
-const MANAGED_MINING_DEFENSE_REJECTED_NAME_PATTERN =
-  /\b(?:dread|elite|commander|officer|overseer|deadspace|capital|battleship|battlecruiser|cruiser)\b/i;
+const MANAGED_INDUSTRIAL_CREW_ROLES = new Set([
+  "miner",
+  "mining_support",
+  "hauler",
+]);
 const MANAGED_MINING_DEFENSE_HOSTILE_UTILITY_GROUP_IDS =
   new Set([
     52, // Warp scramblers/disruptors.
@@ -121,15 +128,35 @@ const MANAGED_MINING_DEFENSE_HOSTILE_UTILITY_GROUP_IDS =
     201, // ECM.
     379, // Target painters.
   ]);
-const MANAGED_INDUSTRIAL_CREW_ROLES = new Set([
-  "miner",
-  "mining_support",
-  "hauler",
-]);
+const MANAGED_MINING_DEFENSE_REJECTED_NAME_PATTERN =
+  /\b(?:dread|elite|commander|officer|overseer|deadspace|capital|battleship|battlecruiser|cruiser)\b/i;
+const MINING_CARGO_FULL_EPSILON_M3 = 0.000001;
+const MINING_FLEET_COMMAND_BURST_AFFINITY_BASE = 1_500_000_000;
+const MINING_JETCAN_DESTRUCTION_EFFECT_ID = 3;
+const MINING_JETTISON_EFFECT_GUID = "effects.Jettison";
+const MINING_TRACTOR_EFFECT_NAME = "tractorBeamCan";
+const miningCargoCapacitySnapshotByEntity = new WeakMap();
+const DEFAULT_MINING_AGGRESSION_MEMORY_MS = 180_000;
+const DEFAULT_MINING_RESPONSE_COOLDOWN_MS = 60_000;
+const DEFAULT_MINING_RESPONSE_RETREAT_DELAY_MS = 120_000;
+const MINING_FLEET_THINK_INTERVAL_MS = 1_000;
+const MINING_FLEET_LIFETIME_MS = 7_200_000; // 2 hours, then the fleet warps off grid and despawns
+const MINING_RANGE_BUFFER_METERS = 500;
+const MINING_ORBIT_DISTANCE_METERS = 1_000;
+const MINING_TARGET_CLAIM_PENALTY_METERS = 7_500;
+const MINING_HAULER_LANDING_RADIUS_METERS = 750;
+const MINING_NPC_CARGO_CAPACITY_M3_BY_TYPE_ID = Object.freeze({
+  32880: 5_000, // Venture
+  17480: 12_000, // Procurer
+  17478: 10_000, // Retriever
+  17476: 7_000, // Covetor
+  22546: 10_000, // Skiff
+  22548: 35_000, // Mackinaw
+  22544: 8_000, // Hulk
+});
 
 const miningFleetStateByID = new Map();
 const startupSceneSeedSet = new Set();
-const miningCargoCapacitySnapshotByEntity = new WeakMap();
 let nextMiningFleetID = 1;
 
 function toInt(value, fallback = 0) {
@@ -137,9 +164,17 @@ function toInt(value, fallback = 0) {
   return Number.isFinite(numeric) ? Math.trunc(numeric) : fallback;
 }
 
-function toFiniteNumber(value, fallback = 0) {
-  const numeric = Number(value);
-  return Number.isFinite(numeric) ? numeric : fallback;
+function normalizeMiningResourceKind(value, fallback = null) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return normalized === "ore" || normalized === "ice" || normalized === "gas"
+    ? normalized
+    : fallback;
+}
+
+function getSceneClockMs(scene) {
+  return scene && typeof scene.getCurrentSimTimeMs === "function"
+    ? toFiniteNumber(scene.getCurrentSimTimeMs(), Date.now())
+    : Date.now();
 }
 
 function distance(left, right) {
@@ -156,1559 +191,6 @@ function getSurfaceDistance(left, right) {
       toFiniteNumber(left && left.radius, 0) -
       toFiniteNumber(right && right.radius, 0),
   );
-}
-
-function cloneVector(source = null, fallback = { x: 0, y: 0, z: 0 }) {
-  return {
-    x: toFiniteNumber(source && source.x, fallback.x),
-    y: toFiniteNumber(source && source.y, fallback.y),
-    z: toFiniteNumber(source && source.z, fallback.z),
-  };
-}
-
-function normalizeVector(source = null, fallback = { x: 1, y: 0, z: 0 }) {
-  const vector = cloneVector(source, fallback);
-  const length = Math.sqrt(
-    (vector.x ** 2) + (vector.y ** 2) + (vector.z ** 2),
-  );
-  if (!Number.isFinite(length) || length <= 0) {
-    return cloneVector(fallback);
-  }
-  return {
-    x: vector.x / length,
-    y: vector.y / length,
-    z: vector.z / length,
-  };
-}
-
-function getSpaceRuntime() {
-  return require(path.join(__dirname, "../../space/runtime"));
-}
-
-function getManagedDroneRuntime() {
-  return require(path.join(__dirname, "../drone/droneRuntime"));
-}
-
-function isManagedIndustrialMiningFleet(fleetRecord) {
-  return Boolean(
-    fleetRecord &&
-    String(fleetRecord.operatorKind || "").trim() &&
-    String(fleetRecord.operatorID || "").trim(),
-  );
-}
-
-function normalizeManagedThreatDoctrine(source = {}) {
-  const doctrine =
-    source && typeof source === "object"
-      ? source
-      : {};
-  return {
-    requiredCrewOvermatch: Math.max(
-      1,
-      toFiniteNumber(
-        doctrine.requiredCrewOvermatch,
-        toFiniteNumber(
-          config.miningNpcManagedDefenseRequiredOvermatch,
-          DEFAULT_MANAGED_MINING_DEFENSE_REQUIRED_OVERMATCH,
-        ),
-      ),
-    ),
-    maximumThreatBountyISK: Math.max(
-      0,
-      toFiniteNumber(
-        doctrine.maximumThreatBountyISK,
-        toFiniteNumber(
-          config.miningNpcManagedDefenseMaxBountyISK,
-          DEFAULT_MANAGED_MINING_DEFENSE_MAX_BOUNTY_ISK,
-        ),
-      ),
-    ),
-    projectedCasualtyProbabilityCeiling: Math.max(
-      0,
-      toFiniteNumber(
-        doctrine.projectedCasualtyProbabilityCeiling,
-        0.01,
-      ),
-    ),
-  };
-}
-
-function getManagedFleetOwnerCharacterID(fleetRecord) {
-  return normalizePositiveInteger(
-    fleetRecord &&
-      (
-        fleetRecord.createdByCharacterID ||
-        fleetRecord.cargoOwnerID
-      ),
-    0,
-  );
-}
-
-function listCoLocatedManagedIndustrialFleets(
-  scene,
-  fleetRecord,
-) {
-  if (
-    !scene ||
-    !isManagedIndustrialMiningFleet(fleetRecord)
-  ) {
-    return [fleetRecord].filter(Boolean);
-  }
-  const ownerCharacterID =
-    getManagedFleetOwnerCharacterID(fleetRecord);
-  const systemID = normalizePositiveInteger(
-    fleetRecord.systemID || scene.systemID,
-    0,
-  );
-  const siteID = normalizePositiveInteger(
-    fleetRecord.targetShipID,
-    0,
-  );
-  if (!(ownerCharacterID > 0) || !(siteID > 0)) {
-    return [fleetRecord];
-  }
-  return [...miningFleetStateByID.values()]
-    .filter((candidate) => (
-      isManagedIndustrialMiningFleet(candidate) &&
-      getManagedFleetOwnerCharacterID(candidate) ===
-        ownerCharacterID &&
-      normalizePositiveInteger(candidate.systemID, 0) ===
-        systemID &&
-      normalizePositiveInteger(candidate.targetShipID, 0) ===
-        siteID &&
-      ["mining", "defending"].includes(
-        String(candidate.state || ""),
-      ) &&
-      getFleetEntities(scene, candidate).length > 0
-    ))
-    .sort(
-      (left, right) =>
-        toInt(left.fleetID, 0) -
-        toInt(right.fleetID, 0),
-    );
-}
-
-function getManagedFleetDefensiveDroneState(fleetRecord) {
-  if (
-    !fleetRecord.defensiveDroneFlightIDsByControllerID ||
-    typeof fleetRecord.defensiveDroneFlightIDsByControllerID !== "object"
-  ) {
-    fleetRecord.defensiveDroneFlightIDsByControllerID = {};
-  }
-  return fleetRecord.defensiveDroneFlightIDsByControllerID;
-}
-
-function notifyManagedDroneStockChanged(
-  fleetRecord,
-  controllerEntity,
-  stock,
-  event = {},
-) {
-  if (
-    !fleetRecord ||
-    typeof fleetRecord.onManagedDroneStockChanged !== "function" ||
-    !stock
-  ) {
-    return null;
-  }
-  const payload = {
-    ...event,
-    stock,
-    atMs: Math.max(
-      0,
-      toInt(event.atMs, Date.now()),
-    ),
-    fleetID: toInt(fleetRecord.fleetID, 0),
-    operatorKind: fleetRecord.operatorKind,
-    operatorID: fleetRecord.operatorID,
-    controllerEntityID: toInt(
-      controllerEntity && controllerEntity.itemID,
-      0,
-    ),
-    controllerTypeID: toInt(
-      controllerEntity && controllerEntity.typeID,
-      0,
-    ),
-  };
-  try {
-    return fleetRecord.onManagedDroneStockChanged(payload);
-  } catch (error) {
-    log.error(
-      `[MiningFleet] managed drone stock callback failed ` +
-      `fleet=${fleetRecord.fleetID} ` +
-      `controller=${payload.controllerEntityID}: ` +
-      String(error && error.message || error),
-    );
-    return {
-      success: false,
-      errorMsg: "MANAGED_DRONE_STOCK_CALLBACK_FAILED",
-    };
-  }
-}
-
-function resolveManagedEntityDroneDoctrine(entity) {
-  const controller = entity
-    ? npcService.getControllerByEntityID(
-        toInt(entity.itemID, 0),
-      )
-    : null;
-  const definition =
-    controller &&
-    controller.definitionSnapshot &&
-    typeof controller.definitionSnapshot === "object"
-      ? controller.definitionSnapshot
-      : null;
-  const loadout =
-    definition &&
-    definition.loadout &&
-    typeof definition.loadout === "object"
-      ? definition.loadout
-      : {};
-  const governance =
-    entity &&
-    entity.doctrineGovernance &&
-    typeof entity.doctrineGovernance === "object"
-      ? entity.doctrineGovernance
-      : {};
-  const bayEntries = [
-    entity && entity.governedDroneBay,
-    entity && entity.droneBay,
-    entity && entity.npcDroneBay,
-    governance.droneBay,
-    loadout.droneBay,
-  ].find(
-    (entries) =>
-      Array.isArray(entries) && entries.length > 0,
-  ) || [];
-  const defenseFlights = [
-    entity && entity.defensiveDroneFlights,
-    entity && entity.defenseFlights,
-    governance.defenseFlights,
-    loadout.defenseFlights,
-  ].find(
-    (entries) =>
-      Array.isArray(entries) && entries.length > 0,
-  ) || [];
-  return {
-    bayEntries,
-    defenseFlights,
-  };
-}
-
-function resolveManagedThreatSizeClass(entity) {
-  const itemType =
-    resolveItemByTypeID(
-      toInt(entity && entity.typeID, 0),
-    ) || {};
-  const groupName = String(
-    itemType.groupName ||
-    itemType.group ||
-    entity && entity.groupName ||
-    "",
-  ).toLowerCase();
-  for (const sizeClass of [
-    "frigate",
-    "destroyer",
-    "cruiser",
-    "battlecruiser",
-    "battleship",
-    "capital",
-  ]) {
-    if (groupName.includes(sizeClass)) {
-      return sizeClass;
-    }
-  }
-  const radius = Math.max(
-    0,
-    toFiniteNumber(
-      entity && entity.radius,
-      toFiniteNumber(itemType.radius, 0),
-    ),
-  );
-  if (radius > 0 && radius <= 60) return "frigate";
-  if (radius > 0 && radius <= 100) return "destroyer";
-  if (radius > 0 && radius <= 250) return "cruiser";
-  if (radius > 0 && radius <= 400) {
-    return "battlecruiser";
-  }
-  if (radius > 0 && radius <= 800) return "battleship";
-  return "unknown";
-}
-
-function selectManagedDefenseFlight(
-  defenseFlights,
-  targetSizeClass,
-) {
-  return (
-    Array.isArray(defenseFlights)
-      ? defenseFlights
-      : []
-  ).find((flight) => {
-    const droneTypeID = toInt(
-      flight && (flight.droneTypeID ?? flight.typeID),
-      0,
-    );
-    const launchCount = Math.max(
-      0,
-      toInt(
-        flight &&
-          (flight.launchCount ?? flight.quantity),
-        0,
-      ),
-    );
-    const targetSizeClasses = Array.isArray(
-      flight && flight.targetSizeClasses,
-    )
-      ? flight.targetSizeClasses.map((entry) =>
-          String(entry || "").trim().toLowerCase())
-      : [];
-    return (
-      droneTypeID > 0 &&
-      launchCount > 0 &&
-      (
-        targetSizeClasses.length <= 0 ||
-        targetSizeClasses.includes(targetSizeClass)
-      )
-    );
-  }) || null;
-}
-
-function getManagedDefenseFlightPower(flight) {
-  if (!flight) {
-    return 0;
-  }
-  const droneTypeID = toInt(
-    flight.droneTypeID ?? flight.typeID,
-    0,
-  );
-  const launchCount = Math.max(
-    0,
-    toInt(
-      flight.launchCount ?? flight.quantity,
-      0,
-    ),
-  );
-  const bandwidthPerDrone = Math.max(
-    0,
-    toFiniteNumber(
-      getTypeAttributeValue(
-        droneTypeID,
-        "droneBandwidthUsed",
-        "droneBandwidthLoad",
-      ),
-      0,
-    ),
-  );
-  return (
-    launchCount *
-    Math.max(1, bandwidthPerDrone / 5)
-  );
-}
-
-function getEntityCombatHealthSnapshot(entity) {
-  const condition =
-    entity &&
-    entity.conditionState &&
-    typeof entity.conditionState === "object"
-      ? entity.conditionState
-      : {};
-  return {
-    shieldRatio: Math.max(
-      0,
-      Math.min(
-        1,
-        toFiniteNumber(condition.shieldCharge, 1),
-      ),
-    ),
-    armorDamageRatio: Math.max(
-      0,
-      Math.min(
-        1,
-        toFiniteNumber(condition.armorDamage, 0),
-      ),
-    ),
-    structureDamageRatio: Math.max(
-      0,
-      Math.min(
-        1,
-        toFiniteNumber(condition.damage, 0),
-      ),
-    ),
-  };
-}
-
-function assessManagedIndustrialThreat(
-  scene,
-  fleetRecord,
-  aggressorEntity,
-) {
-  if (config.miningNpcManagedDefenseEnabled !== true) {
-    return {
-      engage: false,
-      reason: "DEFENSE_DISABLED",
-    };
-  }
-  if (
-    !scene ||
-    !fleetRecord ||
-    !aggressorEntity ||
-    aggressorEntity.nativeNpc !== true
-  ) {
-    return {
-      engage: false,
-      reason: "THREAT_NOT_KNOWN_NPC",
-    };
-  }
-  const aggressorController =
-    npcService.getControllerByEntityID(
-      toInt(aggressorEntity.itemID, 0),
-    );
-  const definition =
-    aggressorController &&
-    aggressorController.definitionSnapshot &&
-    typeof aggressorController.definitionSnapshot === "object"
-      ? aggressorController.definitionSnapshot
-      : null;
-  if (
-    !aggressorController ||
-    !definition ||
-    aggressorEntity.capitalNpc === true
-  ) {
-    return {
-      engage: false,
-      reason: "THREAT_DEFINITION_UNTRUSTED",
-    };
-  }
-
-  const targetSizeClass =
-    resolveManagedThreatSizeClass(aggressorEntity);
-  if (
-    !["frigate", "destroyer"].includes(
-      targetSizeClass,
-    )
-  ) {
-    return {
-      engage: false,
-      reason: "THREAT_HULL_TOO_LARGE",
-      targetSizeClass,
-    };
-  }
-  const threatName = [
-    aggressorEntity.itemName,
-    aggressorEntity.slimName,
-    definition.profile && definition.profile.name,
-    definition.profile && definition.profile.profileID,
-  ].filter(Boolean).join(" ");
-  if (
-    MANAGED_MINING_DEFENSE_REJECTED_NAME_PATTERN.test(
-      threatName,
-    )
-  ) {
-    return {
-      engage: false,
-      reason: "THREAT_VARIANT_REJECTED",
-      targetSizeClass,
-    };
-  }
-  const participatingFleets =
-    listCoLocatedManagedIndustrialFleets(
-      scene,
-      fleetRecord,
-    );
-  const participatingDoctrine =
-    participatingFleets.map((candidate) =>
-      normalizeManagedThreatDoctrine(
-        candidate && candidate.threatDoctrine,
-      ));
-  const bounty = Math.max(
-    0,
-    toFiniteNumber(aggressorEntity.bounty, 0),
-  );
-  const maximumBounty = Math.max(
-    ...participatingDoctrine.map(
-      (doctrine) =>
-        doctrine.maximumThreatBountyISK,
-    ),
-  );
-  if (bounty <= 0 || bounty > maximumBounty) {
-    return {
-      engage: false,
-      reason: "THREAT_BOUNTY_OUT_OF_POLICY",
-      targetSizeClass,
-      bounty,
-      maximumBounty,
-    };
-  }
-  const hasHostileUtility =
-    getNpcFittedModuleItems(aggressorEntity)
-      .some((moduleItem) => {
-        const typeRecord =
-          resolveItemByTypeID(
-            toInt(moduleItem && moduleItem.typeID, 0),
-          ) || {};
-        return (
-          MANAGED_MINING_DEFENSE_HOSTILE_UTILITY_GROUP_IDS
-            .has(
-              toInt(
-                moduleItem && moduleItem.groupID,
-                toInt(typeRecord.groupID, 0),
-              ),
-            )
-        );
-      });
-  if (hasHostileUtility) {
-    return {
-      engage: false,
-      reason: "THREAT_HAS_CONTROL_MODULES",
-      targetSizeClass,
-    };
-  }
-
-  const defensePlans = [];
-  let defensePower = 0;
-  let plannedDroneCount = 0;
-  const maximumActiveDronesPerFleet = Math.max(
-    0,
-    toInt(
-      config.miningNpcManagedDefenseMaxActiveDrones,
-      DEFAULT_MANAGED_MINING_DEFENSE_MAX_ACTIVE_DRONES,
-    ),
-  );
-  for (const participatingFleet of participatingFleets) {
-    let remainingDroneSlots =
-      maximumActiveDronesPerFleet;
-    for (
-      const entity of getFleetEntities(
-        scene,
-        participatingFleet,
-      )
-    ) {
-      const health =
-        getEntityCombatHealthSnapshot(entity);
-      if (
-        health.shieldRatio < 0.99 ||
-        health.armorDamageRatio > 0 ||
-        health.structureDamageRatio > 0
-      ) {
-        return {
-          engage: false,
-          reason: "CREW_NOT_PRISTINE",
-          targetSizeClass,
-        };
-      }
-      const doctrine =
-        resolveManagedEntityDroneDoctrine(entity);
-      const selectedFlight = selectManagedDefenseFlight(
-        doctrine.defenseFlights,
-        targetSizeClass,
-      );
-      if (
-        !selectedFlight ||
-        doctrine.bayEntries.length <= 0
-      ) {
-        continue;
-      }
-      const authoredLaunchCount = Math.max(
-        0,
-        toInt(
-          selectedFlight.launchCount ??
-            selectedFlight.quantity,
-          0,
-        ),
-      );
-      const stagedLaunchCount = Math.min(
-        authoredLaunchCount,
-        remainingDroneSlots,
-      );
-      if (stagedLaunchCount <= 0) {
-        break;
-      }
-      const stagedFlight = {
-        ...selectedFlight,
-        launchCount: stagedLaunchCount,
-      };
-      const flightPower =
-        getManagedDefenseFlightPower(stagedFlight);
-      if (flightPower <= 0) {
-        continue;
-      }
-      defensePlans.push({
-        fleetRecord: participatingFleet,
-        controllerEntity: entity,
-        bayEntries: doctrine.bayEntries,
-        selectedFlight: stagedFlight,
-        flightPower,
-      });
-      defensePower += flightPower;
-      plannedDroneCount += stagedLaunchCount;
-      remainingDroneSlots -= stagedLaunchCount;
-    }
-  }
-  if (defensePlans.length <= 0) {
-    return {
-      engage: false,
-      reason: "NO_LEGAL_DEFENSE_FLIGHT",
-      targetSizeClass,
-    };
-  }
-
-  const shieldCapacity = Math.max(
-    0,
-    toFiniteNumber(
-      aggressorEntity.shieldCapacity,
-      getTypeAttributeValue(
-        aggressorEntity.typeID,
-        "shieldCapacity",
-      ),
-    ),
-  );
-  const armorHP = Math.max(
-    0,
-    toFiniteNumber(
-      aggressorEntity.armorHP,
-      getTypeAttributeValue(
-        aggressorEntity.typeID,
-        "armorHP",
-      ),
-    ),
-  );
-  const structureHP = Math.max(
-    0,
-    toFiniteNumber(
-      aggressorEntity.structureHP,
-      getTypeAttributeValue(
-        aggressorEntity.typeID,
-        "hp",
-        "structureHP",
-      ),
-    ),
-  );
-  const threatPower = Math.max(
-    1,
-    bounty / 5_000,
-    (
-      shieldCapacity +
-      armorHP +
-      structureHP
-    ) / 2_000,
-  );
-  const requiredOvermatch = Math.max(
-    ...participatingDoctrine.map(
-      (doctrine) =>
-        doctrine.requiredCrewOvermatch,
-    ),
-  );
-  if (
-    defensePower <
-    threatPower * requiredOvermatch
-  ) {
-    return {
-      engage: false,
-      reason: "INSUFFICIENT_ZERO_LOSS_MARGIN",
-      targetSizeClass,
-      defensePower,
-      threatPower,
-      requiredOvermatch,
-    };
-  }
-  return {
-    engage: true,
-    reason: "KNOWN_NPC_OVERMATCH",
-    targetSizeClass,
-    bounty,
-    defensePower,
-    threatPower,
-    requiredOvermatch,
-    plannedDroneCount,
-    defensePlans,
-    participatingFleets,
-  };
-}
-
-function scanManagedIndustrialFleetThreat(
-  scene,
-  fleetRecord,
-  now = Date.now(),
-) {
-  const scanAtMs = Math.max(0, toInt(now, 0));
-  const fleetEntityIDSet =
-    new Set(getFleetEntityIDs(fleetRecord));
-  const assignedTarget =
-    scene.getEntityByID(
-      toInt(fleetRecord.activeAsteroidID, 0),
-    ) ||
-    scene.getEntityByID(
-      toInt(fleetRecord.targetShipID, 0),
-    ) ||
-    null;
-  const interactionSource =
-    getFleetEntities(scene, fleetRecord)[0] ||
-    assignedTarget ||
-    null;
-  const isAwayFromSite = [
-    "aggressed",
-    "panic",
-    "returning_to_site",
-  ].includes(String(fleetRecord.state || ""));
-  const assignedSitePosition =
-    assignedTarget && assignedTarget.position ||
-    fleetRecord.retreatSitePosition ||
-    null;
-  const referencePosition =
-    isAwayFromSite && assignedSitePosition
-      ? assignedSitePosition
-      : buildFleetReferencePosition(
-          scene,
-          fleetRecord,
-        );
-  const scanRangeMeters = Math.max(
-    0,
-    toFiniteNumber(
-      config.miningNpcManagedDefenseScanRangeMeters,
-      DEFAULT_MANAGED_MINING_DEFENSE_SCAN_RANGE_METERS,
-    ),
-  );
-  const isCandidate = (entity) => {
-    if (
-      !entity ||
-      entity.kind !== "ship" ||
-      entity.nativeNpc !== true ||
-      fleetEntityIDSet.has(toInt(entity.itemID, 0)) ||
-      (
-        interactionSource &&
-        !canEntitiesInteractLocally(
-          interactionSource,
-          entity,
-        )
-      )
-    ) {
-      return false;
-    }
-    if (toFiniteNumber(entity.bounty, 0) <= 0) {
-      return false;
-    }
-    return (
-      !referencePosition ||
-      !entity.position ||
-      distance(
-        referencePosition,
-        entity.position,
-      ) <= scanRangeMeters
-    );
-  };
-
-  const scanIntervalMs = Math.max(
-    250,
-    toInt(
-      config.miningNpcManagedDefenseScanIntervalMs,
-      DEFAULT_MANAGED_MINING_DEFENSE_SCAN_INTERVAL_MS,
-    ),
-  );
-  const lastScanAtMs = toInt(
-    fleetRecord.lastManagedThreatScanAtMs,
-    -1,
-  );
-  if (
-    lastScanAtMs >= 0 &&
-    scanAtMs >= lastScanAtMs &&
-    scanAtMs - lastScanAtMs < scanIntervalMs
-  ) {
-    const cached =
-      fleetRecord.lastManagedThreatScanResult || null;
-    if (!cached) {
-      return null;
-    }
-    const cachedEntity = scene.getEntityByID(
-      toInt(cached.entityID, 0),
-    );
-    return isCandidate(cachedEntity)
-      ? {
-          ...cached,
-          entity: cachedEntity,
-          cached: true,
-        }
-      : null;
-  }
-
-  fleetRecord.lastManagedThreatScanAtMs =
-    scanAtMs;
-  fleetRecord.managedThreatScanCount =
-    Math.max(
-      0,
-      toInt(fleetRecord.managedThreatScanCount, 0),
-    ) + 1;
-
-  const bubbleIDs = new Set();
-  if (assignedTarget) {
-    const targetBubbleID = toInt(
-      assignedTarget.bubbleID,
-      0,
-    );
-    if (targetBubbleID > 0) {
-      bubbleIDs.add(targetBubbleID);
-    }
-  }
-  for (const entityID of fleetEntityIDSet) {
-    const crewEntity =
-      scene.getEntityByID(entityID);
-    const bubbleID = toInt(
-      crewEntity && crewEntity.bubbleID,
-      0,
-    );
-    if (bubbleID > 0) {
-      bubbleIDs.add(bubbleID);
-    }
-  }
-  const dynamicEntities = [];
-  const seenEntityIDs = new Set();
-  const appendEntities = (entities) => {
-    for (const entity of entities || []) {
-      const entityID = toInt(
-        entity && entity.itemID,
-        0,
-      );
-      if (
-        entityID <= 0 ||
-        seenEntityIDs.has(entityID)
-      ) {
-        continue;
-      }
-      seenEntityIDs.add(entityID);
-      dynamicEntities.push(entity);
-    }
-  };
-  if (
-    bubbleIDs.size > 0 &&
-    typeof scene.getDynamicEntitiesInBubble ===
-      "function"
-  ) {
-    for (const bubbleID of bubbleIDs) {
-      appendEntities(
-        scene.getDynamicEntitiesInBubble(bubbleID),
-      );
-    }
-  } else if (
-    typeof scene.getDynamicEntities === "function"
-  ) {
-    appendEntities(scene.getDynamicEntities());
-  } else if (scene.dynamicEntities instanceof Map) {
-    appendEntities(scene.dynamicEntities.values());
-  }
-
-  let selected = null;
-  let candidateCount = 0;
-  for (const entity of dynamicEntities) {
-    if (!isCandidate(entity)) {
-      continue;
-    }
-    candidateCount += 1;
-    const itemType =
-      resolveItemByTypeID(
-        toInt(entity.typeID, 0),
-      ) || {};
-    const threatName = String(
-      entity.itemName ||
-      entity.slimName ||
-      itemType.name ||
-      "",
-    );
-    const sizeClass =
-      resolveManagedThreatSizeClass(entity);
-    const sizeRank = {
-      unknown: 7,
-      capital: 6,
-      battleship: 5,
-      battlecruiser: 4,
-      cruiser: 3,
-      destroyer: 2,
-      frigate: 1,
-    }[sizeClass] || 7;
-    const candidate = {
-      entity,
-      distanceMeters:
-        referencePosition && entity.position
-          ? distance(
-              referencePosition,
-              entity.position,
-            )
-          : 0,
-      riskRank:
-        (entity.capitalNpc === true ? 100 : 0) +
-        (
-          MANAGED_MINING_DEFENSE_REJECTED_NAME_PATTERN
-            .test(threatName)
-            ? 50
-            : 0
-        ) +
-        sizeRank,
-      bounty: Math.max(
-        0,
-        toFiniteNumber(entity.bounty, 0),
-      ),
-    };
-    if (
-      !selected ||
-      candidate.riskRank > selected.riskRank ||
-      (
-        candidate.riskRank === selected.riskRank &&
-        (
-          candidate.bounty > selected.bounty ||
-          (
-            candidate.bounty === selected.bounty &&
-            (
-              candidate.distanceMeters <
-                selected.distanceMeters ||
-              (
-                candidate.distanceMeters ===
-                  selected.distanceMeters &&
-                toInt(candidate.entity.itemID, 0) <
-                  toInt(selected.entity.itemID, 0)
-              )
-            )
-          )
-        )
-      )
-    ) {
-      selected = candidate;
-    }
-  }
-
-  fleetRecord.lastManagedThreatScanCandidateCount =
-    candidateCount;
-  fleetRecord.lastManagedThreatScanEvaluatedEntityCount =
-    dynamicEntities.length;
-  fleetRecord.lastManagedThreatScanResult = selected
-    ? {
-        entityID: toInt(selected.entity.itemID, 0),
-        distanceMeters: selected.distanceMeters,
-        riskRank: selected.riskRank,
-        bounty: selected.bounty,
-      }
-    : null;
-  return selected
-    ? {
-        ...fleetRecord.lastManagedThreatScanResult,
-        entity: selected.entity,
-        cached: false,
-      }
-    : null;
-}
-
-function buildNpcPseudoSession(entity, hooks = null) {
-  if (hooks && typeof hooks.buildNpcPseudoSession === "function") {
-    return hooks.buildNpcPseudoSession(entity);
-  }
-  return {
-    characterID: toInt(
-      entity && (
-        entity.npcPilotCharacterID ??
-        entity.pilotCharacterID ??
-        entity.characterID
-      ),
-      0,
-    ),
-    corporationID: toInt(entity && entity.corporationID, 0),
-    allianceID: toInt(entity && entity.allianceID, 0),
-    _space: {
-      systemID: toInt(entity && entity.systemID, 0),
-      shipID: toInt(entity && entity.itemID, 0),
-    },
-  };
-}
-
-function getMiningCommandBurstModules(entity) {
-  return getNpcFittedModuleItems(entity)
-    .filter((moduleItem) => isModuleOnline(moduleItem))
-    .map((moduleItem) => ({
-      moduleItem,
-      effectRecord: getTypeEffectRecords(toInt(moduleItem && moduleItem.typeID, 0))
-        .find((effectRecord) => (
-          String(effectRecord && effectRecord.name || "") ===
-          "moduleBonusWarfareLinkMining"
-        )) || null,
-      chargeItem: getNpcLoadedChargeForModule(
-        entity,
-        moduleItem,
-      ),
-    }))
-    .filter((entry) => entry.effectRecord);
-}
-
-function maintainMiningSupportBursts(
-  scene,
-  fleetRecord,
-  hooks = null,
-) {
-  if (
-    !scene ||
-    !fleetRecord ||
-    fleetRecord.state !== "mining"
-  ) {
-    return {
-      configuredCount: 0,
-      activeCount: 0,
-      activatedCount: 0,
-    };
-  }
-  const commandBurstEntries =
-    getFleetEntities(scene, fleetRecord)
-      .flatMap((entity) =>
-        getMiningCommandBurstModules(entity)
-          .map((entry) => ({
-            ...entry,
-            entity,
-          })));
-  if (commandBurstEntries.length <= 0) {
-    return {
-      configuredCount: 0,
-      activeCount: 0,
-      activatedCount: 0,
-    };
-  }
-
-  for (
-    const minerEntityID of
-    fleetRecord.minerEntityIDs || []
-  ) {
-    const minerEntity =
-      scene.getEntityByID(minerEntityID);
-    if (
-      minerEntity &&
-      minerEntity.npcMiningSupportBonus
-    ) {
-      delete minerEntity.npcMiningSupportBonus;
-    }
-  }
-
-  let activeCount = 0;
-  let activatedCount = 0;
-  const errors = [];
-  for (const entry of commandBurstEntries) {
-    const moduleItemID = toInt(
-      entry.moduleItem && entry.moduleItem.itemID,
-      0,
-    );
-    const activeEffect =
-      entry.entity.activeModuleEffects instanceof Map
-        ? entry.entity.activeModuleEffects.get(
-            moduleItemID,
-          )
-        : null;
-    if (activeEffect) {
-      activeCount += 1;
-      continue;
-    }
-    if (
-      !entry.chargeItem ||
-      toInt(entry.chargeItem.typeID, 0) <= 0
-    ) {
-      errors.push({
-        entityID: toInt(entry.entity.itemID, 0),
-        moduleItemID,
-        errorMsg:
-          "MINING_COMMAND_BURST_CHARGE_REQUIRED",
-      });
-      continue;
-    }
-    const activationResult =
-      scene.activateGenericModule(
-        buildNpcPseudoSession(
-          entry.entity,
-          hooks,
-        ),
-        entry.moduleItem,
-        entry.effectRecord.name,
-        {},
-      );
-    if (
-      activationResult &&
-      activationResult.success === true
-    ) {
-      activeCount += 1;
-      activatedCount += 1;
-    } else {
-      errors.push({
-        entityID: toInt(entry.entity.itemID, 0),
-        moduleItemID,
-        errorMsg:
-          activationResult &&
-            activationResult.errorMsg ||
-          "MINING_COMMAND_BURST_ACTIVATION_FAILED",
-      });
-    }
-  }
-  fleetRecord.commandBurstConfiguredCount =
-    commandBurstEntries.length;
-  fleetRecord.commandBurstActiveCount =
-    activeCount;
-  fleetRecord.commandBurstLastErrors = errors;
-  return {
-    configuredCount: commandBurstEntries.length,
-    activeCount,
-    activatedCount,
-    errors,
-  };
-}
-
-function deactivateMiningSupportBursts(
-  scene,
-  fleetRecord,
-  hooks = null,
-  reason = "state",
-) {
-  if (!scene || !fleetRecord) {
-    return 0;
-  }
-  let deactivatedCount = 0;
-  for (const entity of getFleetEntities(scene, fleetRecord)) {
-    const pseudoSession = buildNpcPseudoSession(entity, hooks);
-    for (const entry of getMiningCommandBurstModules(entity)) {
-      const moduleItemID = toInt(entry.moduleItem && entry.moduleItem.itemID, 0);
-      const activeEffect = entity.activeModuleEffects instanceof Map
-        ? entity.activeModuleEffects.get(moduleItemID)
-        : null;
-      if (!activeEffect) {
-        continue;
-      }
-      const result = scene.deactivateGenericModule(pseudoSession, moduleItemID, {
-        reason,
-        deferUntilCycle: false,
-      });
-      if (!result || result.success !== false) {
-        deactivatedCount += 1;
-      }
-    }
-  }
-  return deactivatedCount;
-}
-
-function recallManagedFleetDefensiveDrones(
-  scene,
-  fleetRecord,
-  reason = "recall",
-) {
-  if (!fleetRecord || !isManagedIndustrialMiningFleet(fleetRecord)) {
-    return 0;
-  }
-  let droneRuntime;
-  try {
-    droneRuntime = getManagedDroneRuntime();
-  } catch (_error) {
-    return 0;
-  }
-  const activeScene = resolveFleetScene(scene, fleetRecord);
-  const flightIDsByControllerID =
-    getManagedFleetDefensiveDroneState(fleetRecord);
-  let recalledCount = 0;
-  for (const entityID of getFleetEntityIDs(fleetRecord)) {
-    const controllerEntity =
-      activeScene && activeScene.getEntityByID(entityID);
-    const flightID = String(
-      flightIDsByControllerID[String(entityID)] || "",
-    ).trim();
-    if (
-      flightID &&
-      controllerEntity &&
-      typeof droneRuntime.recallManagedTransientNpcDroneFlight === "function"
-    ) {
-      const result = droneRuntime.recallManagedTransientNpcDroneFlight(
-        activeScene,
-        controllerEntity,
-        { flightID, reason },
-      );
-      if (result && result.success === true) {
-        recalledCount += 1;
-      }
-    }
-    if (
-      activeScene &&
-      typeof droneRuntime.cleanupManagedTransientNpcDroneFlightsForController ===
-        "function"
-    ) {
-      droneRuntime.cleanupManagedTransientNpcDroneFlightsForController(
-        activeScene,
-        controllerEntity || entityID,
-        { reason },
-      );
-    }
-  }
-  fleetRecord.defensiveDroneFlightIDsByControllerID = {};
-  fleetRecord.defenseDroneLossDetected = false;
-  fleetRecord.defenseDecision = null;
-  return recalledCount;
-}
-
-function beginManagedFleetDroneDefense(
-  scene,
-  fleetRecord,
-  aggressorEntity,
-  assessment,
-  options = {},
-) {
-  let droneRuntime;
-  try {
-    droneRuntime = getManagedDroneRuntime();
-  } catch (_error) {
-    return {
-      success: false,
-      errorMsg: "MANAGED_DRONE_RUNTIME_UNAVAILABLE",
-    };
-  }
-  if (
-    typeof droneRuntime
-      .launchManagedTransientNpcDroneFlight !==
-      "function" ||
-    typeof droneRuntime
-      .engageManagedTransientNpcDroneFlight !==
-      "function"
-  ) {
-    return {
-      success: false,
-      errorMsg: "MANAGED_DRONE_API_UNAVAILABLE",
-    };
-  }
-  const participatingFleets = (
-    Array.isArray(
-      assessment && assessment.participatingFleets,
-    ) &&
-    assessment.participatingFleets.length > 0
-      ? assessment.participatingFleets
-      : [fleetRecord]
-  );
-  const recallParticipatingFleets = (reason) => {
-    for (const participatingFleet of participatingFleets) {
-      recallManagedFleetDefensiveDrones(
-        scene,
-        participatingFleet,
-        reason,
-      );
-    }
-  };
-  const touchedEntityIDs = [];
-  for (const plan of assessment.defensePlans || []) {
-    const defensiveFleet =
-      plan && plan.fleetRecord || fleetRecord;
-    const activeFlights =
-      getManagedFleetDefensiveDroneState(
-        defensiveFleet,
-      );
-    const controllerEntity = plan.controllerEntity;
-    const entityID = toInt(
-      controllerEntity && controllerEntity.itemID,
-      0,
-    );
-    let flightID = String(
-      activeFlights[String(entityID)] || "",
-    ).trim();
-    if (!flightID) {
-      const launchResult =
-        droneRuntime
-          .launchManagedTransientNpcDroneFlight(
-            scene,
-            controllerEntity,
-            plan.selectedFlight,
-            {
-              targetEntity: aggressorEntity,
-              bayEntries: plan.bayEntries,
-              ownerKind:
-                "managed_industrial_mining_fleet",
-              ownerID: defensiveFleet.fleetID,
-              provenance: {
-                source:
-                  "managed_industrial_defense",
-                fleetID: defensiveFleet.fleetID,
-                operatorKind:
-                  defensiveFleet.operatorKind,
-                operatorID:
-                  defensiveFleet.operatorID,
-              },
-              nowMs: options.nowMs,
-              onStockChanged(event = {}) {
-                notifyManagedDroneStockChanged(
-                  defensiveFleet,
-                  controllerEntity,
-                  event.stock,
-                  {
-                    ...event,
-                    eventKind: "stock_transition",
-                  },
-                );
-              },
-              onDroneLost() {
-                defensiveFleet.defenseDroneLossDetected =
-                  true;
-              },
-              onFlightClosed() {
-                if (
-                  activeFlights[String(entityID)] ===
-                  flightID
-                ) {
-                  delete activeFlights[
-                    String(entityID)
-                  ];
-                }
-              },
-            },
-          );
-      if (
-        !launchResult ||
-        launchResult.success !== true ||
-        !launchResult.flightID
-      ) {
-        recallParticipatingFleets("launch_failure");
-        return {
-          success: false,
-          errorMsg:
-            launchResult &&
-              launchResult.errorMsg ||
-            "MANAGED_DRONE_LAUNCH_FAILED",
-        };
-      }
-      flightID = String(launchResult.flightID);
-      activeFlights[String(entityID)] = flightID;
-      touchedEntityIDs.push(entityID);
-      const launchStockPersisted =
-        notifyManagedDroneStockChanged(
-          defensiveFleet,
-          controllerEntity,
-          launchResult.stock,
-          {
-            eventKind: "flight_launched",
-            flightID,
-            atMs: options.nowMs,
-            launchedCount: toInt(
-              launchResult.launchedCount,
-              0,
-            ),
-          },
-        );
-      if (
-        launchStockPersisted &&
-        launchStockPersisted.success === false
-      ) {
-        recallParticipatingFleets(
-          "stock_persistence_failure",
-        );
-        return {
-          success: false,
-          errorMsg:
-            launchStockPersisted.errorMsg ||
-            "MANAGED_DRONE_STOCK_PERSISTENCE_FAILED",
-        };
-      }
-    }
-    const engageResult =
-      droneRuntime
-        .engageManagedTransientNpcDroneFlight(
-          scene,
-          controllerEntity,
-          aggressorEntity,
-          { flightID },
-        );
-    if (
-      !engageResult ||
-      engageResult.success !== true
-    ) {
-      recallParticipatingFleets("engage_failure");
-      return {
-        success: false,
-        errorMsg:
-          engageResult && engageResult.errorMsg ||
-          "MANAGED_DRONE_ENGAGE_FAILED",
-      };
-    }
-  }
-  const flightCount = participatingFleets.reduce(
-    (total, participatingFleet) =>
-      total +
-      Object.keys(
-        getManagedFleetDefensiveDroneState(
-          participatingFleet,
-        ),
-      ).length,
-    0,
-  );
-  if (flightCount <= 0) {
-    return {
-      success: false,
-      errorMsg: "NO_MANAGED_DRONES_LAUNCHED",
-    };
-  }
-  return {
-    success: true,
-    data: {
-      flightCount,
-      touchedEntityIDs,
-      participatingFleetIDs:
-        participatingFleets.map(
-          (participatingFleet) =>
-            toInt(participatingFleet.fleetID, 0),
-        ),
-    },
-  };
-}
-
-function isManagedDefenseTargetGone(targetEntity) {
-  if (
-    !targetEntity ||
-    targetEntity.pendingWarp ||
-    targetEntity.mode === "WARP"
-  ) {
-    return true;
-  }
-  const health =
-    getEntityCombatHealthSnapshot(targetEntity);
-  return (
-    health.structureDamageRatio >= 1 ||
-    Boolean(
-      targetEntity.conditionState &&
-      targetEntity.conditionState.incapacitated,
-    )
-  );
-}
-
-function shouldManagedDefenseRetreat(
-  scene,
-  fleetRecord,
-) {
-  if (fleetRecord.defenseDroneLossDetected === true) {
-    return "DEFENSIVE_DRONE_LOST";
-  }
-  const minimumShieldRatio = Math.max(
-    0,
-    Math.min(
-      1,
-      toFiniteNumber(
-        config
-          .miningNpcManagedDefenseRetreatShieldRatio,
-        DEFAULT_MANAGED_MINING_DEFENSE_RETREAT_SHIELD_RATIO,
-      ),
-    ),
-  );
-  for (
-    const entityID of getFleetEntityIDs(fleetRecord)
-  ) {
-    const entity = scene.getEntityByID(entityID);
-    if (!entity) {
-      return "CREW_SHIP_MISSING";
-    }
-    const health =
-      getEntityCombatHealthSnapshot(entity);
-    if (
-      health.structureDamageRatio > 0 ||
-      health.armorDamageRatio > 0 ||
-      health.shieldRatio < minimumShieldRatio
-    ) {
-      return "ZERO_LOSS_MARGIN_BROKEN";
-    }
-  }
-  return null;
-}
-
-function maintainManagedFleetDroneDefense(
-  scene,
-  fleetRecord,
-  now,
-) {
-  const targetEntity = scene.getEntityByID(
-    toInt(fleetRecord.responseTargetID, 0),
-  );
-  if (isManagedDefenseTargetGone(targetEntity)) {
-    recallManagedFleetDefensiveDrones(
-      scene,
-      fleetRecord,
-      "threat_clear",
-    );
-    fleetRecord.responseTargetID = 0;
-    fleetRecord.state = "mining";
-    fleetRecord.resumeAtMs = 0;
-    return {
-      active: false,
-      cleared: true,
-    };
-  }
-  const retreatReason =
-    shouldManagedDefenseRetreat(scene, fleetRecord);
-  if (retreatReason) {
-    retreatFleetToOrigin(fleetRecord, {
-      state: "panic",
-      scene,
-      reason: retreatReason,
-    });
-    return {
-      active: false,
-      retreated: true,
-      reason: retreatReason,
-    };
-  }
-  let droneRuntime;
-  try {
-    droneRuntime = getManagedDroneRuntime();
-  } catch (_error) {
-    droneRuntime = null;
-  }
-  if (
-    !droneRuntime ||
-    typeof droneRuntime
-      .engageManagedTransientNpcDroneFlight !==
-      "function"
-  ) {
-    retreatFleetToOrigin(fleetRecord, {
-      state: "panic",
-      scene,
-      reason: "managed_drone_api_lost",
-    });
-    return {
-      active: false,
-      retreated: true,
-      reason: "MANAGED_DRONE_API_LOST",
-    };
-  }
-  const activeFlights =
-    getManagedFleetDefensiveDroneState(fleetRecord);
-  let engagedFlightCount = 0;
-  for (
-    const [entityID, flightID] of
-    Object.entries(activeFlights)
-  ) {
-    const controllerEntity = scene.getEntityByID(
-      toInt(entityID, 0),
-    );
-    if (!controllerEntity) {
-      continue;
-    }
-    const result =
-      droneRuntime
-        .engageManagedTransientNpcDroneFlight(
-          scene,
-          controllerEntity,
-          targetEntity,
-          { flightID },
-        );
-    if (result && result.success === true) {
-      engagedFlightCount += 1;
-    }
-  }
-  if (engagedFlightCount <= 0) {
-    retreatFleetToOrigin(fleetRecord, {
-      state: "panic",
-      scene,
-      reason: "defense_flight_missing",
-    });
-    return {
-      active: false,
-      retreated: true,
-      reason: "DEFENSE_FLIGHT_MISSING",
-    };
-  }
-  fleetRecord.nextThinkAtMs = Math.max(
-    toInt(fleetRecord.nextThinkAtMs, 0),
-    toInt(now, 0),
-  );
-  return {
-    active: true,
-    engagedFlightCount,
-  };
 }
 
 function buildFleetReferencePosition(scene, fleetRecord) {
@@ -1798,7 +280,7 @@ function resolveFleetInteractionSource(scene, fleetRecord, referenceEntity = nul
 
 function buildFleetMineableClaimCounts(scene, currentFleetRecord) {
   const claimCounts = new Map();
-  const fleets = getMiningFleetsForSystem(scene && scene.systemID);
+  const fleets = getMiningFleetsForScene(scene);
   for (const fleetRecord of fleets) {
     if (
       !fleetRecord ||
@@ -1823,7 +305,7 @@ function buildFleetMineableClaimCounts(scene, currentFleetRecord) {
   return claimCounts;
 }
 
-function resolveFleetMineableStaticEntities(scene, fleetRecord = null, referenceEntity = null) {
+function resolveFleetMineableStaticEntities(scene, fleetRecord = null, referenceEntity = null, options = {}) {
   if (!scene) {
     return [];
   }
@@ -1869,21 +351,13 @@ function resolveFleetMineableStaticEntities(scene, fleetRecord = null, reference
     pushBubbleID(minerEntity && minerEntity.bubbleID);
   }
 
-  if (getByBubbleID) {
-    for (const bubbleID of bubbleCandidateIDs) {
-      const entities = getByBubbleID(bubbleID);
-      if (Array.isArray(entities) && entities.length > 0) {
-        return entities;
-      }
-    }
-  }
-
   if (getByPosition) {
     const positionCandidates = [
       activeTarget && activeTarget.position,
-      fleetRecord && fleetRecord.originAnchor && fleetRecord.originAnchor.position,
-      targetShipEntity && targetShipEntity.position,
+      interactionSource && interactionSource.position,
       referenceEntity && referenceEntity.position,
+      targetShipEntity && targetShipEntity.position,
+      fleetRecord && fleetRecord.originAnchor && fleetRecord.originAnchor.position,
     ];
     for (const position of positionCandidates) {
       if (!position) {
@@ -1896,17 +370,39 @@ function resolveFleetMineableStaticEntities(scene, fleetRecord = null, reference
     }
   }
 
+  // A ship that has just warped can briefly retain its previous bubbleID even
+  // though its position and visible static entities already reflect the new
+  // grid. Position-based lookup is therefore authoritative; cached bubble IDs
+  // remain a fallback for lightweight scenes that cannot resolve by position.
+  if (getByBubbleID) {
+    for (const bubbleID of bubbleCandidateIDs) {
+      const entities = getByBubbleID(bubbleID);
+      if (Array.isArray(entities) && entities.length > 0) {
+        return entities;
+      }
+    }
+  }
+
+  // Discovery for a new fleet stays on the invoker's grid. Running fleets may
+  // still fall back to the whole system.
+  if (options.localGridOnly === true) {
+    return [];
+  }
   return [...(scene.staticEntities || [])];
 }
 
-function resolveAvailableMineableTargetEntries(scene, fleetRecord = null, referenceEntity = null) {
+function resolveAvailableMineableTargetEntries(scene, fleetRecord = null, referenceEntity = null, options = {}) {
   ensureSceneMiningState(scene);
+  const resourceKind = normalizeMiningResourceKind(
+    fleetRecord && fleetRecord.resourceKind,
+    null,
+  );
   const interactionSource = resolveFleetInteractionSource(
     scene,
     fleetRecord,
     referenceEntity,
   );
-  return resolveFleetMineableStaticEntities(scene, fleetRecord, referenceEntity)
+  return resolveFleetMineableStaticEntities(scene, fleetRecord, referenceEntity, options)
     .filter((entity) => (
       isMineableStaticEntity(entity) &&
       (!interactionSource || canEntitiesInteractLocally(interactionSource, entity))
@@ -1915,7 +411,65 @@ function resolveAvailableMineableTargetEntries(scene, fleetRecord = null, refere
       entity,
       state: getMineableState(scene, entity.itemID),
     }))
-    .filter((entry) => entry.state && toInt(entry.state.remainingQuantity, 0) > 0);
+    .filter((entry) => (
+      entry.state &&
+      toInt(entry.state.remainingQuantity, 0) > 0 &&
+      (!resourceKind || entry.state.yieldKind === resourceKind)
+    ));
+}
+
+function resolveNearestMineableTargetForKind(scene, referenceEntity, resourceKind) {
+  const normalizedResourceKind = normalizeMiningResourceKind(resourceKind, null);
+  if (!scene || !referenceEntity || !normalizedResourceKind) {
+    return null;
+  }
+  const probeFleetRecord = {
+    targetShipID: normalizePositiveInteger(referenceEntity.itemID, 0),
+    minerEntityIDs: [],
+    originAnchor: referenceEntity.position
+      ? { position: referenceEntity.position }
+      : null,
+    resourceKind: normalizedResourceKind,
+  };
+  return resolveAvailableMineableTargetEntries(
+    scene,
+    probeFleetRecord,
+    referenceEntity,
+    { localGridOnly: true },
+  )
+    .sort(
+      (left, right) =>
+        distance(left && left.entity && left.entity.position, referenceEntity.position) -
+          distance(right && right.entity && right.entity.position, referenceEntity.position) ||
+        toInt(left && left.entity && left.entity.itemID, 0) -
+          toInt(right && right.entity && right.entity.itemID, 0),
+    )[0] || null;
+}
+
+// A fleet mines what its hulls can mine, whatever query spawned them: an ore
+// command that names the ice pool still gets an ice fleet. Hulls with mixed
+// mining modules leave the kind unset, so each miner picks targets it can mine.
+function resolveSpawnedMiningResourceKind(scene, minerEntityIDs = [], fallbackKind = null) {
+  const kinds = new Set();
+  for (const entityID of Array.isArray(minerEntityIDs) ? minerEntityIDs : []) {
+    const minerEntity = scene && typeof scene.getEntityByID === "function"
+      ? scene.getEntityByID(toInt(entityID, 0))
+      : null;
+    if (!minerEntity) {
+      continue;
+    }
+    for (const moduleItem of getNpcFittedModuleItems(minerEntity)) {
+      const effectRecord = getTypeEffectRecords(toInt(moduleItem && moduleItem.typeID, 0))
+        .find((record) => isMiningEffectRecord(record, moduleItem));
+      if (effectRecord) {
+        kinds.add(resolveMiningFamily(moduleItem, effectRecord));
+      }
+    }
+  }
+  if (kinds.size === 1) {
+    return [...kinds][0];
+  }
+  return kinds.size > 1 ? null : normalizeMiningResourceKind(fallbackKind, null);
 }
 
 function getFleetMinerAssignmentMap(fleetRecord) {
@@ -1955,7 +509,7 @@ function pruneFleetMinerAssignments(scene, fleetRecord) {
 function buildAssignedMineableClaimCounts(scene, currentFleetRecord, excludedMinerEntityID = 0) {
   const claimCounts = new Map();
   const normalizedExcludedMinerEntityID = normalizePositiveInteger(excludedMinerEntityID, 0);
-  for (const fleetRecord of getMiningFleetsForSystem(scene && scene.systemID)) {
+  for (const fleetRecord of getMiningFleetsForScene(scene)) {
     if (
       !fleetRecord ||
       toInt(fleetRecord.fleetID, 0) === toInt(currentFleetRecord && currentFleetRecord.fleetID, 0)
@@ -1987,8 +541,8 @@ function getMineableClaimPenaltyMeters() {
   return Math.max(
     0,
     toFiniteNumber(
-      config.miningNpcFleetTargetClaimPenaltyMeters,
-      7_500,
+      MINING_TARGET_CLAIM_PENALTY_METERS,
+      MINING_TARGET_CLAIM_PENALTY_METERS,
     ),
   );
 }
@@ -2474,6 +1028,27 @@ function parseNpcSpawnArguments(argumentText, defaultAmount = 1) {
   };
 }
 
+function parseMiningFleetCommandArguments(argumentText, defaultAmount = 1) {
+  const trimmed = String(argumentText || "").trim();
+  const parts = trimmed ? trimmed.split(/\s+/) : [];
+  const iceMode = String(parts[0] || "").toLowerCase() === "ice";
+  const parsedArguments = parseNpcSpawnArguments(
+    iceMode ? parts.slice(1).join(" ") : trimmed,
+    defaultAmount,
+  );
+  if (!parsedArguments.success || (iceMode && parsedArguments.query)) {
+    return {
+      success: false,
+      errorMsg: parsedArguments.errorMsg || "INVALID_ICE_ARGUMENTS",
+    };
+  }
+  return {
+    ...parsedArguments,
+    resourceKind: iceMode ? "ice" : "ore",
+    query: iceMode ? DEFAULT_ICE_MINING_FLEET_QUERY : parsedArguments.query,
+  };
+}
+
 function buildMiningWarpLandingPoint(center, index = 0, total = 1, radiusMeters = DEFAULT_MINING_FLEET_SPREAD_METERS) {
   const divisor = Math.max(1, toInt(total, 1));
   const angle = ((Math.PI * 2) / divisor) * Math.max(0, index);
@@ -2807,336 +1382,24 @@ function getNpcOreCargoSummary(entity) {
   };
 }
 
-function getNpcSmallestOreUnitVolumeM3(entity) {
-  let smallestUnitVolumeM3 = Number.POSITIVE_INFINITY;
-  for (const entry of getNpcOreCargoItems(entity)) {
-    const quantity = Math.max(
-      0,
-      toInt(entry && (entry.quantity ?? entry.stacksize), 0),
-    );
-    const volume = Math.max(0, toFiniteNumber(entry && entry.volume, 0));
-    if (quantity > 0 && volume > 0 && volume < smallestUnitVolumeM3) {
-      smallestUnitVolumeM3 = volume;
-    }
-  }
-  return Number.isFinite(smallestUnitVolumeM3)
-    ? smallestUnitVolumeM3
-    : 0;
-}
-
-function getNpcMiningCargoFullState(entity, fallbackCapacityM3 = 0) {
-  const usedVolumeM3 = Math.max(0, getNpcOreCargoVolume(entity));
-  const capacityM3 = Math.max(
-    0,
-    getNpcCargoCapacityM3(entity, fallbackCapacityM3),
-  );
-  const freeVolumeM3 = Math.max(0, capacityM3 - usedVolumeM3);
-  const smallestUnitVolumeM3 = getNpcSmallestOreUnitVolumeM3(entity);
-  const exactFull =
-    capacityM3 > 0 &&
-    usedVolumeM3 >= capacityM3 - MINING_CARGO_FULL_EPSILON_M3;
-  const operationallyFull =
-    exactFull ||
-    (
-      capacityM3 > 0 &&
-      usedVolumeM3 > 0 &&
-      smallestUnitVolumeM3 > 0 &&
-      freeVolumeM3 + MINING_CARGO_FULL_EPSILON_M3 < smallestUnitVolumeM3
-    );
-  return {
-    capacityM3,
-    usedVolumeM3,
-    freeVolumeM3,
-    smallestUnitVolumeM3,
-    exactFull,
-    operationallyFull,
-  };
-}
-
-function resolveNpcCargoCapacityFromResourceState(
-  resourceState,
-  fallbackCapacityM3 = 0,
-) {
-  const miningHoldCapacityM3 = Math.max(
-    0,
-    toFiniteNumber(resourceState && resourceState.generalMiningHoldCapacity, 0),
-  );
-  if (miningHoldCapacityM3 > 0) {
-    return miningHoldCapacityM3;
-  }
-
-  const cargoCapacityM3 = Math.max(
-    0,
-    toFiniteNumber(resourceState && resourceState.cargoCapacity, 0),
-  );
-  const fleetHangarCapacityM3 = Math.max(
-    0,
-    toFiniteNumber(
-      resourceState &&
-        resourceState.attributes &&
-        resourceState.attributes[FLEET_HANGAR_CAPACITY_ATTRIBUTE_ID],
-      0,
-    ),
-  );
-  if (fleetHangarCapacityM3 > 0) {
-    return fleetHangarCapacityM3 + cargoCapacityM3;
-  }
-  if (cargoCapacityM3 > 0) {
-    return cargoCapacityM3;
-  }
-  return Math.max(0, toFiniteNumber(fallbackCapacityM3, 0));
-}
-
-function buildNpcCargoResourceState(typeID, options = {}) {
-  const numericTypeID = toInt(typeID, 0);
-  if (numericTypeID <= 0) {
-    return null;
-  }
-  const shipItem =
-    options.shipItem && typeof options.shipItem === "object"
-      ? options.shipItem
-      : {
-          itemID: -numericTypeID,
-          typeID: numericTypeID,
-          quantity: 1,
-          stacksize: 1,
-          singleton: 1,
-        };
-  try {
-    return buildShipResourceState(0, shipItem, {
-      fittedItems: Array.isArray(options.fittedItems)
-        ? options.fittedItems
-        : [],
-      skillMap: options.skillMap instanceof Map
-        ? options.skillMap
-        : new Map(),
-      includeActiveImplantModifiers: false,
-    });
-  } catch (error) {
-    log.warn(
-      `[MiningFleet] dogma cargo capacity resolution failed type=${numericTypeID}: ` +
-      String(error && error.message || error),
-    );
-    return null;
-  }
-}
-
-function getNpcCargoCapacityM3ForTypeID(
-  typeID,
-  fallbackCapacityM3,
-  options = {},
-) {
-  const numericTypeID = toInt(typeID, 0);
-  const rawMiningHoldCapacityM3 = Math.max(
-    0,
-    toFiniteNumber(
-      getTypeAttributeValue(numericTypeID, "generalMiningHoldCapacity"),
-      0,
-    ),
-  );
-  const skillMap =
-    options.skillMap instanceof Map ? options.skillMap : new Map();
-  const resourceState = buildNpcCargoResourceState(numericTypeID, options);
-  if (rawMiningHoldCapacityM3 > 0) {
-    // A type-only query must return the literal SDE base. Governed NPCs with
-    // authored skills receive the dogma-adjusted mining hold instead.
-    if (skillMap.size <= 0) {
-      return rawMiningHoldCapacityM3;
-    }
-    const adjustedMiningHoldCapacityM3 = Math.max(
-      0,
-      toFiniteNumber(
-        resourceState && resourceState.generalMiningHoldCapacity,
-        0,
-      ),
-    );
-    return adjustedMiningHoldCapacityM3 > 0
-      ? adjustedMiningHoldCapacityM3
-      : rawMiningHoldCapacityM3;
-  }
-
-  const dogmaCapacityM3 = resolveNpcCargoCapacityFromResourceState(
-    resourceState,
-    0,
-  );
-  if (dogmaCapacityM3 > 0) {
-    return dogmaCapacityM3;
-  }
-
-  const itemType = resolveItemByTypeID(numericTypeID) || null;
-  const registryCapacityM3 = Math.max(
-    0,
-    toFiniteNumber(
-      getTypeAttributeValue(numericTypeID, "capacity"),
-      toFiniteNumber(itemType && itemType.capacity, 0),
-    ),
-  );
-  return registryCapacityM3 > 0
-    ? registryCapacityM3
-    : Math.max(0, toFiniteNumber(fallbackCapacityM3, 0));
-}
-
 function getNpcCargoCapacityM3(entity, fallbackCapacityM3) {
-  if (!entity || typeof entity !== "object") {
-    return Math.max(0, toFiniteNumber(fallbackCapacityM3, 0));
-  }
-  const fittedItems = getNpcFittedModuleItems(entity);
-  const skillMap =
-    entity.skillMap instanceof Map ? entity.skillMap : new Map();
-  const fittedSignature = fittedItems
-    .map((item) => [
-      toInt(item && item.typeID, 0),
-      toInt(item && item.flagID, 0),
-      isModuleOnline(item) ? 1 : 0,
-    ].join(":"))
-    .sort()
-    .join("|");
-  const cached = miningCargoCapacitySnapshotByEntity.get(entity);
-  if (
-    cached &&
-    cached.typeID === toInt(entity.typeID, 0) &&
-    cached.fittedSignature === fittedSignature &&
-    cached.skillMap === skillMap
-  ) {
-    return cached.capacityM3;
-  }
-
-  const capacityM3 = getNpcCargoCapacityM3ForTypeID(
-    toInt(entity.typeID, 0),
-    fallbackCapacityM3,
-    {
-      shipItem: entity,
-      fittedItems,
-      skillMap,
-    },
-  );
-  miningCargoCapacitySnapshotByEntity.set(entity, {
-    typeID: toInt(entity.typeID, 0),
-    fittedSignature,
-    skillMap,
-    capacityM3,
-  });
-  return capacityM3;
-}
-
-function estimateNpcMiningVolume(options = {}) {
-  const shipTypeID = toInt(options.shipTypeID, 0);
-  const durationMs = Math.max(0, toInt(options.durationMs, 0));
-  const resourceFamily =
-    String(options.resourceFamily || "ore").trim().toLowerCase() || "ore";
-  const supportBonus =
-    options.supportBonus && typeof options.supportBonus === "object"
-      ? options.supportBonus
-      : {};
-  const cycleTimeMultiplier = Math.max(
-    0.5,
-    Math.min(1, toFiniteNumber(supportBonus.cycleTimeMultiplier, 1)),
-  );
-  if (shipTypeID <= 0 || durationMs <= 0) {
-    return {
-      shipTypeID,
-      durationMs,
-      capacityM3: 0,
-      estimatedVolumeM3: 0,
-      moduleCycles: [],
-    };
-  }
-
-  const fittedItems = [];
-  const skillMap = options.skillMap instanceof Map ? options.skillMap : new Map();
-  let itemNumber = 2;
-  for (const entry of Array.isArray(options.modules) ? options.modules : []) {
-    const typeID = toInt(entry && entry.typeID, 0);
-    const quantity = Math.max(0, toInt(entry && entry.quantity, 0));
-    const moduleType = resolveItemByTypeID(typeID) || {};
-    for (let index = 0; typeID > 0 && index < quantity; index += 1) {
-      fittedItems.push({
-        itemID: -itemNumber,
-        typeID,
-        itemName: String(moduleType.name || moduleType.typeName || ""),
-        quantity: 1,
-        stacksize: 1,
-        singleton: 1,
-        flagID: 26 + itemNumber,
-        online: true,
-      });
-      itemNumber += 1;
-    }
-  }
-
-  const shipItem = {
-    itemID: -1,
-    typeID: shipTypeID,
-    quantity: 1,
-    stacksize: 1,
-    singleton: 1,
-  };
-  const moduleCycles = fittedItems
-    .map((moduleItem) => {
-      const snapshot = buildMiningModuleSnapshot({
-        shipItem,
-        moduleItem,
-        effectRecord: null,
-        fittedItems,
-        skillMap,
-      });
-      if (!snapshot || snapshot.family !== resourceFamily) {
-        return null;
-      }
-      const cycleDurationMs = Math.max(
-        1,
-        snapshot.durationMs * cycleTimeMultiplier,
-      );
-      const cycles = Math.max(0, Math.floor(durationMs / cycleDurationMs));
-      return {
-        moduleTypeID: snapshot.moduleTypeID,
-        resourceFamily,
-        cycleDurationMs,
-        yieldPerCycleM3: snapshot.miningAmountM3,
-        cycles,
-        volumeM3: cycles * snapshot.miningAmountM3,
-      };
-    })
-    .filter(Boolean);
-  const capacityM3 = Math.max(
+  const itemType = resolveItemByTypeID(toInt(entity && entity.typeID, 0)) || null;
+  const explicitHullCapacity = Math.max(
     0,
     toFiniteNumber(
-      options.capacityM3,
-      getNpcCargoCapacityM3ForTypeID(
-        shipTypeID,
-        toFiniteNumber(
-          config.miningNpcMinerCargoCapacityM3,
-          DEFAULT_MINING_MINER_CARGO_CAPACITY_M3,
-        ),
-        { shipItem, fittedItems, skillMap },
-      ),
+      MINING_NPC_CARGO_CAPACITY_M3_BY_TYPE_ID[toInt(entity && entity.typeID, 0)],
+      0,
     ),
   );
-  const rawVolumeM3 = moduleCycles.reduce(
-    (sum, entry) => sum + toFiniteNumber(entry.volumeM3, 0),
-    0,
-  );
-  return {
-    shipTypeID,
-    durationMs,
-    resourceFamily,
-    capacityM3,
-    estimatedVolumeM3: Math.min(capacityM3, rawVolumeM3),
-    supportBonus:
-      Object.keys(supportBonus).length > 0
-        ? {
-            supportClass: String(
-              supportBonus.supportClass || "industrial_command",
-            ),
-            cycleTimeMultiplier,
-            rangeMultiplier: Math.max(
-              1,
-              toFiniteNumber(supportBonus.rangeMultiplier, 1),
-            ),
-          }
-        : null,
-    moduleCycles,
-  };
+  if (explicitHullCapacity > 0) {
+    return explicitHullCapacity;
+  }
+  const configuredCapacity = toFiniteNumber(fallbackCapacityM3, 0);
+  if (configuredCapacity > 0) {
+    return configuredCapacity;
+  }
+  const itemTypeCapacity = toFiniteNumber(itemType && itemType.capacity, 0);
+  return itemTypeCapacity > 0 ? itemTypeCapacity : 0;
 }
 
 function getFleetCargoState(scene, fleetRecord) {
@@ -3205,15 +1468,6 @@ function getFleetEntities(scene, fleetRecord, options = {}) {
   return getFleetEntityIDs(fleetRecord, options)
     .map((entityID) => scene.getEntityByID(entityID))
     .filter(Boolean);
-}
-
-function isFleetWarpInProgress(scene, fleetRecord) {
-  return getFleetEntities(scene, fleetRecord).some((entity) => (
-    entity.mode === "WARP" ||
-    Boolean(entity.pendingWarp) ||
-    Boolean(entity.warpState) ||
-    Boolean(entity.sessionlessWarpIngress)
-  ));
 }
 
 function resolveFleetRepresentativeNpcEntity(scene, fleetRecord) {
@@ -3498,524 +1752,2734 @@ function clearNpcMiningCargo(entity) {
   return removedVolumeM3;
 }
 
-function getInventoryStackQuantity(item) {
-  return Math.max(
-    0,
-    toInt(item && (item.quantity ?? item.stacksize), 0),
-  );
-}
-
-function getInventoryStackVolumeM3(item) {
-  const typeRecord =
-    resolveItemByTypeID(toInt(item && item.typeID, 0)) || {};
-  return getInventoryStackQuantity(item) * Math.max(
-    0,
-    toFiniteNumber(
-      item && item.volume,
-      toFiniteNumber(typeRecord.volume, 0),
+function createMiningFleetRecord(options = {}) {
+  const minerEntityIDs = (Array.isArray(options.minerEntityIDs) ? options.minerEntityIDs : [])
+    .map((value) => normalizePositiveInteger(value, null))
+    .filter(Boolean);
+  const miningWorkerEntityIDs = (
+    Array.isArray(options.miningWorkerEntityIDs)
+      ? options.miningWorkerEntityIDs
+      : minerEntityIDs
+  )
+    .map((value) => normalizePositiveInteger(value, null))
+    .filter(
+      (entityID) =>
+        entityID && minerEntityIDs.includes(entityID),
+    );
+  const miningSupportEntityIDs = (
+    Array.isArray(options.miningSupportEntityIDs)
+      ? options.miningSupportEntityIDs
+      : []
+  )
+    .map((value) => normalizePositiveInteger(value, null))
+    .filter(
+      (entityID) =>
+        entityID && minerEntityIDs.includes(entityID),
+    );
+  const haulerEntityIDs = (Array.isArray(options.haulerEntityIDs) ? options.haulerEntityIDs : [])
+    .map((value) => normalizePositiveInteger(value, null))
+    .filter(Boolean);
+  const responseEntityIDs = (Array.isArray(options.responseEntityIDs) ? options.responseEntityIDs : [])
+    .map((value) => normalizePositiveInteger(value, null))
+    .filter(Boolean);
+  const scene = options.scene && typeof options.scene === "object"
+    ? options.scene
+    : null;
+  const sceneDescriptor =
+    options.sceneDescriptor && typeof options.sceneDescriptor === "object"
+      ? options.sceneDescriptor
+      : scene && scene.sceneDescriptor && typeof scene.sceneDescriptor === "object"
+      ? scene.sceneDescriptor
+      : null;
+  const createdAtMs = Math.max(0, toInt(options.createdAtMs, Date.now()));
+  const fleetRecord = {
+    fleetID: nextMiningFleetID++,
+    source: String(options.source || "gm"),
+    sceneDescriptor: sceneDescriptor ? { ...sceneDescriptor } : null,
+    operatorKind:
+      String(options.operatorKind || "").trim() || null,
+    operatorID:
+      String(options.operatorID || "").trim() || null,
+    threatDoctrine: normalizeManagedThreatDoctrine(
+      options.threatDoctrine,
     ),
-  );
-}
-
-function getMiningJetcanCapacityM3() {
-  return Math.max(
-    1_000,
-    toFiniteNumber(
-      config.miningNpcJetcanCapacityM3,
-      DEFAULT_MINING_JETCAN_CAPACITY_M3,
-    ),
-  );
-}
-
-function getMiningJetcanContents(containerID) {
-  return listContainerItems(null, toInt(containerID, 0), null)
-    .filter((item) => getInventoryStackQuantity(item) > 0);
-}
-
-function getMiningJetcanUsedVolumeM3(containerID) {
-  return getMiningJetcanContents(containerID).reduce(
-    (sum, item) => sum + getInventoryStackVolumeM3(item),
-    0,
-  );
-}
-
-function removeNpcMiningCargoQuantity(entity, cargoItem, quantity) {
-  const requestedQuantity = Math.max(0, toInt(quantity, 0));
-  const currentQuantity = Math.max(
-    0,
-    toInt(cargoItem && cargoItem.quantity, 0),
-  );
-  if (
-    !entity ||
-    !cargoItem ||
-    requestedQuantity <= 0 ||
-    currentQuantity <= 0
-  ) {
-    return 0;
-  }
-  const removedQuantity = Math.min(currentQuantity, requestedQuantity);
-  const remainingQuantity = currentQuantity - removedQuantity;
-  if (remainingQuantity > 0) {
-    cargoItem.quantity = remainingQuantity;
-    cargoItem.stacksize = remainingQuantity;
-    ensureNpcCargoStoreEntry(entity, cargoItem);
-    return removedQuantity;
-  }
-  entity.nativeCargoItems = (
-    Array.isArray(entity.nativeCargoItems) ? entity.nativeCargoItems : []
-  ).filter(
-    (entry) =>
-      toInt(entry && entry.itemID, 0) !== toInt(cargoItem.itemID, 0),
-  );
-  if (toInt(cargoItem.itemID, 0) > 0) {
-    nativeNpcStore.removeNativeCargo(cargoItem.itemID);
-  }
-  return removedQuantity;
-}
-
-function getMiningJetcanRecord(fleetRecord, containerID) {
-  if (!fleetRecord || !fleetRecord.jetcanRecordsByID) {
-    return null;
-  }
-  return (
-    fleetRecord.jetcanRecordsByID[String(toInt(containerID, 0))] ||
-    null
-  );
-}
-
-function detachMiningJetcanRecord(fleetRecord, containerID) {
-  const normalizedContainerID = toInt(containerID, 0);
-  const record = getMiningJetcanRecord(
-    fleetRecord,
-    normalizedContainerID,
-  );
-  if (!record) {
-    return null;
-  }
-  const minerKey = String(toInt(record.minerEntityID, 0));
-  if (
-    toInt(
-      fleetRecord.activeJetcanIDByMinerID &&
-        fleetRecord.activeJetcanIDByMinerID[minerKey],
+    physicalShipLimit: Math.max(
       0,
-    ) === normalizedContainerID
-  ) {
-    delete fleetRecord.activeJetcanIDByMinerID[minerKey];
-  }
-  delete fleetRecord.jetcanRecordsByID[
-    String(normalizedContainerID)
-  ];
-  return record;
-}
-
-function createMiningJetcan(scene, fleetRecord, minerEntity, now) {
-  if (
-    !scene ||
-    !fleetRecord ||
-    !minerEntity ||
-    !npcService.getControllerByEntityID(toInt(minerEntity.itemID, 0))
-  ) {
-    return null;
-  }
-  const minerScope = resolveEntityInteractionScope(minerEntity);
-  if (!minerScope.valid) {
-    return null;
-  }
-  const containerLookup = resolveItemByName("Cargo Container");
-  if (
-    !containerLookup ||
-    !containerLookup.success ||
-    !containerLookup.match
-  ) {
-    return null;
-  }
-  const ownerID = normalizePositiveInteger(
-    fleetRecord.cargoOwnerID,
-    normalizePositiveInteger(
-      minerEntity.ownerID ??
-        minerEntity.corporationID ??
-        minerEntity.pilotCharacterID,
+      toInt(options.physicalShipLimit, 0),
+    ),
+    cargoOwnerID: normalizePositiveInteger(options.cargoOwnerID, 0),
+    cargoCorporationID: normalizePositiveInteger(
+      options.cargoCorporationID,
       0,
     ),
-  );
-  if (ownerID <= 0) {
-    return null;
-  }
-  const direction = normalizeVector(
-    minerEntity.direction,
-    { x: 1, y: 0, z: 0 },
-  );
-  const jettisonDistanceMeters = Math.max(
-    275,
-    toFiniteNumber(config.miningNpcJetcanJettisonDistanceMeters, 750),
-  );
-  const position = {
-    x: toFiniteNumber(minerEntity.position && minerEntity.position.x, 0) +
-      (direction.x * jettisonDistanceMeters),
-    y: toFiniteNumber(minerEntity.position && minerEntity.position.y, 0) +
-      (direction.y * jettisonDistanceMeters),
-    z: toFiniteNumber(minerEntity.position && minerEntity.position.z, 0) +
-      (direction.z * jettisonDistanceMeters),
+    cargoTransient: options.cargoTransient !== false,
+    jetcanNamePrefix: String(options.jetcanNamePrefix || "").trim() || null,
+    externalContainerCollector:
+      typeof options.externalContainerCollector === "function"
+        ? options.externalContainerCollector
+        : null,
+    externalManifestID:
+      String(options.externalManifestID || "").trim() || null,
+    externalCollectionError: null,
+    nextExternalCollectionAttemptAtMs: 0,
+    onManagedFleetDestroyed:
+      typeof options.onManagedFleetDestroyed === "function"
+        ? options.onManagedFleetDestroyed
+        : null,
+    onManagedDroneStockChanged:
+      typeof options.onManagedDroneStockChanged === "function"
+        ? options.onManagedDroneStockChanged
+        : null,
+    managedResourcesReleased: false,
+    startupKey: String(options.startupKey || "").trim() || null,
+    createdByCharacterID: normalizePositiveInteger(options.createdByCharacterID, 0),
+    systemID: normalizePositiveInteger(
+      options.systemID || scene && scene.systemID,
+      0,
+    ),
+    sceneKey: String(
+      options.sceneKey || scene && scene.sceneKey ||
+        sceneDescriptor && sceneDescriptor.sceneKey || "",
+    ).trim() || null,
+    sceneKind: String(
+      options.sceneKind || scene && scene.sceneKind ||
+        sceneDescriptor && sceneDescriptor.sceneKind || "",
+    ).trim() || null,
+    instanceID: normalizePositiveInteger(
+      options.instanceID || scene && scene.instanceID ||
+        sceneDescriptor && sceneDescriptor.instanceID,
+      0,
+    ),
+    targetShipID: normalizePositiveInteger(options.targetShipID, 0),
+    minerEntityIDs,
+    // Support hulls remain in minerEntityIDs so all legacy fleet lifecycle
+    // code still sees them. These subsets preserve each managed crew role.
+    miningWorkerEntityIDs,
+    miningSupportEntityIDs,
+    supportEntityIDs: miningSupportEntityIDs,
+    haulerEntityIDs,
+    responseEntityIDs,
+    resourceKind: normalizeMiningResourceKind(options.resourceKind, null),
+    managedRoster: (
+      Array.isArray(options.managedRoster)
+        ? options.managedRoster
+        : []
+    )
+      .map((entry) => ({
+        memberID:
+          String(entry && entry.memberID || "").trim() ||
+          null,
+        index: Math.max(
+          0,
+          toInt(entry && entry.index, 0),
+        ),
+        entityID: normalizePositiveInteger(
+          entry && entry.entityID,
+          0,
+        ),
+        role:
+          String(entry && entry.role || "").trim() ||
+          null,
+        profileID:
+          String(entry && entry.profileID || "").trim() ||
+          null,
+        pilotIdentity:
+          entry &&
+          entry.pilotIdentity &&
+          typeof entry.pilotIdentity === "object"
+            ? { ...entry.pilotIdentity }
+            : null,
+        livingUniverseActorID:
+          String(
+            entry && entry.livingUniverseActorID || "",
+          ).trim() || null,
+      }))
+      .filter((entry) => entry.entityID > 0),
+    spawnSelectionName: options.spawnSelectionName ? String(options.spawnSelectionName) : null,
+    haulerSelectionName: options.haulerSelectionName ? String(options.haulerSelectionName) : null,
+    responseSelectionName: options.responseSelectionName ? String(options.responseSelectionName) : null,
+    originAnchor: options.originAnchor || null,
+    activeAsteroidID: normalizePositiveInteger(options.activeAsteroidID, 0),
+    assignedAsteroidIDsByMinerID:
+      options.assignedAsteroidIDsByMinerID &&
+      typeof options.assignedAsteroidIDsByMinerID === "object"
+        ? { ...options.assignedAsteroidIDsByMinerID }
+        : {},
+    state: String(options.state || "mining"),
+    createdAtMs,
+    expiresAtMs: Math.max(
+      0,
+      toInt(options.expiresAtMs, createdAtMs + MINING_FLEET_LIFETIME_MS),
+    ),
+    departDespawnAtMs: 0,
+    nextThinkAtMs: 0,
+    haulCompleteAtMs: 0,
+    haulerReturnAtMs: 0,
+    haulerNextArrivalAtMs: Math.max(
+      0,
+      toInt(
+        options.haulerNextArrivalAtMs,
+        haulerEntityIDs.length > 0
+          ? createdAtMs + getHaulerInitialDelayMs()
+          : 0,
+      ),
+    ),
+    resumeAtMs: 0,
+    retreatSitePosition: null,
+    retreatWarpPendingEntityIDs: [],
+    nextRetreatWarpRetryAtMs: 0,
+    lastRetreatWarpErrors: [],
+    managedSiteReturnAtMs: 0,
+    responseDespawnAtMs: 0,
+    responseRetreating: options.responseRetreating === true,
+    lastHauledVolumeM3: 0,
+    lastHauledAtMs: 0,
+    lastAggressorID: normalizePositiveInteger(options.lastAggressorID, 0),
+    lastAggressedAtMs: Math.max(0, toInt(options.lastAggressedAtMs, 0)),
+    lastProcessedAggressionAtMs: Math.max(0, toInt(options.lastProcessedAggressionAtMs, 0)),
+    lastResponseAtMs: Math.max(0, toInt(options.lastResponseAtMs, 0)),
+    responseTargetID: normalizePositiveInteger(options.responseTargetID, 0),
+    responseStandingClass: String(options.responseStandingClass || "").trim() || null,
+    responseStandingValue: toFiniteNumber(options.responseStandingValue, 0),
+    onGridSupport: options.onGridSupport === true,
+    jetcanRecordsByID: {},
+    activeJetcanIDByMinerID: {},
+    activeTractorCanID: 0,
+    activeTractorHaulerID: 0,
+    activeTractorModuleID: 0,
+    supportHaulerState: "idle",
+    supportHaulerEntityID: 0,
+    supportHaulerDeliveryCompleteAtMs: 0,
+    supportHaulerReturnAtMs: 0,
+    supportHaulerReturnPosition: null,
+    supportDeliveryCount: 0,
+    haulerOperationallyFull: false,
+    defensiveDroneFlightIDsByControllerID: {},
+    defenseDroneLossDetected: false,
+    defenseDecision: null,
+    managedThreatScanCount: 0,
+    lastManagedThreatScanAtMs: -1,
+    lastManagedThreatScanCandidateCount: 0,
+    lastManagedThreatScanResult: null,
+    jetcansCreated: 0,
+    jetcansCollected: 0,
+    jetcanVolumeTransferredM3: 0,
   };
-  const corporationID = normalizePositiveInteger(
-    fleetRecord.cargoCorporationID,
-    normalizePositiveInteger(minerEntity.corporationID, 0),
+  fleetRecord.memberBindings = fleetRecord.managedRoster;
+  applyMiningFleetCommandBurstAffinity(
+    fleetRecord,
+    options.scene || null,
   );
-  const itemName = `${String(
-    fleetRecord.jetcanNamePrefix ||
-      minerEntity.itemName ||
-      "Mining Fleet",
-  )} Jetcan`;
-  const entityScopeMetadata = buildChildEntityScopeMetadata(minerEntity);
-  const createResult = createSpaceItemForOwner(
-    ownerID,
-    scene.systemID,
-    containerLookup.match,
-    {
-      ...entityScopeMetadata,
-      itemName,
-      position,
-      velocity: { x: 0, y: 0, z: 0 },
-      direction,
-      targetPoint: position,
-      mode: "STOP",
-      speedFraction: 0,
-      transient: fleetRecord.cargoTransient !== false,
-      createdAtMs: now,
-      expiresAtMs: now + DEFAULT_MINING_JETCAN_LIFETIME_MS,
-      launcherID: toInt(minerEntity.itemID, 0),
-      customInfo: JSON.stringify({
-        evejsLoot: {
-          corporationID,
-          lootRightCorpID: corporationID,
-        },
-        evejsNpcMining: {
-          fleetID: fleetRecord.fleetID,
-          minerEntityID: toInt(minerEntity.itemID, 0),
-        },
-      }),
-    },
-  );
-  const containerID = toInt(
-    createResult && createResult.data && createResult.data.itemID,
-    0,
-  );
-  if (!createResult || !createResult.success || containerID <= 0) {
+  miningFleetStateByID.set(fleetRecord.fleetID, fleetRecord);
+  return fleetRecord;
+}
+
+function getMiningFleetsForSystem(systemID) {
+  const normalizedSystemID = normalizePositiveInteger(systemID, 0);
+  const fleets = [];
+  for (const fleetRecord of miningFleetStateByID.values()) {
+    if (normalizePositiveInteger(fleetRecord && fleetRecord.systemID, 0) === normalizedSystemID) {
+      fleets.push(fleetRecord);
+    }
+  }
+  return fleets;
+}
+
+function getMiningFleetsForScene(scene) {
+  const systemID = normalizePositiveInteger(scene && scene.systemID, 0);
+  const sceneDescriptor = scene && scene.sceneDescriptor || {};
+  const sceneKey = String(
+    scene && scene.sceneKey || sceneDescriptor.sceneKey || "",
+  ).trim();
+  const sceneKind = String(
+    scene && scene.sceneKind || sceneDescriptor.sceneKind || "solarSystem",
+  ).trim();
+  return getMiningFleetsForSystem(systemID).filter((fleetRecord) => {
+    const fleetSceneKey = String(fleetRecord && fleetRecord.sceneKey || "").trim();
+    if (fleetSceneKey) {
+      return Boolean(sceneKey && fleetSceneKey === sceneKey);
+    }
+    // Pre-scene-key records are ordinary-space compatibility state only. They
+    // must never be adopted by an isolated scene that shares the numeric host.
+    return sceneKind !== "abyssal";
+  });
+}
+
+function pruneMiningFleet(fleetRecord) {
+  if (!fleetRecord) {
     return null;
   }
-
-  const spawnResult = getSpaceRuntime().spawnDynamicInventoryEntity(
-    scene.systemID,
-    containerID,
-    {
-      broadcast: false,
-      entityScopeMetadata,
-    },
-  );
-  const containerEntity =
-    spawnResult &&
-    spawnResult.success &&
-    spawnResult.data &&
-    spawnResult.data.entity
-      ? spawnResult.data.entity
-      : scene.getEntityByID(containerID);
+  fleetRecord.minerEntityIDs = (Array.isArray(fleetRecord.minerEntityIDs) ? fleetRecord.minerEntityIDs : [])
+    .filter((entityID) => npcService.getControllerByEntityID(entityID));
+  fleetRecord.haulerEntityIDs = (Array.isArray(fleetRecord.haulerEntityIDs) ? fleetRecord.haulerEntityIDs : [])
+    .filter((entityID) => npcService.getControllerByEntityID(entityID));
+  fleetRecord.responseEntityIDs = (Array.isArray(fleetRecord.responseEntityIDs) ? fleetRecord.responseEntityIDs : [])
+    .filter((entityID) => npcService.getControllerByEntityID(entityID));
+  if (fleetRecord.haulerEntityIDs.length <= 0) {
+    fleetRecord.haulerNextArrivalAtMs = 0;
+  }
+  if (fleetRecord.responseEntityIDs.length <= 0) {
+    fleetRecord.responseTargetID = 0;
+    fleetRecord.responseDespawnAtMs = 0;
+    fleetRecord.responseRetreating = false;
+  }
+  const assignmentMap = getFleetMinerAssignmentMap(fleetRecord);
+  for (const minerEntityID of Object.keys(assignmentMap)) {
+    if (!fleetRecord.minerEntityIDs.includes(toInt(minerEntityID, 0))) {
+      delete assignmentMap[minerEntityID];
+    }
+  }
   if (
-    !containerEntity ||
-    !canEntitiesInteractLocally(minerEntity, containerEntity)
+    fleetRecord.minerEntityIDs.length === 0 &&
+    fleetRecord.haulerEntityIDs.length === 0 &&
+    fleetRecord.responseEntityIDs.length === 0
   ) {
-    if (containerEntity) {
-      getSpaceRuntime().removeDynamicEntity(scene.systemID, containerID, {
-        persistSpaceState: false,
+    miningFleetStateByID.delete(fleetRecord.fleetID);
+    return null;
+  }
+  return fleetRecord;
+}
+
+function destroyFleetEntities(fleetRecord) {
+  const entityIDs = [
+    ...(Array.isArray(fleetRecord && fleetRecord.minerEntityIDs) ? fleetRecord.minerEntityIDs : []),
+    ...(Array.isArray(fleetRecord && fleetRecord.haulerEntityIDs) ? fleetRecord.haulerEntityIDs : []),
+    ...(Array.isArray(fleetRecord && fleetRecord.responseEntityIDs) ? fleetRecord.responseEntityIDs : []),
+  ];
+  let destroyedCount = 0;
+  for (const entityID of entityIDs) {
+    const destroyResult = npcService.destroyNpcControllerByEntityID(entityID, {
+      removeContents: true,
+    });
+    if (destroyResult && destroyResult.success) {
+      destroyedCount += 1;
+    }
+  }
+  return destroyedCount;
+}
+
+function buildSpawnResultEntityIDs(spawnResult) {
+  return (
+    spawnResult &&
+    spawnResult.data &&
+    Array.isArray(spawnResult.data.spawned)
+      ? spawnResult.data.spawned
+        .map((entry) => normalizePositiveInteger(entry && entry.entity && entry.entity.itemID, null))
+        .filter(Boolean)
+      : []
+  );
+}
+
+function spawnFleetWing(systemID, centerTarget, options = {}) {
+  const amount = Math.max(1, toInt(options.amount, 1));
+  const profileQuery = String(options.profileQuery || "").trim();
+  const originAnchor = options.originAnchor || null;
+  const sharedSpawnOptions = {
+    ...(options.sceneDescriptor
+      ? { sceneDescriptor: options.sceneDescriptor }
+      : {}),
+    ...(options.entityScopeMetadata && typeof options.entityScopeMetadata === "object"
+      ? { entityScopeMetadata: options.entityScopeMetadata }
+      : {}),
+    transient: true,
+    broadcast: false,
+    skipInitialBehaviorTick: true,
+    preferredTargetID: normalizePositiveInteger(options.preferredTargetID, 0),
+    anchorDescriptor: originAnchor
+      ? {
+          kind: "coordinates",
+          position: originAnchor.position,
+          direction: originAnchor.direction,
+          name: String(options.anchorName || "Mining Fleet Warp Origin"),
+        }
+      : null,
+  };
+  const groupResolution = profileQuery
+    ? resolveNpcSpawnGroup(profileQuery, "")
+    : {
+      success: false,
+    };
+  let spawnResult = null;
+  if (groupResolution.success && groupResolution.data) {
+    const spawned = [];
+    let partialFailure = null;
+    for (let iteration = 0; iteration < amount; iteration += 1) {
+      const groupSpawnResult = npcService.spawnNpcGroupInSystem(systemID, {
+        ...sharedSpawnOptions,
+        spawnGroupQuery: profileQuery,
+        entityType: ENTITY_TYPE.NPC,
+      });
+      if (
+        !groupSpawnResult.success ||
+        !groupSpawnResult.data ||
+        !Array.isArray(groupSpawnResult.data.spawned) ||
+        groupSpawnResult.data.spawned.length <= 0
+      ) {
+        if (spawned.length <= 0) {
+          return groupSpawnResult;
+        }
+        partialFailure = {
+          failedAt: iteration + 1,
+          errorMsg: groupSpawnResult.errorMsg || "NPC_GROUP_SPAWN_FAILED",
+        };
+        break;
+      }
+      spawned.push(...groupSpawnResult.data.spawned);
+      if (groupSpawnResult.data.partialFailure) {
+        partialFailure = groupSpawnResult.data.partialFailure;
+        break;
+      }
+    }
+    spawnResult = {
+      success: true,
+      data: {
+        selectionKind: "group",
+        selectionID: groupResolution.data.spawnGroupID,
+        selectionName: groupResolution.data.name || groupResolution.data.spawnGroupID,
+        requestedAmount: amount,
+        spawned,
+        partialFailure,
+      },
+      suggestions: [],
+    };
+  } else {
+    spawnResult = npcService.spawnNpcBatchInSystem(systemID, {
+      ...sharedSpawnOptions,
+      profileQuery,
+      amount,
+    });
+  }
+  if (!spawnResult.success || !spawnResult.data || !Array.isArray(spawnResult.data.spawned) || spawnResult.data.spawned.length <= 0) {
+    return spawnResult;
+  }
+
+  if (options.warpIn !== false && centerTarget && centerTarget.position) {
+    const landingRadiusMeters = Math.max(
+      500,
+      toFiniteNumber(
+        options.landingRadiusMeters,
+        DEFAULT_MINING_WARP_LANDING_RADIUS_METERS,
+      ),
+    );
+    const warpRequests = spawnResult.data.spawned.map((entry, index, list) => ({
+      entityID: normalizePositiveInteger(entry && entry.entity && entry.entity.itemID, 0),
+      point: buildMiningWarpLandingPoint(
+        centerTarget.position,
+        index,
+        list.length,
+        landingRadiusMeters,
+      ),
+      options: {
+        forceImmediateStart: true,
+        broadcastWarpStartToVisibleSessions: true,
+        visibilitySuppressMs: 250,
+        ingressDurationMs: Math.max(
+          250,
+          toFiniteNumber(
+            config.miningNpcWarpIngressDurationMs,
+            DEFAULT_MINING_WARP_INGRESS_DURATION_MS,
+          ),
+        ),
+      },
+    }));
+    const warpResult = npcService.runtime.warpBatchToPoints(warpRequests, {
+      groupWake: true,
+    });
+    if (!warpResult.success) {
+      return warpResult;
+    }
+  }
+
+  return spawnResult;
+}
+
+function resolveSessionScene(session) {
+  if (!session || !session._space) {
+    return null;
+  }
+  const spaceRuntime = require(path.join(__dirname, "../../space/runtime"));
+  return spaceRuntime.getSceneForSession(session);
+}
+
+function spawnMiningFleetInternal(scene, options = {}) {
+  const systemID = normalizePositiveInteger(options.systemID || (scene && scene.systemID), 0);
+  const centerTarget = options.centerTarget || buildSpawnTarget(scene);
+  if (!systemID || !centerTarget || !centerTarget.position) {
+    return {
+      success: false,
+      errorMsg: "SPAWN_TARGET_NOT_FOUND",
+    };
+  }
+
+  const originAnchor = options.originAnchor || buildOffgridOriginAnchor(scene, centerTarget);
+  const entityScopeMetadata = buildChildEntityScopeMetadata(centerTarget);
+  const resolvedMinerQuery = resolveMiningFleetQuery(
+    scene,
+    options.minerQuery,
+    systemID,
+  );
+  const minerSpawnResult = spawnFleetWing(systemID, centerTarget, {
+    sceneDescriptor: scene.sceneDescriptor,
+    amount: Math.max(
+      1,
+      toInt(
+        options.minerAmount,
+        toInt(config.miningNpcFleetDefaultCount, DEFAULT_MINING_FLEET_COUNT),
+      ),
+    ),
+    profileQuery: resolvedMinerQuery,
+    entityScopeMetadata,
+    preferredTargetID: 0,
+    originAnchor,
+    warpIn: true,
+    landingRadiusMeters: toFiniteNumber(
+      config.miningNpcFleetLandingRadiusMeters,
+      DEFAULT_MINING_WARP_LANDING_RADIUS_METERS,
+    ),
+  });
+  if (!minerSpawnResult.success || !minerSpawnResult.data) {
+    return minerSpawnResult;
+  }
+
+  const haulerAmount = Math.max(
+    0,
+    toInt(
+      options.haulerAmount,
+      toInt(config.miningNpcHaulerDefaultCount, DEFAULT_MINING_HAULER_COUNT),
+    ),
+  );
+  let haulerSpawnResult = null;
+  if (haulerAmount > 0) {
+    const resolvedHaulerQuery = resolveMiningHaulerQuery(
+      scene,
+      options.haulerQuery,
+      systemID,
+    );
+    haulerSpawnResult = spawnFleetWing(systemID, originAnchor, {
+      sceneDescriptor: scene.sceneDescriptor,
+      amount: haulerAmount,
+      profileQuery: resolvedHaulerQuery,
+      entityScopeMetadata,
+      preferredTargetID: 0,
+      originAnchor,
+      warpIn: false,
+    });
+    if (!haulerSpawnResult.success || !haulerSpawnResult.data) {
+      const minerEntityIDs = buildSpawnResultEntityIDs(minerSpawnResult);
+      for (const entityID of minerEntityIDs) {
+        npcService.destroyNpcControllerByEntityID(entityID, {
+          removeContents: true,
+        });
+      }
+      return haulerSpawnResult;
+    }
+  }
+
+  for (const entityID of buildSpawnResultEntityIDs(minerSpawnResult)) {
+    applyPassiveMiningFleetOverrides(entityID, {
+      movementMode: "orbit",
+      orbitDistanceMeters: 1_200,
+      followRangeMeters: 800,
+      idleAnchorOrbit: false,
+      issueStopOrder: false,
+      clearCombatPreference: true,
+    });
+  }
+  for (const entityID of buildSpawnResultEntityIDs(haulerSpawnResult)) {
+    applyPassiveMiningFleetOverrides(entityID, {
+      movementMode: "stop",
+      orbitDistanceMeters: 500,
+      followRangeMeters: 500,
+      idleAnchorOrbit: false,
+      idleAnchorOrbitDistanceMeters: 500,
+      clearCombatPreference: true,
+    });
+  }
+
+  return {
+    success: true,
+    data: {
+      originAnchor,
+      minerSpawnResult,
+      haulerSpawnResult,
+      centerTarget,
+      minerEntityIDs: buildSpawnResultEntityIDs(minerSpawnResult),
+      haulerEntityIDs: buildSpawnResultEntityIDs(haulerSpawnResult),
+    },
+  };
+}
+
+function issueResponseOrders(responseEntityIDs = [], aggressorEntityID = 0) {
+  const normalizedAggressorEntityID = normalizePositiveInteger(aggressorEntityID, 0);
+  for (const entityID of Array.isArray(responseEntityIDs) ? responseEntityIDs : []) {
+    npcService.setBehaviorOverrides(entityID, {
+      autoAggro: true,
+      autoActivateWeapons: true,
+      autoAggroTargetClasses: [ENTITY_TYPE.PLAYER],
+      targetPreference: "preferredTargetThenNearestPlayer",
+      movementMode: "orbit",
+      orbitDistanceMeters: 1_800,
+      followRangeMeters: 1_500,
+      aggressionRangeMeters: 250_000,
+      idleAnchorOrbit: false,
+      returnToHomeWhenIdle: true,
+      leashRangeMeters: 250_000,
+    });
+    if (normalizedAggressorEntityID > 0) {
+      npcService.issueManualOrder(entityID, {
+        type: "attack",
+        targetID: normalizedAggressorEntityID,
+        allowWeapons: true,
+        keepLock: true,
+        movementMode: "orbit",
+        orbitDistanceMeters: 1_800,
       });
     }
-    removeInventoryItem(containerID, { removeContents: true });
-    return null;
+    npcService.wakeNpcController(entityID, 0);
   }
-  containerEntity.itemName = itemName;
-  containerEntity.slimName = itemName;
-  containerEntity.corporationID = corporationID;
-  containerEntity.lootRightCorpID = corporationID;
-  scene.broadcastAddBalls(
-    [containerEntity],
-    null,
-    { freshAcquire: true },
-  );
-  scene.broadcastSpecialFx(
-    containerEntity.itemID,
-    MINING_JETTISON_EFFECT_GUID,
-    {
-      targetID: null,
-      isOffensive: false,
-      start: true,
-      active: false,
-      duration: -1,
-      useCurrentVisibleStamp: true,
-    },
-    containerEntity,
-  );
-
-  const record = {
-    containerID,
-    minerEntityID: toInt(minerEntity.itemID, 0),
-    createdAtMs: now,
-    sealedAtMs: 0,
-    tractorStartedAtMs: 0,
-    pickupRangeReachedAtMs: 0,
-    collectedAtMs: 0,
-  };
-  fleetRecord.jetcanRecordsByID[String(containerID)] = record;
-  fleetRecord.activeJetcanIDByMinerID[
-    String(record.minerEntityID)
-  ] = containerID;
-  fleetRecord.jetcansCreated += 1;
-  log.info(
-    `[MiningSupport] fleet=${fleetRecord.fleetID} ` +
-    `miner=${record.minerEntityID} jettisoned can=${containerID}`,
-  );
-  return record;
 }
 
-function resolveActiveMiningJetcan(
-  scene,
-  fleetRecord,
-  minerEntity,
-  now,
-) {
-  const minerEntityID = toInt(minerEntity && minerEntity.itemID, 0);
-  const activeContainerID = toInt(
-    fleetRecord &&
-      fleetRecord.activeJetcanIDByMinerID &&
-      fleetRecord.activeJetcanIDByMinerID[String(minerEntityID)],
-    0,
+function retreatResponseWingToOrigin(fleetRecord, options = {}) {
+  if (!fleetRecord || !fleetRecord.originAnchor || !fleetRecord.originAnchor.position) {
+    return 0;
+  }
+  const ingressDurationMs = Math.max(
+    250,
+    toFiniteNumber(
+      config.miningNpcWarpIngressDurationMs,
+      DEFAULT_MINING_WARP_INGRESS_DURATION_MS,
+    ),
   );
-  if (activeContainerID > 0) {
-    const record = getMiningJetcanRecord(
-      fleetRecord,
-      activeContainerID,
-    );
-    const entity = scene.getEntityByID(activeContainerID);
-    if (
-      record &&
-      entity &&
-      canEntitiesInteractLocally(minerEntity, entity) &&
-      record.sealedAtMs <= 0 &&
-      record.tractorStartedAtMs <= 0 &&
-      record.collectedAtMs <= 0
-    ) {
-      return record;
+  let retreatedCount = 0;
+  for (const entityID of Array.isArray(fleetRecord.responseEntityIDs) ? fleetRecord.responseEntityIDs : []) {
+    if (!npcService.getControllerByEntityID(entityID)) {
+      continue;
     }
-    delete fleetRecord.activeJetcanIDByMinerID[
-      String(minerEntityID)
-    ];
+    npcService.issueManualOrder(entityID, {
+      type: "returnHome",
+      allowWeapons: false,
+    });
+    npcService.runtime.warpToPoint(entityID, fleetRecord.originAnchor.position, {
+      forceImmediateStart: true,
+      broadcastWarpStartToVisibleSessions: true,
+      visibilitySuppressMs: 250,
+      ingressDurationMs,
+    });
+    retreatedCount += 1;
   }
-  return createMiningJetcan(scene, fleetRecord, minerEntity, now);
+  if (retreatedCount > 0) {
+    fleetRecord.responseRetreating = true;
+    fleetRecord.responseTargetID = 0;
+    fleetRecord.responseDespawnAtMs = Math.max(
+      0,
+      toInt(options.nowMs, 0) + ingressDurationMs,
+    );
+  }
+  return retreatedCount;
 }
 
-function routeMinerCargoToJetcans(
-  scene,
-  fleetRecord,
-  minerEntity,
-  now,
-  options = {},
-) {
+function destroyResponseWing(fleetRecord) {
+  let destroyedCount = 0;
+  for (const entityID of Array.isArray(fleetRecord && fleetRecord.responseEntityIDs) ? fleetRecord.responseEntityIDs : []) {
+    const destroyResult = npcService.destroyNpcControllerByEntityID(entityID, {
+      removeContents: true,
+    });
+    if (destroyResult && destroyResult.success) {
+      destroyedCount += 1;
+    }
+  }
+  fleetRecord.responseEntityIDs = [];
+  fleetRecord.responseTargetID = 0;
+  fleetRecord.responseDespawnAtMs = 0;
+  fleetRecord.responseRetreating = false;
+  return destroyedCount;
+}
+
+function spawnResponseWingForFleet(scene, fleetRecord, aggressorEntity, responsePlan, options = {}) {
   if (
     !scene ||
     !fleetRecord ||
-    !minerEntity ||
-    !npcService.getControllerByEntityID(toInt(minerEntity.itemID, 0))
+    !aggressorEntity ||
+    !responsePlan ||
+    responsePlan.amount <= 0 ||
+    !String(responsePlan.profileQuery || "").trim()
   ) {
-    return 0;
+    return {
+      success: true,
+      data: {
+        spawnedEntityIDs: [],
+        standingProfile: responsePlan ? responsePlan.standingProfile : null,
+        selectionName: null,
+      },
+    };
   }
+
+  const spawnResult = spawnFleetWing(scene.systemID, aggressorEntity, {
+    sceneDescriptor: scene.sceneDescriptor,
+    amount: responsePlan.amount,
+    profileQuery: responsePlan.profileQuery,
+    entityScopeMetadata: buildChildEntityScopeMetadata(aggressorEntity),
+    preferredTargetID: normalizePositiveInteger(aggressorEntity.itemID, 0),
+    originAnchor: fleetRecord.originAnchor,
+    warpIn: true,
+    landingRadiusMeters: toFiniteNumber(
+      config.miningNpcFleetLandingRadiusMeters,
+      DEFAULT_MINING_WARP_LANDING_RADIUS_METERS,
+    ),
+  });
+  if (!spawnResult.success || !spawnResult.data) {
+    return spawnResult;
+  }
+
+  const spawnedEntityIDs = buildSpawnResultEntityIDs(spawnResult);
+  issueResponseOrders(
+    spawnedEntityIDs,
+    normalizePositiveInteger(aggressorEntity.itemID, 0),
+  );
+  fleetRecord.responseEntityIDs.push(...spawnedEntityIDs);
+  fleetRecord.responseSelectionName =
+    spawnResult.data.selectionName ||
+    String(responsePlan.profileQuery || "").trim() ||
+    null;
+  fleetRecord.responseTargetID = normalizePositiveInteger(aggressorEntity.itemID, 0);
+  fleetRecord.responseRetreating = false;
+  fleetRecord.responseStandingClass =
+    responsePlan.standingProfile && responsePlan.standingProfile.standingClass
+      ? responsePlan.standingProfile.standingClass
+      : null;
+  fleetRecord.responseStandingValue =
+    responsePlan.standingProfile && Number.isFinite(responsePlan.standingProfile.standing)
+      ? responsePlan.standingProfile.standing
+      : 0;
+  fleetRecord.lastResponseAtMs = Math.max(0, toInt(options.nowMs, Date.now()));
+  fleetRecord.responseDespawnAtMs =
+    fleetRecord.lastResponseAtMs + getResponseRetreatDelayMs();
+  return {
+    success: true,
+    data: {
+      spawnedEntityIDs,
+      standingProfile: responsePlan.standingProfile || null,
+      selectionName: fleetRecord.responseSelectionName,
+    },
+  };
+}
+
+function triggerFleetAggression(scene, fleetRecord, options = {}) {
+  if (!scene || !fleetRecord) {
+    return {
+      success: false,
+      errorMsg: "SCENE_NOT_FOUND",
+    };
+  }
+
+  const now = Math.max(0, toInt(options.nowMs, Date.now()));
+  const aggressorEntity =
+    options.aggressorEntity ||
+    scene.getEntityByID(normalizePositiveInteger(options.aggressorEntityID, 0)) ||
+    null;
+  if (!aggressorEntity) {
+    return {
+      success: false,
+      errorMsg: "AGGRESSOR_NOT_FOUND",
+    };
+  }
+
+  const aggressionEventAtMs = Math.max(
+    0,
+    toInt(options.aggressionEventAtMs, now),
+  );
   if (
     options.force !== true &&
-    config.miningNpcJetcansRequireFullHold !== false &&
-    !getNpcMiningCargoFullState(
-      minerEntity,
-      toFiniteNumber(
-        config.miningNpcMinerCargoCapacityM3,
-        DEFAULT_MINING_MINER_CARGO_CAPACITY_M3,
-      ),
-    ).operationallyFull
+    aggressionEventAtMs > 0 &&
+    aggressionEventAtMs <= Math.max(0, toInt(fleetRecord.lastProcessedAggressionAtMs, 0))
   ) {
+    return {
+      success: true,
+      data: {
+        noChange: true,
+        standingClass: fleetRecord.responseStandingClass || null,
+        retreatedCount: 0,
+        responseSpawnedCount: 0,
+      },
+    };
+  }
+
+  const autoResumeDelayMs = Math.max(
+    0,
+    toInt(
+      config.miningNpcFleetAutoResumeDelayMs,
+      0,
+    ),
+  );
+  const responsePlan = resolveResponsePlan(scene, fleetRecord, aggressorEntity, {
+    amount: options.responseAmount,
+    profileQuery: options.responseQuery,
+  });
+  const retreatedCount = retreatFleetToOrigin(fleetRecord, {
+    state: options.panic === true ? "panic" : "aggressed",
+    resumeAtMs: autoResumeDelayMs > 0 ? (now + autoResumeDelayMs) : 0,
+    scene,
+    hooks: options.hooks,
+    reason: "aggression",
+  });
+  fleetRecord.lastAggressorID = normalizePositiveInteger(aggressorEntity.itemID, 0);
+  fleetRecord.lastAggressedAtMs = aggressionEventAtMs || now;
+  fleetRecord.lastProcessedAggressionAtMs = aggressionEventAtMs || now;
+  fleetRecord.responseTargetID = normalizePositiveInteger(aggressorEntity.itemID, 0);
+
+  let responseSpawnedCount = 0;
+  let responseSelectionName = fleetRecord.responseSelectionName || null;
+  const cooldownMs = getResponseCooldownMs();
+  const hasDeployableResponse =
+    responsePlan.amount > 0 &&
+    String(responsePlan.profileQuery || "").trim().length > 0;
+  const canSpawnResponse =
+    hasDeployableResponse &&
+    (
+      fleetRecord.lastResponseAtMs <= 0 ||
+      cooldownMs <= 0 ||
+      now - fleetRecord.lastResponseAtMs >= cooldownMs ||
+      fleetRecord.responseEntityIDs.length <= 0
+    );
+
+  if (canSpawnResponse) {
+    const spawnResult = spawnResponseWingForFleet(
+      scene,
+      fleetRecord,
+      aggressorEntity,
+      responsePlan,
+      { nowMs: now },
+    );
+    if (!spawnResult.success) {
+      return spawnResult;
+    }
+    responseSpawnedCount = Array.isArray(spawnResult.data && spawnResult.data.spawnedEntityIDs)
+      ? spawnResult.data.spawnedEntityIDs.length
+      : 0;
+    responseSelectionName = spawnResult.data && spawnResult.data.selectionName
+      ? spawnResult.data.selectionName
+      : responseSelectionName;
+  } else if (fleetRecord.responseEntityIDs.length > 0) {
+    issueResponseOrders(
+      fleetRecord.responseEntityIDs,
+      normalizePositiveInteger(aggressorEntity.itemID, 0),
+    );
+    fleetRecord.responseDespawnAtMs = now + getResponseRetreatDelayMs();
+  }
+
+  return {
+    success: true,
+    data: {
+      standingClass:
+        responsePlan.standingProfile && responsePlan.standingProfile.standingClass
+          ? responsePlan.standingProfile.standingClass
+          : null,
+      standingValue:
+        responsePlan.standingProfile && Number.isFinite(responsePlan.standingProfile.standing)
+          ? responsePlan.standingProfile.standing
+          : 0,
+      retreatedCount,
+      responseSpawnedCount,
+      responseSelectionName,
+    },
+  };
+}
+
+function handleMiningFleetCommand(session, argumentText) {
+  if (!session || !session.characterID || !session._space) {
+    return {
+      success: false,
+      message: "You must be in space before using /npcminer.",
+    };
+  }
+
+  const parsedArguments = parseMiningFleetCommandArguments(
+    argumentText,
+    Math.max(1, toInt(config.miningNpcFleetDefaultCount, DEFAULT_MINING_FLEET_COUNT)),
+  );
+  if (!parsedArguments.success) {
+    return {
+      success: false,
+      message: "Usage: /npcminer [amount] [profile|pool|group] or /npcminer ice [amount]",
+    };
+  }
+  if (parsedArguments.amount > MAX_MINING_NPC_COMMAND_SPAWN_COUNT) {
+    return {
+      success: false,
+      message: `Mining fleet spawn count must be between 1 and ${MAX_MINING_NPC_COMMAND_SPAWN_COUNT}.`,
+    };
+  }
+
+  const scene = resolveSessionScene(session);
+  let centerTarget = buildSpawnTarget(scene, session);
+  if (parsedArguments.resourceKind === "ice") {
+    const iceTargetEntry = resolveNearestMineableTargetForKind(
+      scene,
+      centerTarget,
+      "ice",
+    );
+    if (!iceTargetEntry || !iceTargetEntry.entity) {
+      return {
+        success: false,
+        message: "No active ice asteroid is available in your current grid.",
+      };
+    }
+    centerTarget = iceTargetEntry.entity;
+  }
+  const spawnResult = spawnMiningFleetInternal(scene, {
+    systemID: session._space.systemID,
+    centerTarget,
+    preferredTargetID: normalizePositiveInteger(session._space.shipID, 0),
+    minerAmount: parsedArguments.amount,
+    minerQuery: parsedArguments.query || String(config.miningNpcFleetProfileOrPool || ""),
+    haulerAmount: Math.max(0, toInt(config.miningNpcHaulerDefaultCount, DEFAULT_MINING_HAULER_COUNT)),
+    haulerQuery: String(config.miningNpcHaulerProfileOrPool || ""),
+  });
+  if (!spawnResult.success || !spawnResult.data) {
+    const suggestions = Array.isArray(spawnResult && spawnResult.suggestions)
+      ? ` Suggestions: ${spawnResult.suggestions.join(", ")}`
+      : "";
+    return {
+      success: false,
+      message: `Mining fleet spawn failed: ${spawnResult.errorMsg || "UNKNOWN_ERROR"}.${suggestions}`.trim(),
+    };
+  }
+
+  const fleetRecord = createMiningFleetRecord({
+    source: "gm",
+    createdByCharacterID: session.characterID,
+    systemID: session._space.systemID,
+    sceneKey: scene.sceneKey || scene.sceneDescriptor && scene.sceneDescriptor.sceneKey,
+    sceneKind: scene.sceneKind || scene.sceneDescriptor && scene.sceneDescriptor.sceneKind,
+    instanceID: scene.sceneDescriptor && scene.sceneDescriptor.instanceID,
+    targetShipID: session._space.shipID,
+    minerEntityIDs: spawnResult.data.minerEntityIDs,
+    haulerEntityIDs: spawnResult.data.haulerEntityIDs,
+    resourceKind: resolveSpawnedMiningResourceKind(
+      scene,
+      spawnResult.data.minerEntityIDs,
+      parsedArguments.resourceKind,
+    ),
+    expiresAtMs: getSceneClockMs(scene) + MINING_FLEET_LIFETIME_MS,
+    originAnchor: spawnResult.data.originAnchor,
+    spawnSelectionName:
+      spawnResult.data.minerSpawnResult &&
+      spawnResult.data.minerSpawnResult.data &&
+      spawnResult.data.minerSpawnResult.data.selectionName,
+    haulerSelectionName:
+      spawnResult.data.haulerSpawnResult &&
+      spawnResult.data.haulerSpawnResult.data &&
+      spawnResult.data.haulerSpawnResult.data.selectionName,
+  });
+  return {
+    success: true,
+    message: [
+      `Spawned mining fleet ${fleetRecord.fleetID} with ${fleetRecord.minerEntityIDs.length} miner hull${fleetRecord.minerEntityIDs.length === 1 ? "" : "s"}.`,
+      fleetRecord.haulerEntityIDs.length > 0
+        ? `Attached ${fleetRecord.haulerEntityIDs.length} hauler hull${fleetRecord.haulerEntityIDs.length === 1 ? "" : "s"}.`
+        : "No hauler wing was attached.",
+      `Resource: ${fleetRecord.resourceKind || "mixed"}.`,
+      `Selection: ${fleetRecord.spawnSelectionName || parsedArguments.query || resolveMiningFleetQuery(scene, "", session._space.systemID)}.`,
+      "The fleet is transient only, will not persist across restart, and departs after 2 hours.",
+    ].join(" "),
+  };
+}
+
+function retreatFleetToOrigin(fleetRecord, options = {}) {
+  if (!fleetRecord || !fleetRecord.originAnchor || !fleetRecord.originAnchor.position) {
     return 0;
   }
-
-  let transferredVolumeM3 = 0;
-  const touchedJetcanRecords = new Set();
-  const finishJettison = () => {
-    for (const jetcanRecord of touchedJetcanRecords) {
-      jetcanRecord.sealedAtMs = Math.max(1, toInt(now, Date.now()));
-      const minerKey = String(
-        toInt(jetcanRecord.minerEntityID, 0),
-      );
-      if (
-        toInt(
-          fleetRecord.activeJetcanIDByMinerID &&
-            fleetRecord.activeJetcanIDByMinerID[minerKey],
-          0,
-        ) === toInt(jetcanRecord.containerID, 0)
-      ) {
-        delete fleetRecord.activeJetcanIDByMinerID[minerKey];
-      }
-    }
-    return transferredVolumeM3;
-  };
-
-  for (const cargoItem of [...getNpcOreCargoItems(minerEntity)]) {
-    const typeID = toInt(cargoItem && cargoItem.typeID, 0);
-    const typeRecord = resolveItemByTypeID(typeID) || null;
-    const unitVolumeM3 = Math.max(
-      MINING_CARGO_FULL_EPSILON_M3,
-      toFiniteNumber(
-        cargoItem && cargoItem.volume,
-        toFiniteNumber(typeRecord && typeRecord.volume, 0),
-      ),
+  clearFleetManualOrders([
+    ...(Array.isArray(fleetRecord.minerEntityIDs) ? fleetRecord.minerEntityIDs : []),
+    ...(Array.isArray(fleetRecord.haulerEntityIDs) ? fleetRecord.haulerEntityIDs : []),
+  ]);
+  if (options.scene && options.hooks) {
+    deactivateMiningModulesForFleet(
+      options.scene,
+      fleetRecord,
+      options.hooks,
+      options.reason || "state",
     );
-    let remainingQuantity = Math.max(
+  }
+  const ingressDurationMs = Math.max(
+    250,
+    toFiniteNumber(
+      config.miningNpcWarpIngressDurationMs,
+      DEFAULT_MINING_WARP_INGRESS_DURATION_MS,
+    ),
+  );
+  const entityIDs = [
+    ...(Array.isArray(fleetRecord.minerEntityIDs) ? fleetRecord.minerEntityIDs : []),
+    ...(Array.isArray(fleetRecord.haulerEntityIDs) ? fleetRecord.haulerEntityIDs : []),
+  ];
+  let retreatedCount = 0;
+  for (const entityID of entityIDs) {
+    if (!npcService.getControllerByEntityID(entityID)) {
+      continue;
+    }
+    npcService.runtime.warpToPoint(entityID, fleetRecord.originAnchor.position, {
+      forceImmediateStart: true,
+      broadcastWarpStartToVisibleSessions: true,
+      visibilitySuppressMs: 250,
+      ingressDurationMs,
+    });
+    retreatedCount += 1;
+  }
+  fleetRecord.state = String(options.state || "retreating");
+  fleetRecord.resumeAtMs = Math.max(0, toInt(options.resumeAtMs, 0));
+  fleetRecord.nextThinkAtMs = 0;
+  return retreatedCount;
+}
+
+function handleMiningFleetAggroCommand(session, argumentText, options = {}) {
+  if (!session || !session.characterID || !session._space) {
+    return {
+      success: false,
+      message: "You must be in space before using /npcmineraggro.",
+    };
+  }
+
+  const scene = resolveSessionScene(session);
+  const fleets = getMiningFleetsForScene(scene)
+    .map((fleetRecord) => pruneMiningFleet(fleetRecord))
+    .filter(Boolean);
+  if (fleets.length <= 0) {
+    return {
+      success: false,
+      message: "No tracked mining fleets are active in your current system.",
+    };
+  }
+
+  const parsedArguments = parseNpcSpawnArguments(
+    argumentText,
+    Math.max(1, toInt(config.miningNpcResponseDefaultCount, DEFAULT_MINING_RESPONSE_COUNT)),
+  );
+  if (!parsedArguments.success) {
+    return {
+      success: false,
+      message: "Usage: /npcmineraggro [amount] [profile|pool|group]",
+    };
+  }
+  if (parsedArguments.amount > MAX_MINING_NPC_COMMAND_SPAWN_COUNT) {
+    return {
+      success: false,
+      message: `Mining response spawn count must be between 1 and ${MAX_MINING_NPC_COMMAND_SPAWN_COUNT}.`,
+    };
+  }
+
+  const aggressorEntity = scene && scene.getEntityByID(
+    normalizePositiveInteger(session._space.shipID, 0),
+  );
+  if (!scene || !aggressorEntity) {
+    return {
+      success: false,
+      message: "Unable to resolve your active ship for /npcmineraggro.",
+    };
+  }
+
+  let retreatedCount = 0;
+  let responseSpawnedCount = 0;
+  let lastSelectionName = null;
+  let lastStandingClass = null;
+  for (const fleetRecord of fleets) {
+    const aggressionResult = triggerFleetAggression(scene, fleetRecord, {
+      aggressorEntity,
+      responseAmount: parsedArguments.amount,
+      responseQuery:
+        parsedArguments.query ||
+        String(config.miningNpcResponseProfileOrPool || DEFAULT_MINING_RESPONSE_QUERY),
+      panic: options.panic === true,
+      force: true,
+      nowMs: Date.now(),
+      aggressionEventAtMs: Date.now(),
+    });
+    if (!aggressionResult.success) {
+      return {
+        success: false,
+        message: `Mining response spawn failed: ${aggressionResult.errorMsg || "UNKNOWN_ERROR"}.`,
+      };
+    }
+    retreatedCount += Math.max(0, toInt(aggressionResult.data && aggressionResult.data.retreatedCount, 0));
+    responseSpawnedCount += Math.max(
       0,
-      toInt(cargoItem && cargoItem.quantity, 0),
+      toInt(aggressionResult.data && aggressionResult.data.responseSpawnedCount, 0),
     );
-    while (typeRecord && remainingQuantity > 0) {
-      const jetcanRecord = resolveActiveMiningJetcan(
-        scene,
-        fleetRecord,
-        minerEntity,
-        now,
-      );
-      if (!jetcanRecord) {
-        return finishJettison();
-      }
-      touchedJetcanRecords.add(jetcanRecord);
-      const usedVolumeM3 = getMiningJetcanUsedVolumeM3(
-        jetcanRecord.containerID,
-      );
-      const availableVolumeM3 = Math.max(
-        0,
-        getMiningJetcanCapacityM3() - usedVolumeM3,
-      );
-      const quantityThatFits = Math.min(
-        remainingQuantity,
-        Math.max(0, Math.floor(availableVolumeM3 / unitVolumeM3)),
-      );
-      if (quantityThatFits <= 0) {
-        delete fleetRecord.activeJetcanIDByMinerID[
-          String(minerEntity.itemID)
-        ];
-        continue;
-      }
-      const grantResult = grantItemToOwnerLocation(
-        normalizePositiveInteger(
-          fleetRecord.cargoOwnerID,
-          normalizePositiveInteger(minerEntity.ownerID, 0),
-        ),
-        jetcanRecord.containerID,
-        0,
-        typeRecord,
-        quantityThatFits,
-        { transient: fleetRecord.cargoTransient !== false },
-      );
-      if (!grantResult || !grantResult.success) {
-        return finishJettison();
-      }
-      const removedQuantity = removeNpcMiningCargoQuantity(
-        minerEntity,
-        cargoItem,
-        quantityThatFits,
-      );
-      if (removedQuantity <= 0) {
-        return finishJettison();
-      }
-      remainingQuantity -= removedQuantity;
-      transferredVolumeM3 += removedQuantity * unitVolumeM3;
-      if (
-        getMiningJetcanUsedVolumeM3(jetcanRecord.containerID) >=
-        getMiningJetcanCapacityM3() - 1
-      ) {
-        delete fleetRecord.activeJetcanIDByMinerID[
-          String(minerEntity.itemID)
-        ];
-      }
+    if (aggressionResult.data && aggressionResult.data.responseSelectionName) {
+      lastSelectionName = aggressionResult.data.responseSelectionName;
+    }
+    if (aggressionResult.data && aggressionResult.data.standingClass) {
+      lastStandingClass = aggressionResult.data.standingClass;
     }
   }
-  return finishJettison();
+
+  return {
+    success: true,
+    message: [
+      `Simulated aggression against ${fleets.length} tracked mining fleet${fleets.length === 1 ? "" : "s"}.`,
+      retreatedCount > 0
+        ? `${retreatedCount} miner/hauler hull${retreatedCount === 1 ? "" : "s"} initiated retreat warp.`
+        : "No miner retreat warp was needed.",
+      responseSpawnedCount > 0
+        ? `Spawned ${responseSpawnedCount} response hull${responseSpawnedCount === 1 ? "" : "s"} from ${lastSelectionName || parsedArguments.query || String(config.miningNpcResponseProfileOrPool || DEFAULT_MINING_RESPONSE_QUERY)}.`
+        : "No additional response hulls were required.",
+      lastStandingClass
+        ? `Standing class resolved as ${lastStandingClass}.`
+        : "Standing class resolution was unavailable.",
+    ].join(" "),
+  };
 }
 
-function resolveTractorModule(entity) {
-  return getNpcFittedModuleItems(entity)
-    .filter((moduleItem) => isModuleOnline(moduleItem))
-    .map((moduleItem) => ({
-      moduleItem,
-      effectRecord: getTypeEffectRecords(
-        toInt(moduleItem && moduleItem.typeID, 0),
-      ).find(
-        (effectRecord) =>
-          String(effectRecord && effectRecord.name || "") ===
-          MINING_TRACTOR_EFFECT_NAME,
-      ) || null,
-    }))
-    .find((entry) => entry.effectRecord) || null;
-}
-
-function removeMiningJetcan(
-  scene,
-  fleetRecord,
-  containerID,
-  options = {},
-) {
-  const normalizedContainerID = toInt(containerID, 0);
-  detachMiningJetcanRecord(
-    fleetRecord,
-    normalizedContainerID,
-  );
-  removeInventoryItem(normalizedContainerID, {
-    removeContents: options.removeContents !== false,
-  });
-  const systemID = toInt(
-    scene && scene.systemID,
-    toInt(fleetRecord && fleetRecord.systemID, 0),
-  );
-  if (systemID > 0) {
-    getSpaceRuntime().removeDynamicEntity(
-      systemID,
-      normalizedContainerID,
-      {
-        terminalDestructionEffectID:
-          MINING_JETCAN_DESTRUCTION_EFFECT_ID,
-        persistSpaceState: false,
-      },
-    );
-  }
-}
-
-function deactivateFleetTractor(
-  scene,
-  fleetRecord,
-  haulerEntity,
-  hooks,
-  reason = "cargo",
-) {
-  const moduleID = toInt(
-    fleetRecord && fleetRecord.activeTractorModuleID,
+function handleMiningFleetClearCommand(session) {
+  const systemID = normalizePositiveInteger(
+    session &&
+      session._space &&
+      session._space.systemID,
     0,
   );
-  if (
-    scene &&
-    haulerEntity &&
-    moduleID > 0 &&
-    npcService.getControllerByEntityID(toInt(haulerEntity.itemID, 0))
-  ) {
-    scene.deactivateGenericModule(
-      buildNpcPseudoSession(haulerEntity, hooks),
-      moduleID,
-      {
-        reason,
-        deferUntilCycle: false,
-      },
-    );
+  if (!systemID) {
+    return {
+      success: false,
+      message: "You must be in space before using /npcminerclear.",
+    };
   }
-  fleetRecord.activeTractorCanID = 0;
-  fleetRecord.activeTractorHaulerID = 0;
-  fleetRecord.activeTractorModuleID = 0;
+
+  const scene = resolveSessionScene(session);
+  if (!scene) {
+    return {
+      success: false,
+      message: "Unable to resolve your current scene for /npcminerclear.",
+    };
+  }
+  const fleets = getMiningFleetsForScene(scene);
+  let destroyedCount = 0;
+  for (const fleetRecord of fleets) {
+    destroyedCount += destroyFleetEntities(fleetRecord);
+    miningFleetStateByID.delete(fleetRecord.fleetID);
+  }
+
+  return {
+    success: true,
+    message: `Cleared ${fleets.length} tracked mining fleet${fleets.length === 1 ? "" : "s"} and destroyed ${destroyedCount} associated NPC hull${destroyedCount === 1 ? "" : "s"}.`,
+  };
+}
+
+function formatFleetSummary(scene, fleetRecord) {
+  const cargoState = scene ? getFleetCargoState(scene, fleetRecord) : {
+    minerUsedVolumeM3: 0,
+    minerCapacityM3: 0,
+    haulerCapacityM3: 0,
+    minerFillRatio: 0,
+  };
+  const nextHaulerMs = Math.max(
+    0,
+    toInt(fleetRecord.haulerNextArrivalAtMs, 0) - Date.now(),
+  );
+  const departsInMs = Math.max(
+    0,
+    toInt(fleetRecord.expiresAtMs, 0) - getSceneClockMs(scene),
+  );
+  return [
+    `fleet ${fleetRecord.fleetID}`,
+    `state=${fleetRecord.state}`,
+    `resource=${fleetRecord.resourceKind || "any"}`,
+    `departsIn=${Math.ceil(departsInMs / 60_000)}m`,
+    `miners=${fleetRecord.minerEntityIDs.length}`,
+    `haulers=${fleetRecord.haulerEntityIDs.length}`,
+    `response=${fleetRecord.responseEntityIDs.length}`,
+    fleetRecord.lastAggressorID > 0
+      ? `aggressor=${fleetRecord.lastAggressorID}`
+      : "aggressor=none",
+    fleetRecord.responseStandingClass
+      ? `standing=${fleetRecord.responseStandingClass}`
+      : "standing=unknown",
+    fleetRecord.haulerEntityIDs.length > 0
+      ? `haulerEta=${Math.ceil(nextHaulerMs / 1000)}s`
+      : "haulerEta=off",
+    `cargo=${cargoState.minerUsedVolumeM3.toFixed(1)}/${cargoState.minerCapacityM3.toFixed(1)}m3`,
+  ].join(", ");
+}
+
+function handleMiningFleetStatusCommand(session) {
+  const systemID = normalizePositiveInteger(
+    session &&
+      session._space &&
+      session._space.systemID,
+    0,
+  );
+  if (!systemID) {
+    return {
+      success: false,
+      message: "You must be in space before using /npcminerstatus.",
+    };
+  }
+
+  const scene = resolveSessionScene(session);
+  const fleets = getMiningFleetsForScene(scene)
+    .map((fleetRecord) => pruneMiningFleet(fleetRecord))
+    .filter(Boolean);
+  if (fleets.length <= 0) {
+    return {
+      success: true,
+      message: "No tracked mining fleets are active in your current system.",
+    };
+  }
+
+  return {
+    success: true,
+    message: `Tracked mining fleets in system ${systemID}: ${fleets.map((fleetRecord) => formatFleetSummary(scene, fleetRecord)).join("; ")}.`,
+  };
+}
+
+function handleMiningFleetRetreatCommand(session) {
+  const systemID = normalizePositiveInteger(session && session._space && session._space.systemID, 0);
+  if (!systemID) {
+    return {
+      success: false,
+      message: "You must be in space before using /npcminerretreat.",
+    };
+  }
+  const scene = resolveSessionScene(session);
+  const fleets = getMiningFleetsForScene(scene)
+    .map((fleetRecord) => pruneMiningFleet(fleetRecord))
+    .filter(Boolean);
+  if (fleets.length <= 0) {
+    return {
+      success: false,
+      message: "No tracked mining fleets are active in your current system.",
+    };
+  }
+  let retreatedCount = 0;
+  for (const fleetRecord of fleets) {
+    retreatedCount += retreatFleetToOrigin(fleetRecord, {
+      state: "retreating",
+    });
+  }
+  return {
+    success: true,
+    message: `Retreated ${retreatedCount} miner/hauler hull${retreatedCount === 1 ? "" : "s"} across ${fleets.length} fleet${fleets.length === 1 ? "" : "s"}.`,
+  };
+}
+
+function handleMiningFleetResumeCommand(session) {
+  const systemID = normalizePositiveInteger(session && session._space && session._space.systemID, 0);
+  if (!systemID) {
+    return {
+      success: false,
+      message: "You must be in space before using /npcminerresume.",
+    };
+  }
+  const scene = resolveSessionScene(session);
+  const fleets = getMiningFleetsForScene(scene)
+    .map((fleetRecord) => pruneMiningFleet(fleetRecord))
+    .filter(Boolean);
+  if (fleets.length <= 0) {
+    return {
+      success: false,
+      message: "No tracked mining fleets are active in your current system.",
+    };
+  }
+  for (const fleetRecord of fleets) {
+    fleetRecord.state = "mining";
+    fleetRecord.resumeAtMs = 0;
+    fleetRecord.nextThinkAtMs = 0;
+  }
+  return {
+    success: true,
+    message: `Resumed ${fleets.length} tracked mining fleet${fleets.length === 1 ? "" : "s"}.`,
+  };
+}
+
+function handleMiningFleetHaulCommand(session) {
+  const systemID = normalizePositiveInteger(session && session._space && session._space.systemID, 0);
+  if (!systemID) {
+    return {
+      success: false,
+      message: "You must be in space before using /npcminerhaul.",
+    };
+  }
+  const scene = resolveSessionScene(session);
+  const fleets = getMiningFleetsForScene(scene)
+    .map((fleetRecord) => pruneMiningFleet(fleetRecord))
+    .filter(Boolean);
+  if (fleets.length <= 0) {
+    return {
+      success: false,
+      message: "No tracked mining fleets are active in your current system.",
+    };
+  }
+  for (const fleetRecord of fleets) {
+    fleetRecord.state = "hauling";
+    fleetRecord.nextThinkAtMs = 0;
+    fleetRecord.haulCompleteAtMs = 0;
+  }
+  return {
+    success: true,
+    message: `Forced hauling behavior on ${fleets.length} tracked mining fleet${fleets.length === 1 ? "" : "s"}.`,
+  };
+}
+
+function resolveStartupFleetCount() {
+  return Math.max(0, toInt(config.miningNpcStartupFleetCount, 0));
+}
+
+function handleSceneDisposed(scene) {
+  if (!scene) {
+    return {
+      clearedStartupSeedCount: 0,
+      removedFleetCount: 0,
+    };
+  }
+
+  const sceneDescriptor = scene.sceneDescriptor || {};
+  const sceneKey = String(
+    scene.sceneKey || sceneDescriptor.sceneKey || scene.systemID || "",
+  ).trim();
+  let clearedStartupSeedCount = 0;
+  if (sceneKey) {
+    const startupKeyPrefix = `${sceneKey}:`;
+    for (const startupKey of startupSceneSeedSet) {
+      if (!String(startupKey).startsWith(startupKeyPrefix)) {
+        continue;
+      }
+      startupSceneSeedSet.delete(startupKey);
+      clearedStartupSeedCount += 1;
+    }
+  }
+
+  let removedFleetCount = 0;
+  for (const fleetRecord of getMiningFleetsForScene(scene)) {
+    if (!fleetRecord || !miningFleetStateByID.delete(fleetRecord.fleetID)) {
+      continue;
+    }
+    removedFleetCount += 1;
+  }
+
+  return {
+    clearedStartupSeedCount,
+    removedFleetCount,
+  };
+}
+
+function handleSceneCreated(scene) {
+  if (!scene) {
+    return;
+  }
+  const allowedSystemIDs = parseSystemIdList(config.miningNpcStartupSystemIDs);
+  if (allowedSystemIDs.length > 0 && !allowedSystemIDs.includes(toInt(scene.systemID, 0))) {
+    return;
+  }
+
+  const sceneKey = String(
+    scene.sceneKey || scene.sceneDescriptor && scene.sceneDescriptor.sceneKey || scene.systemID,
+  );
+  const startupKey = `${sceneKey}:${resolveStartupFleetCount()}`;
+  if (startupSceneSeedSet.has(startupKey)) {
+    return;
+  }
+  startupSceneSeedSet.add(startupKey);
+
+  const fleetCount = resolveStartupFleetCount();
+  if (fleetCount <= 0) {
+    return;
+  }
+
+  ensureSceneMiningState(scene);
+  const centerTarget = buildSpawnTarget(scene);
+  for (let index = 0; index < fleetCount; index += 1) {
+    const spawnResult = spawnMiningFleetInternal(scene, {
+      systemID: scene.systemID,
+      centerTarget,
+      preferredTargetID: 0,
+      minerAmount: Math.max(1, toInt(config.miningNpcStartupFleetMinerCount, config.miningNpcFleetDefaultCount || DEFAULT_MINING_FLEET_COUNT)),
+      minerQuery: String(config.miningNpcStartupFleetProfileOrPool || config.miningNpcFleetProfileOrPool || ""),
+      haulerAmount: Math.max(0, toInt(config.miningNpcStartupFleetHaulerCount, config.miningNpcHaulerDefaultCount || DEFAULT_MINING_HAULER_COUNT)),
+      haulerQuery: String(config.miningNpcStartupHaulerProfileOrPool || config.miningNpcHaulerProfileOrPool || ""),
+    });
+    if (!spawnResult.success || !spawnResult.data) {
+      continue;
+    }
+    createMiningFleetRecord({
+      source: "startup",
+      startupKey: `${sceneKey}:${index + 1}`,
+      systemID: scene.systemID,
+      sceneKey: scene.sceneKey || scene.sceneDescriptor && scene.sceneDescriptor.sceneKey,
+      sceneKind: scene.sceneKind || scene.sceneDescriptor && scene.sceneDescriptor.sceneKind,
+      instanceID: scene.sceneDescriptor && scene.sceneDescriptor.instanceID,
+      targetShipID: 0,
+      minerEntityIDs: spawnResult.data.minerEntityIDs,
+      haulerEntityIDs: spawnResult.data.haulerEntityIDs,
+      resourceKind: resolveSpawnedMiningResourceKind(
+        scene,
+        spawnResult.data.minerEntityIDs,
+        "ore",
+      ),
+      expiresAtMs: getSceneClockMs(scene) + MINING_FLEET_LIFETIME_MS,
+      originAnchor: spawnResult.data.originAnchor,
+      spawnSelectionName:
+        spawnResult.data.minerSpawnResult &&
+        spawnResult.data.minerSpawnResult.data &&
+        spawnResult.data.minerSpawnResult.data.selectionName,
+      haulerSelectionName:
+        spawnResult.data.haulerSpawnResult &&
+        spawnResult.data.haulerSpawnResult.data &&
+        spawnResult.data.haulerSpawnResult.data.selectionName,
+    });
+  }
+}
+
+function deactivateMiningModulesForEntity(scene, entity, hooks, reason = "state") {
+  if (!scene || !entity || !hooks || typeof hooks.buildNpcPseudoSession !== "function") {
+    return;
+  }
+  const pseudoSession = hooks.buildNpcPseudoSession(entity);
+  for (const moduleItem of getNpcFittedModuleItems(entity)) {
+    const effectRecord =
+      typeof hooks.findMiningEffectRecordForModule === "function"
+        ? hooks.findMiningEffectRecordForModule(moduleItem)
+        : getEffectTypeRecord(toInt(moduleItem && moduleItem.effectID, 0));
+    if (!effectRecord) {
+      continue;
+    }
+    const activeEffect = entity.activeModuleEffects instanceof Map
+      ? entity.activeModuleEffects.get(toInt(moduleItem.itemID, 0))
+      : null;
+    if (!activeEffect) {
+      continue;
+    }
+    scene.deactivateGenericModule(pseudoSession, moduleItem.itemID, {
+      reason,
+    });
+  }
+}
+
+function deactivateMiningModulesForFleet(scene, fleetRecord, hooks, reason = "state") {
+  for (const entityID of Array.isArray(fleetRecord && fleetRecord.minerEntityIDs) ? fleetRecord.minerEntityIDs : []) {
+    const entity = scene.getEntityByID(entityID);
+    if (!entity) {
+      continue;
+    }
+    deactivateMiningModulesForEntity(scene, entity, hooks, reason);
+  }
+}
+
+function startHaulCycle(scene, fleetRecord, now, hooks) {
+  if (!scene || !fleetRecord || fleetRecord.haulerEntityIDs.length <= 0) {
+    return false;
+  }
+  clearFleetManualOrders(fleetRecord.minerEntityIDs);
+  deactivateMiningModulesForFleet(scene, fleetRecord, hooks, "cargo");
+  const gatherTarget =
+    scene.getEntityByID(toInt(fleetRecord.activeAsteroidID, 0)) ||
+    scene.getEntityByID(toInt(fleetRecord.targetShipID, 0)) ||
+    null;
+  const gatherPoint =
+    (gatherTarget && gatherTarget.position) ||
+    (fleetRecord.originAnchor && fleetRecord.originAnchor.position) ||
+    { x: 0, y: 0, z: 0 };
+  const ingressDurationMs = Math.max(
+    250,
+    toFiniteNumber(
+      config.miningNpcWarpIngressDurationMs,
+      DEFAULT_MINING_WARP_INGRESS_DURATION_MS,
+    ),
+  );
+  for (const [index, entityID] of fleetRecord.haulerEntityIDs.entries()) {
+    npcService.runtime.warpToPoint(entityID, buildMiningWarpLandingPoint(
+      gatherPoint,
+      index,
+      fleetRecord.haulerEntityIDs.length,
+      Math.max(
+        250,
+        MINING_HAULER_LANDING_RADIUS_METERS,
+      ),
+    ), {
+      forceImmediateStart: true,
+      broadcastWarpStartToVisibleSessions: true,
+      visibilitySuppressMs: 250,
+      ingressDurationMs,
+    });
+  }
+  fleetRecord.state = "hauling";
+  fleetRecord.haulerNextArrivalAtMs = 0;
+  fleetRecord.haulCompleteAtMs =
+    now +
+    ingressDurationMs +
+    Math.max(
+      500,
+      DEFAULT_MINING_HAULER_UNLOAD_DURATION_MS,
+    );
+  fleetRecord.nextThinkAtMs = fleetRecord.haulCompleteAtMs;
+  return true;
+}
+
+function completeHaulCycle(scene, fleetRecord, now) {
+  let hauledVolumeM3 = 0;
+  for (const entityID of Array.isArray(fleetRecord && fleetRecord.minerEntityIDs) ? fleetRecord.minerEntityIDs : []) {
+    const entity = scene.getEntityByID(entityID);
+    if (!entity) {
+      continue;
+    }
+    hauledVolumeM3 += clearNpcMiningCargo(entity);
+  }
+  const ingressDurationMs = Math.max(
+    250,
+    toFiniteNumber(
+      config.miningNpcWarpIngressDurationMs,
+      DEFAULT_MINING_WARP_INGRESS_DURATION_MS,
+    ),
+  );
+  if (fleetRecord.originAnchor && fleetRecord.originAnchor.position) {
+    for (const entityID of Array.isArray(fleetRecord.haulerEntityIDs) ? fleetRecord.haulerEntityIDs : []) {
+      npcService.runtime.warpToPoint(entityID, fleetRecord.originAnchor.position, {
+        forceImmediateStart: true,
+        broadcastWarpStartToVisibleSessions: true,
+        visibilitySuppressMs: 250,
+        ingressDurationMs,
+      });
+    }
+  }
+  fleetRecord.lastHauledVolumeM3 = hauledVolumeM3;
+  fleetRecord.lastHauledAtMs = now;
+  fleetRecord.haulerNextArrivalAtMs = now + getHaulerRepeatDelayMs();
+  fleetRecord.state = "haulereturn";
+  fleetRecord.haulerReturnAtMs = now + ingressDurationMs;
+  fleetRecord.nextThinkAtMs = fleetRecord.haulerReturnAtMs;
+}
+
+function shouldTriggerHauling(scene, fleetRecord, noAsteroidsRemain = false, now = Date.now()) {
+  if (!scene || !fleetRecord || fleetRecord.haulerEntityIDs.length <= 0) {
+    return false;
+  }
+  if (
+    toFiniteNumber(fleetRecord.haulerNextArrivalAtMs, 0) > 0 &&
+    now < toFiniteNumber(fleetRecord.haulerNextArrivalAtMs, 0)
+  ) {
+    return false;
+  }
+  const cargoState = getFleetCargoState(scene, fleetRecord);
+  const thresholdRatio = Math.max(
+    0.01,
+    Math.min(
+      1,
+      toFiniteNumber(
+        config.miningNpcHaulThresholdRatio,
+        DEFAULT_MINING_HAUL_THRESHOLD_RATIO,
+      ),
+    ),
+  );
+  if (noAsteroidsRemain && cargoState.minerUsedVolumeM3 > 0) {
+    return true;
+  }
+  return cargoState.minerFillRatio >= thresholdRatio;
+}
+
+// Fleets are temporary. When their lifetime runs out, the miners, haulers and
+// any response wing warp to the fleet's origin, and the hulls are removed once
+// that warp has had time to finish. A fleet with nothing left to warp is
+// removed at once.
+function advanceMiningFleetDeparture(scene, fleetRecord, now, hooks) {
+  if (fleetRecord.state === "departing") {
+    if (now >= toFiniteNumber(fleetRecord.departDespawnAtMs, 0)) {
+      destroyFleetEntities(fleetRecord);
+      miningFleetStateByID.delete(fleetRecord.fleetID);
+    }
+    return true;
+  }
+
+  if (!(toFiniteNumber(fleetRecord.expiresAtMs, 0) > 0)) {
+    fleetRecord.expiresAtMs = now + MINING_FLEET_LIFETIME_MS;
+  }
+  if (now < fleetRecord.expiresAtMs) {
+    return false;
+  }
+
+  const retreatedCount =
+    retreatFleetToOrigin(fleetRecord, {
+      state: "departing",
+      scene,
+      hooks,
+      reason: "expired",
+    }) +
+    retreatResponseWingToOrigin(fleetRecord, { nowMs: now });
+  if (retreatedCount <= 0) {
+    destroyFleetEntities(fleetRecord);
+    miningFleetStateByID.delete(fleetRecord.fleetID);
+    return true;
+  }
+
+  const ingressDurationMs = Math.max(
+    250,
+    toFiniteNumber(
+      config.miningNpcWarpIngressDurationMs,
+      DEFAULT_MINING_WARP_INGRESS_DURATION_MS,
+    ),
+  );
+  fleetRecord.state = "departing";
+  fleetRecord.departDespawnAtMs = now + ingressDurationMs;
+  fleetRecord.nextThinkAtMs = fleetRecord.departDespawnAtMs;
+  return true;
+}
+
+function tickMiningFleet(scene, fleetRecord, now, hooks) {
+  if (!scene || !fleetRecord || !hooks) {
+    return;
+  }
+
+  const thinkIntervalMs = Math.max(
+    250,
+    MINING_FLEET_THINK_INTERVAL_MS,
+  );
+  if (toFiniteNumber(fleetRecord.nextThinkAtMs, 0) > now) {
+    return;
+  }
+  fleetRecord.nextThinkAtMs = now + thinkIntervalMs;
+
+  if (advanceMiningFleetDeparture(scene, fleetRecord, now, hooks)) {
+    return;
+  }
+  const retreatRetry = retryPendingFleetRetreat(scene, fleetRecord, now);
+  if (retreatRetry.pendingCount > 0 || retreatRetry.startedCount > 0) {
+    return;
+  }
+
+  const latestAggression = getLatestFleetAggression(scene, fleetRecord, now);
+  if (
+    latestAggression &&
+    latestAggression.lastAggressedAtMs >
+      Math.max(0, toInt(fleetRecord.lastProcessedAggressionAtMs, 0))
+  ) {
+    triggerFleetAggression(scene, fleetRecord, {
+      aggressorEntity: latestAggression.aggressorEntity,
+      aggressionEventAtMs: latestAggression.lastAggressedAtMs,
+      nowMs: now,
+      hooks,
+    });
+  }
+
+  if (fleetRecord.responseEntityIDs.length > 0) {
+    const activeResponseTarget = scene.getEntityByID(toInt(fleetRecord.responseTargetID, 0));
+    if (activeResponseTarget && fleetRecord.responseRetreating !== true) {
+      issueResponseOrders(fleetRecord.responseEntityIDs, activeResponseTarget.itemID);
+    }
+    if (
+      fleetRecord.responseDespawnAtMs > 0 &&
+      now >= fleetRecord.responseDespawnAtMs
+    ) {
+      if (fleetRecord.responseRetreating === true) {
+        destroyResponseWing(fleetRecord);
+      } else {
+        retreatResponseWingToOrigin(fleetRecord, { nowMs: now });
+      }
+    }
+  }
+
+  if (
+    (fleetRecord.state === "aggressed" || fleetRecord.state === "panic") &&
+    fleetRecord.resumeAtMs > 0 &&
+    now >= fleetRecord.resumeAtMs &&
+    fleetRecord.responseEntityIDs.length <= 0
+  ) {
+    fleetRecord.state = "mining";
+    fleetRecord.resumeAtMs = 0;
+  }
+
+  if (fleetRecord.state === "hauling") {
+    if (now >= toFiniteNumber(fleetRecord.haulCompleteAtMs, 0)) {
+      completeHaulCycle(scene, fleetRecord, now);
+    }
+    return;
+  }
+  if (fleetRecord.state === "haulereturn") {
+    if (now >= toFiniteNumber(fleetRecord.haulerReturnAtMs, 0)) {
+      fleetRecord.state = "mining";
+      fleetRecord.haulerReturnAtMs = 0;
+    }
+    return;
+  }
+  if (fleetRecord.state !== "mining") {
+    return;
+  }
+
+  maintainMiningSupportBursts(scene, fleetRecord, hooks);
+  processOnGridMiningSupport(scene, fleetRecord, now, hooks);
+
+  maintainMiningSupportBursts(scene, fleetRecord, hooks);
+  processOnGridMiningSupport(scene, fleetRecord, now, hooks);
+
+  // This switch controls autonomous target selection/module activation only.
+  // Fleet lifecycle work above (response-wing cleanup, aggression recovery,
+  // and in-flight hauling) must continue even while automatic mining is off.
+  if (hooks.autoMineEnabled === false) {
+    return;
+  }
+
+  const availableTargetEntries = resolveAvailableMineableTargetEntries(scene, fleetRecord);
+  if (availableTargetEntries.length <= 0) {
+    fleetRecord.activeAsteroidID = 0;
+    if (shouldTriggerHauling(scene, fleetRecord, true, now) && startHaulCycle(scene, fleetRecord, now, hooks)) {
+      return;
+    }
+    fleetRecord.state = "depleted";
+    retreatFleetToOrigin(fleetRecord, {
+      state: "depleted",
+      scene,
+      hooks,
+      reason: "depleted",
+    });
+    return;
+  }
+
+  if (shouldTriggerHauling(scene, fleetRecord, false, now) && startHaulCycle(scene, fleetRecord, now, hooks)) {
+    return;
+  }
+
+  const assignmentMap = pruneFleetMinerAssignments(scene, fleetRecord);
+  const claimCounts = buildAssignedMineableClaimCounts(scene, fleetRecord);
+  const targetAssignmentCounts = new Map();
+  const rangeBufferMeters = Math.max(
+    0,
+    MINING_RANGE_BUFFER_METERS,
+  );
+  const orbitDistanceMeters = Math.max(
+    500,
+    MINING_ORBIT_DISTANCE_METERS,
+  );
+
+  for (const minerEntityID of Array.isArray(fleetRecord.minerEntityIDs) ? fleetRecord.minerEntityIDs : []) {
+    const minerEntity = scene.getEntityByID(minerEntityID);
+    if (!minerEntity || minerEntity.mode === "WARP" || minerEntity.pendingWarp) {
+      continue;
+    }
+
+    const miningModules = getNpcFittedModuleItems(minerEntity)
+      .filter((moduleItem) => isModuleOnline(moduleItem))
+      .map((moduleItem) => ({
+        moduleItem,
+        effectRecord:
+          typeof hooks.findMiningEffectRecordForModule === "function"
+            ? hooks.findMiningEffectRecordForModule(moduleItem)
+            : getEffectTypeRecord(toInt(moduleItem && moduleItem.effectID, 0)),
+      }))
+      .filter((entry) => entry.effectRecord);
+    if (miningModules.length <= 0) {
+      continue;
+    }
+
+    const primarySnapshot = hooks.buildEntityMiningSnapshot(
+      minerEntity,
+      miningModules[0].moduleItem,
+      miningModules[0].effectRecord,
+    );
+    if (!primarySnapshot) {
+      continue;
+    }
+
+    const targetEntity = chooseMineableTargetForMiner(
+      scene,
+      fleetRecord,
+      minerEntity,
+      availableTargetEntries,
+      claimCounts,
+      primarySnapshot,
+      hooks,
+    );
+    if (!targetEntity) {
+      delete assignmentMap[toInt(minerEntity.itemID, 0)];
+      continue;
+    }
+    const targetEntityID = toInt(targetEntity.itemID, 0);
+    targetAssignmentCounts.set(
+      targetEntityID,
+      toInt(targetAssignmentCounts.get(targetEntityID), 0) + 1,
+    );
+
+    const distanceToTarget = hooks.getSurfaceDistance(minerEntity, targetEntity);
+    const engagementRangeMeters = getMiningEngagementRangeMeters(
+      scene,
+      minerEntity,
+      primarySnapshot,
+      rangeBufferMeters,
+    );
+    if (distanceToTarget > engagementRangeMeters) {
+      syncMiningApproachOrder(
+        scene,
+        minerEntity,
+        targetEntity,
+        orbitDistanceMeters,
+      );
+      continue;
+    }
+
+    const targetLockResult = syncMiningTargetLock(
+      scene,
+      minerEntity,
+      targetEntity,
+      now,
+      hooks,
+    );
+    if (!targetLockResult || targetLockResult.success !== true) {
+      syncMiningApproachOrder(
+        scene,
+        minerEntity,
+        targetEntity,
+        orbitDistanceMeters,
+      );
+      continue;
+    }
+
+    syncMiningApproachOrder(
+      scene,
+      minerEntity,
+      targetEntity,
+      orbitDistanceMeters,
+    );
+    const pseudoSession = hooks.buildNpcPseudoSession(minerEntity);
+    for (const entry of miningModules) {
+      const activeEffect = minerEntity.activeModuleEffects instanceof Map
+        ? minerEntity.activeModuleEffects.get(toInt(entry.moduleItem.itemID, 0))
+        : null;
+      if (activeEffect && toInt(activeEffect.targetID, 0) !== toInt(targetEntity.itemID, 0)) {
+        scene.deactivateGenericModule(pseudoSession, entry.moduleItem.itemID, {
+          reason: "target",
+        });
+        continue;
+      }
+      if (!activeEffect) {
+      scene.activateGenericModule(pseudoSession, entry.moduleItem, entry.effectRecord.name, {
+        targetID: targetEntity.itemID,
+      });
+      }
+    }
+  }
+
+  const primaryTargetEntry = [...targetAssignmentCounts.entries()]
+    .sort((left, right) => right[1] - left[1] || left[0] - right[0])[0];
+  fleetRecord.activeAsteroidID = primaryTargetEntry ? toInt(primaryTargetEntry[0], 0) : 0;
+}
+
+function tickScene(scene, now, hooks = {}) {
+  const fleets = getMiningFleetsForScene(scene)
+    .map((fleetRecord) => pruneMiningFleet(fleetRecord))
+    .filter(Boolean);
+  if (fleets.length <= 0) {
+    return;
+  }
+  for (const fleetRecord of fleets) {
+    tickMiningFleet(scene, fleetRecord, now, hooks);
+  }
+}
+
+function adoptManagedPilotIdentity(
+  scene,
+  entityIDs,
+  options = {},
+) {
+  const identity =
+    options.pilotIdentity &&
+    typeof options.pilotIdentity === "object"
+      ? options.pilotIdentity
+      : null;
+  const pilotCharacterID = normalizePositiveInteger(
+    identity && identity.characterID,
+    0,
+  );
+  if (!scene || pilotCharacterID <= 0) {
+    return;
+  }
+  const pilotName = String(
+    identity.characterName || "Industrial Hireling",
+  ).trim();
+  const actorID = String(
+    options.livingUniverseActorID || "",
+  ).trim();
+  for (const entityID of Array.isArray(entityIDs) ? entityIDs : []) {
+    const entity =
+      typeof scene.getEntityByID === "function"
+        ? scene.getEntityByID(entityID)
+        : null;
+    if (!entity) {
+      continue;
+    }
+    entity.npcPilotCharacterID = pilotCharacterID;
+    entity.livingUniverseActorID = actorID || null;
+    entity.npcRole = String(
+      options.managedRole ||
+        entity.npcRole ||
+        "industrial",
+    );
+    entity.itemName = pilotName;
+    entity.slimName = pilotName;
+  }
+}
+
+function applyManagedIndustrialCrewMemberState(
+  scene,
+  member,
+  entityID,
+  options = {},
+) {
+  if (member.role === "hauler") {
+    applyPassiveMiningFleetOverrides(entityID, {
+      movementMode: "stop",
+      orbitDistanceMeters: 500,
+      followRangeMeters: 500,
+      idleAnchorOrbit: false,
+      idleAnchorOrbitDistanceMeters: 500,
+      clearCombatPreference: true,
+    });
+  } else if (member.role === "mining_support") {
+    applyPassiveMiningFleetOverrides(entityID, {
+      movementMode: "orbit",
+      orbitDistanceMeters: 3_500,
+      followRangeMeters: 1_500,
+      idleAnchorOrbit: false,
+      issueStopOrder: false,
+      clearCombatPreference: true,
+    });
+  } else {
+    applyPassiveMiningFleetOverrides(entityID, {
+      movementMode: "orbit",
+      orbitDistanceMeters: 1_200,
+      followRangeMeters: 800,
+      idleAnchorOrbit: false,
+      issueStopOrder: false,
+      clearCombatPreference: true,
+    });
+  }
+
+  adoptManagedPilotIdentity(scene, [entityID], {
+    ...options,
+    ...member,
+    pilotIdentity:
+      member.pilotIdentity || options.pilotIdentity,
+    livingUniverseActorID:
+      String(
+        member.livingUniverseActorID || "",
+      ).trim() ||
+      String(
+        options.livingUniverseActorID || "",
+      ).trim() ||
+      null,
+    managedRole: member.role,
+  });
+  const entity =
+    scene && typeof scene.getEntityByID === "function"
+      ? scene.getEntityByID(entityID)
+      : null;
+  if (!entity) {
+    return false;
+  }
+  entity.npcRole = member.role;
+  entity.managedIndustrialCrewMemberID = member.memberID;
+  entity.managedIndustrialCrewProfileID =
+    member.profileID;
+  entity.managedIndustrialCrewRole = member.role;
+  return true;
+}
+
+function applyMiningFleetCommandBurstAffinity(
+  fleetRecord,
+  scene = null,
+) {
+  if (!fleetRecord) {
+    return 0;
+  }
+  let activeScene = scene;
+  if (!activeScene) {
+    const runtime = getSpaceRuntime();
+    activeScene =
+      runtime.scenes instanceof Map
+        ? runtime.scenes.get(
+            toInt(fleetRecord.systemID, 0),
+          ) || null
+        : null;
+  }
+  const affinityGroupID =
+    MINING_FLEET_COMMAND_BURST_AFFINITY_BASE +
+    Math.max(1, toInt(fleetRecord.fleetID, 1));
+  fleetRecord.commandBurstAffinityGroupID =
+    affinityGroupID;
+  let assignedCount = 0;
+  for (const entityID of [
+    ...(Array.isArray(fleetRecord.minerEntityIDs)
+      ? fleetRecord.minerEntityIDs
+      : []),
+    ...(Array.isArray(fleetRecord.haulerEntityIDs)
+      ? fleetRecord.haulerEntityIDs
+      : []),
+  ]) {
+    const entity =
+      activeScene &&
+      typeof activeScene.getEntityByID === "function"
+        ? activeScene.getEntityByID(entityID)
+        : null;
+    if (!entity) {
+      continue;
+    }
+    entity.commandBurstAffinityGroupID =
+      affinityGroupID;
+    entity.remoteRepairBurstAffinityGroupID =
+      affinityGroupID;
+    assignedCount += 1;
+  }
+  return assignedCount;
+}
+
+function assessManagedIndustrialThreat(
+  scene,
+  fleetRecord,
+  aggressorEntity,
+) {
+  if (config.miningNpcManagedDefenseEnabled !== true) {
+    return {
+      engage: false,
+      reason: "DEFENSE_DISABLED",
+    };
+  }
+  if (
+    !scene ||
+    !fleetRecord ||
+    !aggressorEntity ||
+    aggressorEntity.nativeNpc !== true
+  ) {
+    return {
+      engage: false,
+      reason: "THREAT_NOT_KNOWN_NPC",
+    };
+  }
+  const aggressorController =
+    npcService.getControllerByEntityID(
+      toInt(aggressorEntity.itemID, 0),
+    );
+  const definition =
+    aggressorController &&
+    aggressorController.definitionSnapshot &&
+    typeof aggressorController.definitionSnapshot === "object"
+      ? aggressorController.definitionSnapshot
+      : null;
+  if (
+    !aggressorController ||
+    !definition ||
+    aggressorEntity.capitalNpc === true
+  ) {
+    return {
+      engage: false,
+      reason: "THREAT_DEFINITION_UNTRUSTED",
+    };
+  }
+
+  const targetSizeClass =
+    resolveManagedThreatSizeClass(aggressorEntity);
+  if (
+    !["frigate", "destroyer"].includes(
+      targetSizeClass,
+    )
+  ) {
+    return {
+      engage: false,
+      reason: "THREAT_HULL_TOO_LARGE",
+      targetSizeClass,
+    };
+  }
+  const threatName = [
+    aggressorEntity.itemName,
+    aggressorEntity.slimName,
+    definition.profile && definition.profile.name,
+    definition.profile && definition.profile.profileID,
+  ].filter(Boolean).join(" ");
+  if (
+    MANAGED_MINING_DEFENSE_REJECTED_NAME_PATTERN.test(
+      threatName,
+    )
+  ) {
+    return {
+      engage: false,
+      reason: "THREAT_VARIANT_REJECTED",
+      targetSizeClass,
+    };
+  }
+  const participatingFleets =
+    listCoLocatedManagedIndustrialFleets(
+      scene,
+      fleetRecord,
+    );
+  const participatingDoctrine =
+    participatingFleets.map((candidate) =>
+      normalizeManagedThreatDoctrine(
+        candidate && candidate.threatDoctrine,
+      ));
+  const bounty = Math.max(
+    0,
+    toFiniteNumber(aggressorEntity.bounty, 0),
+  );
+  const maximumBounty = Math.max(
+    ...participatingDoctrine.map(
+      (doctrine) =>
+        doctrine.maximumThreatBountyISK,
+    ),
+  );
+  if (bounty <= 0 || bounty > maximumBounty) {
+    return {
+      engage: false,
+      reason: "THREAT_BOUNTY_OUT_OF_POLICY",
+      targetSizeClass,
+      bounty,
+      maximumBounty,
+    };
+  }
+  const hasHostileUtility =
+    getNpcFittedModuleItems(aggressorEntity)
+      .some((moduleItem) => {
+        const typeRecord =
+          resolveItemByTypeID(
+            toInt(moduleItem && moduleItem.typeID, 0),
+          ) || {};
+        return (
+          MANAGED_MINING_DEFENSE_HOSTILE_UTILITY_GROUP_IDS
+            .has(
+              toInt(
+                moduleItem && moduleItem.groupID,
+                toInt(typeRecord.groupID, 0),
+              ),
+            )
+        );
+      });
+  if (hasHostileUtility) {
+    return {
+      engage: false,
+      reason: "THREAT_HAS_CONTROL_MODULES",
+      targetSizeClass,
+    };
+  }
+
+  const defensePlans = [];
+  let defensePower = 0;
+  let plannedDroneCount = 0;
+  const maximumActiveDronesPerFleet = Math.max(
+    0,
+    toInt(
+      config.miningNpcManagedDefenseMaxActiveDrones,
+      DEFAULT_MANAGED_MINING_DEFENSE_MAX_ACTIVE_DRONES,
+    ),
+  );
+  for (const participatingFleet of participatingFleets) {
+    let remainingDroneSlots =
+      maximumActiveDronesPerFleet;
+    for (
+      const entity of getFleetEntities(
+        scene,
+        participatingFleet,
+      )
+    ) {
+      const health =
+        getEntityCombatHealthSnapshot(entity);
+      if (
+        health.shieldRatio < 0.99 ||
+        health.armorDamageRatio > 0 ||
+        health.structureDamageRatio > 0
+      ) {
+        return {
+          engage: false,
+          reason: "CREW_NOT_PRISTINE",
+          targetSizeClass,
+        };
+      }
+      const doctrine =
+        resolveManagedEntityDroneDoctrine(entity);
+      const selectedFlight = selectManagedDefenseFlight(
+        doctrine.defenseFlights,
+        targetSizeClass,
+      );
+      if (
+        !selectedFlight ||
+        doctrine.bayEntries.length <= 0
+      ) {
+        continue;
+      }
+      const authoredLaunchCount = Math.max(
+        0,
+        toInt(
+          selectedFlight.launchCount ??
+            selectedFlight.quantity,
+          0,
+        ),
+      );
+      const stagedLaunchCount = Math.min(
+        authoredLaunchCount,
+        remainingDroneSlots,
+      );
+      if (stagedLaunchCount <= 0) {
+        break;
+      }
+      const stagedFlight = {
+        ...selectedFlight,
+        launchCount: stagedLaunchCount,
+      };
+      const flightPower =
+        getManagedDefenseFlightPower(stagedFlight);
+      if (flightPower <= 0) {
+        continue;
+      }
+      defensePlans.push({
+        fleetRecord: participatingFleet,
+        controllerEntity: entity,
+        bayEntries: doctrine.bayEntries,
+        selectedFlight: stagedFlight,
+        flightPower,
+      });
+      defensePower += flightPower;
+      plannedDroneCount += stagedLaunchCount;
+      remainingDroneSlots -= stagedLaunchCount;
+    }
+  }
+  if (defensePlans.length <= 0) {
+    return {
+      engage: false,
+      reason: "NO_LEGAL_DEFENSE_FLIGHT",
+      targetSizeClass,
+    };
+  }
+
+  const shieldCapacity = Math.max(
+    0,
+    toFiniteNumber(
+      aggressorEntity.shieldCapacity,
+      getTypeAttributeValue(
+        aggressorEntity.typeID,
+        "shieldCapacity",
+      ),
+    ),
+  );
+  const armorHP = Math.max(
+    0,
+    toFiniteNumber(
+      aggressorEntity.armorHP,
+      getTypeAttributeValue(
+        aggressorEntity.typeID,
+        "armorHP",
+      ),
+    ),
+  );
+  const structureHP = Math.max(
+    0,
+    toFiniteNumber(
+      aggressorEntity.structureHP,
+      getTypeAttributeValue(
+        aggressorEntity.typeID,
+        "hp",
+        "structureHP",
+      ),
+    ),
+  );
+  const threatPower = Math.max(
+    1,
+    bounty / 5_000,
+    (
+      shieldCapacity +
+      armorHP +
+      structureHP
+    ) / 2_000,
+  );
+  const requiredOvermatch = Math.max(
+    ...participatingDoctrine.map(
+      (doctrine) =>
+        doctrine.requiredCrewOvermatch,
+    ),
+  );
+  if (
+    defensePower <
+    threatPower * requiredOvermatch
+  ) {
+    return {
+      engage: false,
+      reason: "INSUFFICIENT_ZERO_LOSS_MARGIN",
+      targetSizeClass,
+      defensePower,
+      threatPower,
+      requiredOvermatch,
+    };
+  }
+  return {
+    engage: true,
+    reason: "KNOWN_NPC_OVERMATCH",
+    targetSizeClass,
+    bounty,
+    defensePower,
+    threatPower,
+    requiredOvermatch,
+    plannedDroneCount,
+    defensePlans,
+    participatingFleets,
+  };
+}
+
+function beginManagedFleetDroneDefense(
+  scene,
+  fleetRecord,
+  aggressorEntity,
+  assessment,
+  options = {},
+) {
+  let droneRuntime;
+  try {
+    droneRuntime = getManagedDroneRuntime();
+  } catch (_error) {
+    return {
+      success: false,
+      errorMsg: "MANAGED_DRONE_RUNTIME_UNAVAILABLE",
+    };
+  }
+  if (
+    typeof droneRuntime
+      .launchManagedTransientNpcDroneFlight !==
+      "function" ||
+    typeof droneRuntime
+      .engageManagedTransientNpcDroneFlight !==
+      "function"
+  ) {
+    return {
+      success: false,
+      errorMsg: "MANAGED_DRONE_API_UNAVAILABLE",
+    };
+  }
+  const participatingFleets = (
+    Array.isArray(
+      assessment && assessment.participatingFleets,
+    ) &&
+    assessment.participatingFleets.length > 0
+      ? assessment.participatingFleets
+      : [fleetRecord]
+  );
+  const recallParticipatingFleets = (reason) => {
+    for (const participatingFleet of participatingFleets) {
+      recallManagedFleetDefensiveDrones(
+        scene,
+        participatingFleet,
+        reason,
+      );
+    }
+  };
+  const touchedEntityIDs = [];
+  for (const plan of assessment.defensePlans || []) {
+    const defensiveFleet =
+      plan && plan.fleetRecord || fleetRecord;
+    const activeFlights =
+      getManagedFleetDefensiveDroneState(
+        defensiveFleet,
+      );
+    const controllerEntity = plan.controllerEntity;
+    const entityID = toInt(
+      controllerEntity && controllerEntity.itemID,
+      0,
+    );
+    let flightID = String(
+      activeFlights[String(entityID)] || "",
+    ).trim();
+    if (!flightID) {
+      const launchResult =
+        droneRuntime
+          .launchManagedTransientNpcDroneFlight(
+            scene,
+            controllerEntity,
+            plan.selectedFlight,
+            {
+              targetEntity: aggressorEntity,
+              bayEntries: plan.bayEntries,
+              ownerKind:
+                "managed_industrial_mining_fleet",
+              ownerID: defensiveFleet.fleetID,
+              provenance: {
+                source:
+                  "managed_industrial_defense",
+                fleetID: defensiveFleet.fleetID,
+                operatorKind:
+                  defensiveFleet.operatorKind,
+                operatorID:
+                  defensiveFleet.operatorID,
+              },
+              nowMs: options.nowMs,
+              onStockChanged(event = {}) {
+                notifyManagedDroneStockChanged(
+                  defensiveFleet,
+                  controllerEntity,
+                  event.stock,
+                  {
+                    ...event,
+                    eventKind: "stock_transition",
+                  },
+                );
+              },
+              onDroneLost() {
+                defensiveFleet.defenseDroneLossDetected =
+                  true;
+              },
+              onFlightClosed() {
+                if (
+                  activeFlights[String(entityID)] ===
+                  flightID
+                ) {
+                  delete activeFlights[
+                    String(entityID)
+                  ];
+                }
+              },
+            },
+          );
+      if (
+        !launchResult ||
+        launchResult.success !== true ||
+        !launchResult.flightID
+      ) {
+        recallParticipatingFleets("launch_failure");
+        return {
+          success: false,
+          errorMsg:
+            launchResult &&
+              launchResult.errorMsg ||
+            "MANAGED_DRONE_LAUNCH_FAILED",
+        };
+      }
+      flightID = String(launchResult.flightID);
+      activeFlights[String(entityID)] = flightID;
+      touchedEntityIDs.push(entityID);
+      const launchStockPersisted =
+        notifyManagedDroneStockChanged(
+          defensiveFleet,
+          controllerEntity,
+          launchResult.stock,
+          {
+            eventKind: "flight_launched",
+            flightID,
+            atMs: options.nowMs,
+            launchedCount: toInt(
+              launchResult.launchedCount,
+              0,
+            ),
+          },
+        );
+      if (
+        launchStockPersisted &&
+        launchStockPersisted.success === false
+      ) {
+        recallParticipatingFleets(
+          "stock_persistence_failure",
+        );
+        return {
+          success: false,
+          errorMsg:
+            launchStockPersisted.errorMsg ||
+            "MANAGED_DRONE_STOCK_PERSISTENCE_FAILED",
+        };
+      }
+    }
+    const engageResult =
+      droneRuntime
+        .engageManagedTransientNpcDroneFlight(
+          scene,
+          controllerEntity,
+          aggressorEntity,
+          { flightID },
+        );
+    if (
+      !engageResult ||
+      engageResult.success !== true
+    ) {
+      recallParticipatingFleets("engage_failure");
+      return {
+        success: false,
+        errorMsg:
+          engageResult && engageResult.errorMsg ||
+          "MANAGED_DRONE_ENGAGE_FAILED",
+      };
+    }
+  }
+  const flightCount = participatingFleets.reduce(
+    (total, participatingFleet) =>
+      total +
+      Object.keys(
+        getManagedFleetDefensiveDroneState(
+          participatingFleet,
+        ),
+      ).length,
+    0,
+  );
+  if (flightCount <= 0) {
+    return {
+      success: false,
+      errorMsg: "NO_MANAGED_DRONES_LAUNCHED",
+    };
+  }
+  return {
+    success: true,
+    data: {
+      flightCount,
+      touchedEntityIDs,
+      participatingFleetIDs:
+        participatingFleets.map(
+          (participatingFleet) =>
+            toInt(participatingFleet.fleetID, 0),
+        ),
+    },
+  };
+}
+
+function buildCappedGroupProfilePlan(
+  groupResolution,
+  amount,
+  physicalShipLimit,
+) {
+  const limit = Math.max(
+    0,
+    toInt(physicalShipLimit, 0),
+  );
+  if (limit <= 0) {
+    return null;
+  }
+  const profileIDs = [];
+  for (
+    let iteration = 0;
+    iteration < Math.max(1, toInt(amount, 1));
+    iteration += 1
+  ) {
+    const definitionPlan = buildDefinitionsForSpawnGroup(
+      groupResolution && groupResolution.data,
+      { entityType: "npc" },
+    );
+    if (
+      !definitionPlan ||
+      definitionPlan.success !== true ||
+      !definitionPlan.data
+    ) {
+      return definitionPlan || {
+        success: false,
+        errorMsg: "NPC_GROUP_SPAWN_PLAN_FAILED",
+      };
+    }
+    for (const definition of definitionPlan.data.definitions || []) {
+      const profileID = String(
+        definition &&
+          definition.profile &&
+          definition.profile.profileID ||
+          "",
+      ).trim();
+      if (!profileID) {
+        return {
+          success: false,
+          errorMsg: "NPC_DEFINITION_INCOMPLETE",
+        };
+      }
+      profileIDs.push(profileID);
+      if (profileIDs.length >= limit) {
+        return {
+          success: true,
+          data: { profileIDs },
+        };
+      }
+    }
+  }
+  return profileIDs.length > 0
+    ? { success: true, data: { profileIDs } }
+    : {
+        success: false,
+        errorMsg: "NPC_GROUP_SPAWN_PLAN_EMPTY",
+      };
+}
+
+function buildNpcCargoResourceState(typeID, options = {}) {
+  const numericTypeID = toInt(typeID, 0);
+  if (numericTypeID <= 0) {
+    return null;
+  }
+  const shipItem =
+    options.shipItem && typeof options.shipItem === "object"
+      ? options.shipItem
+      : {
+          itemID: -numericTypeID,
+          typeID: numericTypeID,
+          quantity: 1,
+          stacksize: 1,
+          singleton: 1,
+        };
+  try {
+    return buildShipResourceState(0, shipItem, {
+      fittedItems: Array.isArray(options.fittedItems)
+        ? options.fittedItems
+        : [],
+      skillMap: options.skillMap instanceof Map
+        ? options.skillMap
+        : new Map(),
+      includeActiveImplantModifiers: false,
+    });
+  } catch (error) {
+    log.warn(
+      `[MiningFleet] dogma cargo capacity resolution failed type=${numericTypeID}: ` +
+      String(error && error.message || error),
+    );
+    return null;
+  }
+}
+
+function buildNpcPseudoSession(entity, hooks = null) {
+  if (hooks && typeof hooks.buildNpcPseudoSession === "function") {
+    return hooks.buildNpcPseudoSession(entity);
+  }
+  return {
+    characterID: toInt(
+      entity && (
+        entity.npcPilotCharacterID ??
+        entity.pilotCharacterID ??
+        entity.characterID
+      ),
+      0,
+    ),
+    corporationID: toInt(entity && entity.corporationID, 0),
+    allianceID: toInt(entity && entity.allianceID, 0),
+    _space: {
+      systemID: toInt(entity && entity.systemID, 0),
+      shipID: toInt(entity && entity.itemID, 0),
+    },
+  };
+}
+
+function cleanupMiningFleetRuntimeResources(
+  scene,
+  fleetRecord,
+  options = {},
+) {
+  if (!fleetRecord) {
+    return {
+      burstCount: 0,
+      droneFlightCount: 0,
+      supportRemovedCount: 0,
+    };
+  }
+  const reason = String(options.reason || "fleet_cleanup");
+  const activeScene = resolveFleetScene(scene, fleetRecord);
+  const burstCount = deactivateMiningSupportBursts(
+    activeScene,
+    fleetRecord,
+    options.hooks || null,
+    reason,
+  );
+  const droneFlightCount = recallManagedFleetDefensiveDrones(
+    activeScene,
+    fleetRecord,
+    reason,
+  );
+  const supportResult = cleanupMiningFleetSupport(
+    activeScene,
+    fleetRecord.fleetID,
+    {
+      hooks: options.hooks || null,
+      unregister: false,
+      reason,
+    },
+  );
+  return {
+    burstCount,
+    droneFlightCount,
+    supportRemovedCount: Math.max(
+      0,
+      toInt(
+        supportResult &&
+          supportResult.data &&
+          supportResult.data.removedCount,
+        0,
+      ),
+    ),
+  };
+}
+
+function cleanupMiningFleetSupport(
+  scene,
+  fleetID,
+  options = {},
+) {
+  const normalizedFleetID = toInt(fleetID, 0);
+  const fleetRecord =
+    miningFleetStateByID.get(normalizedFleetID) || null;
+  if (!fleetRecord) {
+    return {
+      success: true,
+      data: {
+        fleetID: normalizedFleetID,
+        removedCount: 0,
+      },
+    };
+  }
+  const activeScene = resolveFleetScene(scene, fleetRecord);
+  const haulerEntity =
+    activeScene &&
+    toInt(fleetRecord.activeTractorHaulerID, 0) > 0
+      ? activeScene.getEntityByID(
+          fleetRecord.activeTractorHaulerID,
+        )
+      : null;
+  deactivateFleetTractor(
+    activeScene,
+    fleetRecord,
+    haulerEntity,
+    options.hooks || null,
+    "cleanup",
+  );
+  let removedCount = 0;
+  let preservedCount = 0;
+  for (
+    const record of Object.values({
+      ...(fleetRecord.jetcanRecordsByID || {}),
+    })
+  ) {
+    if (!record || toInt(record.containerID, 0) <= 0) {
+      continue;
+    }
+    if (
+      options.removePersistentCargo !== true &&
+      (
+        record.external === true ||
+        fleetRecord.cargoTransient === false
+      )
+    ) {
+      // External cans belong to another actor, while non-transient mining
+      // cans are the employer's settled cargo. Drop only fleet bookkeeping;
+      // destroying either container here would erase cargo during stand-down.
+      detachMiningJetcanRecord(
+        fleetRecord,
+        record.containerID,
+      );
+      preservedCount += 1;
+      continue;
+    }
+    removeMiningJetcan(
+      activeScene,
+      fleetRecord,
+      record.containerID,
+      { removeContents: true },
+    );
+    removedCount += 1;
+  }
+  if (options.unregister === true) {
+    releaseManagedFleetResources(
+      fleetRecord,
+      options.reason || "support_cleanup",
+    );
+    miningFleetStateByID.delete(normalizedFleetID);
+  }
+  return {
+    success: true,
+    data: {
+      fleetID: normalizedFleetID,
+      removedCount,
+      preservedCount,
+    },
+  };
+}
+
+function cloneVector(source = null, fallback = { x: 0, y: 0, z: 0 }) {
+  return {
+    x: toFiniteNumber(source && source.x, fallback.x),
+    y: toFiniteNumber(source && source.y, fallback.y),
+    z: toFiniteNumber(source && source.z, fallback.z),
+  };
 }
 
 function collectMiningJetcan(
@@ -4269,140 +4733,1457 @@ function collectMiningJetcan(
   return true;
 }
 
-function startOnGridHaulerDelivery(
+function createMiningJetcan(scene, fleetRecord, minerEntity, now) {
+  if (
+    !scene ||
+    !fleetRecord ||
+    !minerEntity ||
+    !npcService.getControllerByEntityID(toInt(minerEntity.itemID, 0))
+  ) {
+    return null;
+  }
+  const minerScope = resolveEntityInteractionScope(minerEntity);
+  if (!minerScope.valid) {
+    return null;
+  }
+  const containerLookup = resolveItemByName("Cargo Container");
+  if (
+    !containerLookup ||
+    !containerLookup.success ||
+    !containerLookup.match
+  ) {
+    return null;
+  }
+  const ownerID = normalizePositiveInteger(
+    fleetRecord.cargoOwnerID,
+    normalizePositiveInteger(
+      minerEntity.ownerID ??
+        minerEntity.corporationID ??
+        minerEntity.pilotCharacterID,
+      0,
+    ),
+  );
+  if (ownerID <= 0) {
+    return null;
+  }
+  const direction = normalizeVector(
+    minerEntity.direction,
+    { x: 1, y: 0, z: 0 },
+  );
+  const jettisonDistanceMeters = Math.max(
+    275,
+    toFiniteNumber(config.miningNpcJetcanJettisonDistanceMeters, 750),
+  );
+  const position = {
+    x: toFiniteNumber(minerEntity.position && minerEntity.position.x, 0) +
+      (direction.x * jettisonDistanceMeters),
+    y: toFiniteNumber(minerEntity.position && minerEntity.position.y, 0) +
+      (direction.y * jettisonDistanceMeters),
+    z: toFiniteNumber(minerEntity.position && minerEntity.position.z, 0) +
+      (direction.z * jettisonDistanceMeters),
+  };
+  const corporationID = normalizePositiveInteger(
+    fleetRecord.cargoCorporationID,
+    normalizePositiveInteger(minerEntity.corporationID, 0),
+  );
+  const itemName = `${String(
+    fleetRecord.jetcanNamePrefix ||
+      minerEntity.itemName ||
+      "Mining Fleet",
+  )} Jetcan`;
+  const entityScopeMetadata = buildChildEntityScopeMetadata(minerEntity);
+  const createResult = createSpaceItemForOwner(
+    ownerID,
+    scene.systemID,
+    containerLookup.match,
+    {
+      ...entityScopeMetadata,
+      itemName,
+      position,
+      velocity: { x: 0, y: 0, z: 0 },
+      direction,
+      targetPoint: position,
+      mode: "STOP",
+      speedFraction: 0,
+      transient: fleetRecord.cargoTransient !== false,
+      createdAtMs: now,
+      expiresAtMs: now + DEFAULT_MINING_JETCAN_LIFETIME_MS,
+      launcherID: toInt(minerEntity.itemID, 0),
+      customInfo: JSON.stringify({
+        evejsLoot: {
+          corporationID,
+          lootRightCorpID: corporationID,
+        },
+        evejsNpcMining: {
+          fleetID: fleetRecord.fleetID,
+          minerEntityID: toInt(minerEntity.itemID, 0),
+        },
+      }),
+    },
+  );
+  const containerID = toInt(
+    createResult && createResult.data && createResult.data.itemID,
+    0,
+  );
+  if (!createResult || !createResult.success || containerID <= 0) {
+    return null;
+  }
+
+  const spawnResult = getSpaceRuntime().spawnDynamicInventoryEntity(
+    scene.systemID,
+    containerID,
+    {
+      broadcast: false,
+      entityScopeMetadata,
+    },
+  );
+  const containerEntity =
+    spawnResult &&
+    spawnResult.success &&
+    spawnResult.data &&
+    spawnResult.data.entity
+      ? spawnResult.data.entity
+      : scene.getEntityByID(containerID);
+  if (
+    !containerEntity ||
+    !canEntitiesInteractLocally(minerEntity, containerEntity)
+  ) {
+    if (containerEntity) {
+      getSpaceRuntime().removeDynamicEntity(scene.systemID, containerID, {
+        persistSpaceState: false,
+      });
+    }
+    removeInventoryItem(containerID, { removeContents: true });
+    return null;
+  }
+  containerEntity.itemName = itemName;
+  containerEntity.slimName = itemName;
+  containerEntity.corporationID = corporationID;
+  containerEntity.lootRightCorpID = corporationID;
+  scene.broadcastAddBalls(
+    [containerEntity],
+    null,
+    { freshAcquire: true },
+  );
+  scene.broadcastSpecialFx(
+    containerEntity.itemID,
+    MINING_JETTISON_EFFECT_GUID,
+    {
+      targetID: null,
+      isOffensive: false,
+      start: true,
+      active: false,
+      duration: -1,
+      useCurrentVisibleStamp: true,
+    },
+    containerEntity,
+  );
+
+  const record = {
+    containerID,
+    minerEntityID: toInt(minerEntity.itemID, 0),
+    createdAtMs: now,
+    sealedAtMs: 0,
+    tractorStartedAtMs: 0,
+    pickupRangeReachedAtMs: 0,
+    collectedAtMs: 0,
+  };
+  fleetRecord.jetcanRecordsByID[String(containerID)] = record;
+  fleetRecord.activeJetcanIDByMinerID[
+    String(record.minerEntityID)
+  ] = containerID;
+  fleetRecord.jetcansCreated += 1;
+  log.info(
+    `[MiningSupport] fleet=${fleetRecord.fleetID} ` +
+    `miner=${record.minerEntityID} jettisoned can=${containerID}`,
+  );
+  return record;
+}
+
+function deactivateFleetTractor(
   scene,
   fleetRecord,
   haulerEntity,
-  now,
+  hooks,
+  reason = "cargo",
+) {
+  const moduleID = toInt(
+    fleetRecord && fleetRecord.activeTractorModuleID,
+    0,
+  );
+  if (
+    scene &&
+    haulerEntity &&
+    moduleID > 0 &&
+    npcService.getControllerByEntityID(toInt(haulerEntity.itemID, 0))
+  ) {
+    scene.deactivateGenericModule(
+      buildNpcPseudoSession(haulerEntity, hooks),
+      moduleID,
+      {
+        reason,
+        deferUntilCycle: false,
+      },
+    );
+  }
+  fleetRecord.activeTractorCanID = 0;
+  fleetRecord.activeTractorHaulerID = 0;
+  fleetRecord.activeTractorModuleID = 0;
+}
+
+function deactivateMiningSupportBursts(
+  scene,
+  fleetRecord,
+  hooks = null,
+  reason = "state",
+) {
+  if (!scene || !fleetRecord) {
+    return 0;
+  }
+  let deactivatedCount = 0;
+  for (const entity of getFleetEntities(scene, fleetRecord)) {
+    const pseudoSession = buildNpcPseudoSession(entity, hooks);
+    for (const entry of getMiningCommandBurstModules(entity)) {
+      const moduleItemID = toInt(entry.moduleItem && entry.moduleItem.itemID, 0);
+      const activeEffect = entity.activeModuleEffects instanceof Map
+        ? entity.activeModuleEffects.get(moduleItemID)
+        : null;
+      if (!activeEffect) {
+        continue;
+      }
+      const result = scene.deactivateGenericModule(pseudoSession, moduleItemID, {
+        reason,
+        deferUntilCycle: false,
+      });
+      if (!result || result.success !== false) {
+        deactivatedCount += 1;
+      }
+    }
+  }
+  return deactivatedCount;
+}
+
+function destroyManagedMiningFleet(fleetID, options = {}) {
+  const normalizedFleetID = toInt(fleetID, 0);
+  const fleetRecord =
+    miningFleetStateByID.get(normalizedFleetID) || null;
+  if (!fleetRecord) {
+    return {
+      success: true,
+      data: {
+        fleetID: normalizedFleetID,
+        destroyedCount: 0,
+      },
+    };
+  }
+  if (!managedMiningOwnerMatches(fleetRecord, options)) {
+    return {
+      success: false,
+      errorMsg: "MANAGED_MINING_OWNER_MISMATCH",
+    };
+  }
+  const reason = String(
+    options.reason || "managed_destroy",
+  );
+  const destroyedCount = destroyFleetEntities(fleetRecord, {
+    scene: options.scene || null,
+    hooks: options.hooks || null,
+    reason,
+  });
+  releaseManagedFleetResources(fleetRecord, reason);
+  miningFleetStateByID.delete(normalizedFleetID);
+  return {
+    success: true,
+    data: {
+      fleetID: normalizedFleetID,
+      destroyedCount,
+    },
+  };
+}
+
+function destroyManagedMiningFleetsByOwner(options = {}) {
+  const owner = normalizeManagedMiningOwner(options);
+  if (!owner.operatorKind || !owner.operatorID) {
+    return {
+      success: false,
+      errorMsg: "MANAGED_MINING_OWNER_REQUIRED",
+    };
+  }
+  const fleetIDs = [...miningFleetStateByID.values()]
+    .filter(
+      (fleetRecord) =>
+        managedMiningOwnerMatches(fleetRecord, owner),
+    )
+    .map((fleetRecord) => fleetRecord.fleetID);
+  let destroyedCount = 0;
+  for (const fleetID of fleetIDs) {
+    const result = destroyManagedMiningFleet(fleetID, {
+      ...owner,
+      scene: options.scene || null,
+      hooks: options.hooks || null,
+      reason: options.reason,
+    });
+    if (result && result.success === true) {
+      destroyedCount += Math.max(
+        0,
+        toInt(
+          result.data && result.data.destroyedCount,
+          0,
+        ),
+      );
+    }
+  }
+  return {
+    success: true,
+    data: {
+      fleetIDs,
+      fleetCount: fleetIDs.length,
+      destroyedCount,
+    },
+  };
+}
+
+function detachMiningJetcanRecord(fleetRecord, containerID) {
+  const normalizedContainerID = toInt(containerID, 0);
+  const record = getMiningJetcanRecord(
+    fleetRecord,
+    normalizedContainerID,
+  );
+  if (!record) {
+    return null;
+  }
+  const minerKey = String(toInt(record.minerEntityID, 0));
+  if (
+    toInt(
+      fleetRecord.activeJetcanIDByMinerID &&
+        fleetRecord.activeJetcanIDByMinerID[minerKey],
+      0,
+    ) === normalizedContainerID
+  ) {
+    delete fleetRecord.activeJetcanIDByMinerID[minerKey];
+  }
+  delete fleetRecord.jetcanRecordsByID[
+    String(normalizedContainerID)
+  ];
+  return record;
+}
+
+function estimateNpcMiningVolume(options = {}) {
+  const shipTypeID = toInt(options.shipTypeID, 0);
+  const durationMs = Math.max(0, toInt(options.durationMs, 0));
+  const resourceFamily =
+    String(options.resourceFamily || "ore").trim().toLowerCase() || "ore";
+  const supportBonus =
+    options.supportBonus && typeof options.supportBonus === "object"
+      ? options.supportBonus
+      : {};
+  const cycleTimeMultiplier = Math.max(
+    0.5,
+    Math.min(1, toFiniteNumber(supportBonus.cycleTimeMultiplier, 1)),
+  );
+  if (shipTypeID <= 0 || durationMs <= 0) {
+    return {
+      shipTypeID,
+      durationMs,
+      capacityM3: 0,
+      estimatedVolumeM3: 0,
+      moduleCycles: [],
+    };
+  }
+
+  const fittedItems = [];
+  const skillMap = options.skillMap instanceof Map ? options.skillMap : new Map();
+  let itemNumber = 2;
+  for (const entry of Array.isArray(options.modules) ? options.modules : []) {
+    const typeID = toInt(entry && entry.typeID, 0);
+    const quantity = Math.max(0, toInt(entry && entry.quantity, 0));
+    const moduleType = resolveItemByTypeID(typeID) || {};
+    for (let index = 0; typeID > 0 && index < quantity; index += 1) {
+      fittedItems.push({
+        itemID: -itemNumber,
+        typeID,
+        itemName: String(moduleType.name || moduleType.typeName || ""),
+        quantity: 1,
+        stacksize: 1,
+        singleton: 1,
+        flagID: 26 + itemNumber,
+        online: true,
+      });
+      itemNumber += 1;
+    }
+  }
+
+  const shipItem = {
+    itemID: -1,
+    typeID: shipTypeID,
+    quantity: 1,
+    stacksize: 1,
+    singleton: 1,
+  };
+  const moduleCycles = fittedItems
+    .map((moduleItem) => {
+      const snapshot = buildMiningModuleSnapshot({
+        shipItem,
+        moduleItem,
+        effectRecord: null,
+        fittedItems,
+        skillMap,
+      });
+      if (!snapshot || snapshot.family !== resourceFamily) {
+        return null;
+      }
+      const cycleDurationMs = Math.max(
+        1,
+        snapshot.durationMs * cycleTimeMultiplier,
+      );
+      const cycles = Math.max(0, Math.floor(durationMs / cycleDurationMs));
+      return {
+        moduleTypeID: snapshot.moduleTypeID,
+        resourceFamily,
+        cycleDurationMs,
+        yieldPerCycleM3: snapshot.miningAmountM3,
+        cycles,
+        volumeM3: cycles * snapshot.miningAmountM3,
+      };
+    })
+    .filter(Boolean);
+  const capacityM3 = Math.max(
+    0,
+    toFiniteNumber(
+      options.capacityM3,
+      getNpcCargoCapacityM3ForTypeID(
+        shipTypeID,
+        toFiniteNumber(
+          config.miningNpcMinerCargoCapacityM3,
+          DEFAULT_MINING_MINER_CARGO_CAPACITY_M3,
+        ),
+        { shipItem, fittedItems, skillMap },
+      ),
+    ),
+  );
+  const rawVolumeM3 = moduleCycles.reduce(
+    (sum, entry) => sum + toFiniteNumber(entry.volumeM3, 0),
+    0,
+  );
+  return {
+    shipTypeID,
+    durationMs,
+    resourceFamily,
+    capacityM3,
+    estimatedVolumeM3: Math.min(capacityM3, rawVolumeM3),
+    supportBonus:
+      Object.keys(supportBonus).length > 0
+        ? {
+            supportClass: String(
+              supportBonus.supportClass || "industrial_command",
+            ),
+            cycleTimeMultiplier,
+            rangeMultiplier: Math.max(
+              1,
+              toFiniteNumber(supportBonus.rangeMultiplier, 1),
+            ),
+          }
+        : null,
+    moduleCycles,
+  };
+}
+
+function finalizeOnGridMiningSupport(
+  scene,
+  fleetID,
   options = {},
+) {
+  const fleetRecord =
+    miningFleetStateByID.get(toInt(fleetID, 0)) || null;
+  if (!fleetRecord || fleetRecord.onGridSupport !== true) {
+    return {
+      success: true,
+      data: {
+        fleetID: toInt(fleetID, 0),
+        collectedCount: 0,
+      },
+    };
+  }
+  const activeScene = resolveFleetScene(scene, fleetRecord);
+  const haulerEntity = activeScene
+    ? fleetRecord.haulerEntityIDs
+      .map((entityID) => activeScene.getEntityByID(entityID))
+      .find(
+        (entity) =>
+          entity &&
+          npcService.getControllerByEntityID(
+            toInt(entity.itemID, 0),
+          ),
+      ) || null
+    : null;
+  let collectedCount = 0;
+  if (activeScene && haulerEntity) {
+    for (
+      const record of Object.values({
+        ...(fleetRecord.jetcanRecordsByID || {}),
+      })
+    ) {
+      if (!record || toInt(record.containerID, 0) <= 0) {
+        continue;
+      }
+      if (
+        collectMiningJetcan(
+          activeScene,
+          fleetRecord,
+          haulerEntity,
+          record.containerID,
+          options.hooks || null,
+          { force: true, nowMs: options.nowMs },
+        )
+      ) {
+        collectedCount += 1;
+      }
+    }
+  }
+  return {
+    success: true,
+    data: {
+      fleetID: fleetRecord.fleetID,
+      collectedCount,
+      remainingCount: Object.keys(
+        fleetRecord.jetcanRecordsByID || {},
+      ).length,
+    },
+  };
+}
+
+function getEntityCombatHealthSnapshot(entity) {
+  const condition =
+    entity &&
+    entity.conditionState &&
+    typeof entity.conditionState === "object"
+      ? entity.conditionState
+      : {};
+  return {
+    shieldRatio: Math.max(
+      0,
+      Math.min(
+        1,
+        toFiniteNumber(condition.shieldCharge, 1),
+      ),
+    ),
+    armorDamageRatio: Math.max(
+      0,
+      Math.min(
+        1,
+        toFiniteNumber(condition.armorDamage, 0),
+      ),
+    ),
+    structureDamageRatio: Math.max(
+      0,
+      Math.min(
+        1,
+        toFiniteNumber(condition.damage, 0),
+      ),
+    ),
+  };
+}
+
+function getInventoryStackQuantity(item) {
+  return Math.max(
+    0,
+    toInt(item && (item.quantity ?? item.stacksize), 0),
+  );
+}
+
+function getInventoryStackVolumeM3(item) {
+  const typeRecord =
+    resolveItemByTypeID(toInt(item && item.typeID, 0)) || {};
+  return getInventoryStackQuantity(item) * Math.max(
+    0,
+    toFiniteNumber(
+      item && item.volume,
+      toFiniteNumber(typeRecord.volume, 0),
+    ),
+  );
+}
+
+function getManagedDefenseFlightPower(flight) {
+  if (!flight) {
+    return 0;
+  }
+  const droneTypeID = toInt(
+    flight.droneTypeID ?? flight.typeID,
+    0,
+  );
+  const launchCount = Math.max(
+    0,
+    toInt(
+      flight.launchCount ?? flight.quantity,
+      0,
+    ),
+  );
+  const bandwidthPerDrone = Math.max(
+    0,
+    toFiniteNumber(
+      getTypeAttributeValue(
+        droneTypeID,
+        "droneBandwidthUsed",
+        "droneBandwidthLoad",
+      ),
+      0,
+    ),
+  );
+  return (
+    launchCount *
+    Math.max(1, bandwidthPerDrone / 5)
+  );
+}
+
+function getManagedDroneRuntime() {
+  return require(path.join(__dirname, "../drone/droneRuntime"));
+}
+
+function getManagedFleetDefensiveDroneState(fleetRecord) {
+  if (
+    !fleetRecord.defensiveDroneFlightIDsByControllerID ||
+    typeof fleetRecord.defensiveDroneFlightIDsByControllerID !== "object"
+  ) {
+    fleetRecord.defensiveDroneFlightIDsByControllerID = {};
+  }
+  return fleetRecord.defensiveDroneFlightIDsByControllerID;
+}
+
+function getManagedFleetOwnerCharacterID(fleetRecord) {
+  return normalizePositiveInteger(
+    fleetRecord &&
+      (
+        fleetRecord.createdByCharacterID ||
+        fleetRecord.cargoOwnerID
+      ),
+    0,
+  );
+}
+
+function getManagedMiningFleet(fleetID, options = {}) {
+  const fleetRecord =
+    miningFleetStateByID.get(toInt(fleetID, 0)) || null;
+  if (
+    !fleetRecord ||
+    !managedMiningOwnerMatches(fleetRecord, options)
+  ) {
+    return null;
+  }
+  return pruneMiningFleet(fleetRecord);
+}
+
+function getManagedRetreatCooldownMs() {
+  return Math.max(
+    1_000,
+    toInt(
+      config
+        .miningNpcManagedDefenseRetreatCooldownMs,
+      DEFAULT_MANAGED_MINING_DEFENSE_RETREAT_COOLDOWN_MS,
+    ),
+  );
+}
+
+function getMiningCommandBurstModules(entity) {
+  return getNpcFittedModuleItems(entity)
+    .filter((moduleItem) => isModuleOnline(moduleItem))
+    .map((moduleItem) => ({
+      moduleItem,
+      effectRecord: getTypeEffectRecords(toInt(moduleItem && moduleItem.typeID, 0))
+        .find((effectRecord) => (
+          String(effectRecord && effectRecord.name || "") ===
+          "moduleBonusWarfareLinkMining"
+        )) || null,
+      chargeItem: getNpcLoadedChargeForModule(
+        entity,
+        moduleItem,
+      ),
+    }))
+    .filter((entry) => entry.effectRecord);
+}
+
+function getMiningJetcanCapacityM3() {
+  return Math.max(
+    1_000,
+    toFiniteNumber(
+      config.miningNpcJetcanCapacityM3,
+      DEFAULT_MINING_JETCAN_CAPACITY_M3,
+    ),
+  );
+}
+
+function getMiningJetcanContents(containerID) {
+  return listContainerItems(null, toInt(containerID, 0), null)
+    .filter((item) => getInventoryStackQuantity(item) > 0);
+}
+
+function getMiningJetcanRecord(fleetRecord, containerID) {
+  if (!fleetRecord || !fleetRecord.jetcanRecordsByID) {
+    return null;
+  }
+  return (
+    fleetRecord.jetcanRecordsByID[String(toInt(containerID, 0))] ||
+    null
+  );
+}
+
+function getMiningJetcanUsedVolumeM3(containerID) {
+  return getMiningJetcanContents(containerID).reduce(
+    (sum, item) => sum + getInventoryStackVolumeM3(item),
+    0,
+  );
+}
+
+function getNpcCargoCapacityM3ForTypeID(
+  typeID,
+  fallbackCapacityM3,
+  options = {},
+) {
+  const numericTypeID = toInt(typeID, 0);
+  const rawMiningHoldCapacityM3 = Math.max(
+    0,
+    toFiniteNumber(
+      getTypeAttributeValue(numericTypeID, "generalMiningHoldCapacity"),
+      0,
+    ),
+  );
+  const skillMap =
+    options.skillMap instanceof Map ? options.skillMap : new Map();
+  const resourceState = buildNpcCargoResourceState(numericTypeID, options);
+  if (rawMiningHoldCapacityM3 > 0) {
+    // A type-only query must return the literal SDE base. Governed NPCs with
+    // authored skills receive the dogma-adjusted mining hold instead.
+    if (skillMap.size <= 0) {
+      return rawMiningHoldCapacityM3;
+    }
+    const adjustedMiningHoldCapacityM3 = Math.max(
+      0,
+      toFiniteNumber(
+        resourceState && resourceState.generalMiningHoldCapacity,
+        0,
+      ),
+    );
+    return adjustedMiningHoldCapacityM3 > 0
+      ? adjustedMiningHoldCapacityM3
+      : rawMiningHoldCapacityM3;
+  }
+
+  const dogmaCapacityM3 = resolveNpcCargoCapacityFromResourceState(
+    resourceState,
+    0,
+  );
+  if (dogmaCapacityM3 > 0) {
+    return dogmaCapacityM3;
+  }
+
+  const itemType = resolveItemByTypeID(numericTypeID) || null;
+  const registryCapacityM3 = Math.max(
+    0,
+    toFiniteNumber(
+      getTypeAttributeValue(numericTypeID, "capacity"),
+      toFiniteNumber(itemType && itemType.capacity, 0),
+    ),
+  );
+  return registryCapacityM3 > 0
+    ? registryCapacityM3
+    : Math.max(0, toFiniteNumber(fallbackCapacityM3, 0));
+}
+
+function getNpcMiningCargoFullState(entity, fallbackCapacityM3 = 0) {
+  const usedVolumeM3 = Math.max(0, getNpcOreCargoVolume(entity));
+  const capacityM3 = Math.max(
+    0,
+    getNpcCargoCapacityM3(entity, fallbackCapacityM3),
+  );
+  const freeVolumeM3 = Math.max(0, capacityM3 - usedVolumeM3);
+  const smallestUnitVolumeM3 = getNpcSmallestOreUnitVolumeM3(entity);
+  const exactFull =
+    capacityM3 > 0 &&
+    usedVolumeM3 >= capacityM3 - MINING_CARGO_FULL_EPSILON_M3;
+  const operationallyFull =
+    exactFull ||
+    (
+      capacityM3 > 0 &&
+      usedVolumeM3 > 0 &&
+      smallestUnitVolumeM3 > 0 &&
+      freeVolumeM3 + MINING_CARGO_FULL_EPSILON_M3 < smallestUnitVolumeM3
+    );
+  return {
+    capacityM3,
+    usedVolumeM3,
+    freeVolumeM3,
+    smallestUnitVolumeM3,
+    exactFull,
+    operationallyFull,
+  };
+}
+
+function getNpcSmallestOreUnitVolumeM3(entity) {
+  let smallestUnitVolumeM3 = Number.POSITIVE_INFINITY;
+  for (const entry of getNpcOreCargoItems(entity)) {
+    const quantity = Math.max(
+      0,
+      toInt(entry && (entry.quantity ?? entry.stacksize), 0),
+    );
+    const volume = Math.max(0, toFiniteNumber(entry && entry.volume, 0));
+    if (quantity > 0 && volume > 0 && volume < smallestUnitVolumeM3) {
+      smallestUnitVolumeM3 = volume;
+    }
+  }
+  return Number.isFinite(smallestUnitVolumeM3)
+    ? smallestUnitVolumeM3
+    : 0;
+}
+
+function getSpaceRuntime() {
+  return require(path.join(__dirname, "../../space/runtime"));
+}
+
+function isFleetWarpInProgress(scene, fleetRecord) {
+  return getFleetEntities(scene, fleetRecord).some((entity) => (
+    entity.mode === "WARP" ||
+    Boolean(entity.pendingWarp) ||
+    Boolean(entity.warpState) ||
+    Boolean(entity.sessionlessWarpIngress)
+  ));
+}
+
+function isManagedDefenseTargetGone(targetEntity) {
+  if (
+    !targetEntity ||
+    targetEntity.pendingWarp ||
+    targetEntity.mode === "WARP"
+  ) {
+    return true;
+  }
+  const health =
+    getEntityCombatHealthSnapshot(targetEntity);
+  return (
+    health.structureDamageRatio >= 1 ||
+    Boolean(
+      targetEntity.conditionState &&
+      targetEntity.conditionState.incapacitated,
+    )
+  );
+}
+
+function isManagedIndustrialMiningFleet(fleetRecord) {
+  return Boolean(
+    fleetRecord &&
+    String(fleetRecord.operatorKind || "").trim() &&
+    String(fleetRecord.operatorID || "").trim(),
+  );
+}
+
+function isManagedRetreatThreatStillPresent(
+  scene,
+  fleetRecord,
+  now,
+) {
+  const scanRangeMeters = Math.max(
+    0,
+    toFiniteNumber(
+      config.miningNpcManagedDefenseScanRangeMeters,
+      DEFAULT_MANAGED_MINING_DEFENSE_SCAN_RANGE_METERS,
+    ),
+  );
+  const sitePosition =
+    fleetRecord.retreatSitePosition ||
+    (
+      scene.getEntityByID(
+        toInt(fleetRecord.activeAsteroidID, 0),
+      ) ||
+      scene.getEntityByID(
+        toInt(fleetRecord.targetShipID, 0),
+      ) ||
+      {}
+    ).position ||
+    null;
+  const interactionSource =
+    getFleetEntities(scene, fleetRecord)[0] ||
+    null;
+  const lastAggressor = scene.getEntityByID(
+    toInt(fleetRecord.lastAggressorID, 0),
+  );
+  if (
+    lastAggressor &&
+    (
+      !interactionSource ||
+      canEntitiesInteractLocally(
+        interactionSource,
+        lastAggressor,
+      )
+    ) &&
+    (
+      !sitePosition ||
+      !lastAggressor.position ||
+      distance(
+        sitePosition,
+        lastAggressor.position,
+      ) <= scanRangeMeters
+    )
+  ) {
+    return {
+      entity: lastAggressor,
+      reason: "LAST_AGGRESSOR_PRESENT",
+    };
+  }
+  const proactiveThreat =
+    scanManagedIndustrialFleetThreat(
+      scene,
+      fleetRecord,
+      now,
+    );
+  return proactiveThreat && proactiveThreat.entity
+    ? {
+        entity: proactiveThreat.entity,
+        reason: "HOSTILE_NPC_PRESENT",
+      }
+    : null;
+}
+
+function listCoLocatedManagedIndustrialFleets(
+  scene,
+  fleetRecord,
+) {
+  if (
+    !scene ||
+    !isManagedIndustrialMiningFleet(fleetRecord)
+  ) {
+    return [fleetRecord].filter(Boolean);
+  }
+  const ownerCharacterID =
+    getManagedFleetOwnerCharacterID(fleetRecord);
+  const systemID = normalizePositiveInteger(
+    fleetRecord.systemID || scene.systemID,
+    0,
+  );
+  const siteID = normalizePositiveInteger(
+    fleetRecord.targetShipID,
+    0,
+  );
+  if (!(ownerCharacterID > 0) || !(siteID > 0)) {
+    return [fleetRecord];
+  }
+  return [...miningFleetStateByID.values()]
+    .filter((candidate) => (
+      isManagedIndustrialMiningFleet(candidate) &&
+      getManagedFleetOwnerCharacterID(candidate) ===
+        ownerCharacterID &&
+      normalizePositiveInteger(candidate.systemID, 0) ===
+        systemID &&
+      normalizePositiveInteger(candidate.targetShipID, 0) ===
+        siteID &&
+      ["mining", "defending"].includes(
+        String(candidate.state || ""),
+      ) &&
+      getFleetEntities(scene, candidate).length > 0
+    ))
+    .sort(
+      (left, right) =>
+        toInt(left.fleetID, 0) -
+        toInt(right.fleetID, 0),
+    );
+}
+
+function maintainManagedFleetDroneDefense(
+  scene,
+  fleetRecord,
+  now,
+) {
+  const targetEntity = scene.getEntityByID(
+    toInt(fleetRecord.responseTargetID, 0),
+  );
+  if (isManagedDefenseTargetGone(targetEntity)) {
+    recallManagedFleetDefensiveDrones(
+      scene,
+      fleetRecord,
+      "threat_clear",
+    );
+    fleetRecord.responseTargetID = 0;
+    fleetRecord.state = "mining";
+    fleetRecord.resumeAtMs = 0;
+    return {
+      active: false,
+      cleared: true,
+    };
+  }
+  const retreatReason =
+    shouldManagedDefenseRetreat(scene, fleetRecord);
+  if (retreatReason) {
+    retreatFleetToOrigin(fleetRecord, {
+      state: "panic",
+      scene,
+      reason: retreatReason,
+    });
+    return {
+      active: false,
+      retreated: true,
+      reason: retreatReason,
+    };
+  }
+  let droneRuntime;
+  try {
+    droneRuntime = getManagedDroneRuntime();
+  } catch (_error) {
+    droneRuntime = null;
+  }
+  if (
+    !droneRuntime ||
+    typeof droneRuntime
+      .engageManagedTransientNpcDroneFlight !==
+      "function"
+  ) {
+    retreatFleetToOrigin(fleetRecord, {
+      state: "panic",
+      scene,
+      reason: "managed_drone_api_lost",
+    });
+    return {
+      active: false,
+      retreated: true,
+      reason: "MANAGED_DRONE_API_LOST",
+    };
+  }
+  const activeFlights =
+    getManagedFleetDefensiveDroneState(fleetRecord);
+  let engagedFlightCount = 0;
+  for (
+    const [entityID, flightID] of
+    Object.entries(activeFlights)
+  ) {
+    const controllerEntity = scene.getEntityByID(
+      toInt(entityID, 0),
+    );
+    if (!controllerEntity) {
+      continue;
+    }
+    const result =
+      droneRuntime
+        .engageManagedTransientNpcDroneFlight(
+          scene,
+          controllerEntity,
+          targetEntity,
+          { flightID },
+        );
+    if (result && result.success === true) {
+      engagedFlightCount += 1;
+    }
+  }
+  if (engagedFlightCount <= 0) {
+    retreatFleetToOrigin(fleetRecord, {
+      state: "panic",
+      scene,
+      reason: "defense_flight_missing",
+    });
+    return {
+      active: false,
+      retreated: true,
+      reason: "DEFENSE_FLIGHT_MISSING",
+    };
+  }
+  fleetRecord.nextThinkAtMs = Math.max(
+    toInt(fleetRecord.nextThinkAtMs, 0),
+    toInt(now, 0),
+  );
+  return {
+    active: true,
+    engagedFlightCount,
+  };
+}
+
+function maintainMiningSupportBursts(
+  scene,
+  fleetRecord,
+  hooks = null,
 ) {
   if (
     !scene ||
     !fleetRecord ||
-    fleetRecord.onGridSupport !== true ||
-    !haulerEntity ||
-    !npcService.getControllerByEntityID(toInt(haulerEntity.itemID, 0)) ||
-    fleetRecord.externalContainerCollector ||
-    String(fleetRecord.supportHaulerState || "idle") !== "idle"
+    fleetRecord.state !== "mining"
   ) {
-    return false;
+    return {
+      configuredCount: 0,
+      activeCount: 0,
+      activatedCount: 0,
+    };
   }
-  const cargoState = getNpcMiningCargoFullState(
-    haulerEntity,
-    DEFAULT_MINING_HAULER_CARGO_CAPACITY_M3,
-  );
-  if (
-    cargoState.usedVolumeM3 <= 0 ||
-    (options.force !== true && !cargoState.operationallyFull)
+  const commandBurstEntries =
+    getFleetEntities(scene, fleetRecord)
+      .flatMap((entity) =>
+        getMiningCommandBurstModules(entity)
+          .map((entry) => ({
+            ...entry,
+            entity,
+          })));
+  if (commandBurstEntries.length <= 0) {
+    return {
+      configuredCount: 0,
+      activeCount: 0,
+      activatedCount: 0,
+    };
+  }
+
+  for (
+    const minerEntityID of
+    fleetRecord.minerEntityIDs || []
   ) {
-    return false;
+    const minerEntity =
+      scene.getEntityByID(minerEntityID);
+    if (
+      minerEntity &&
+      minerEntity.npcMiningSupportBonus
+    ) {
+      delete minerEntity.npcMiningSupportBonus;
+    }
   }
-  if (!fleetRecord.originAnchor || !fleetRecord.originAnchor.position) {
-    return false;
-  }
-  const ingressDurationMs = Math.max(
-    250,
-    toFiniteNumber(
-      config.miningNpcWarpIngressDurationMs,
-      DEFAULT_MINING_WARP_INGRESS_DURATION_MS,
-    ),
-  );
-  const returnPosition =
-    buildFleetReferencePosition(scene, fleetRecord) ||
-    cloneVector(haulerEntity.position);
-  npcService.runtime.warpToPoint(
-    haulerEntity.itemID,
-    fleetRecord.originAnchor.position,
-    {
-      forceImmediateStart: true,
-      broadcastWarpStartToVisibleSessions: true,
-      visibilitySuppressMs: 250,
-      ingressDurationMs,
-    },
-  );
-  fleetRecord.supportHaulerState = "delivering";
-  fleetRecord.supportHaulerEntityID = toInt(
-    haulerEntity.itemID,
-    0,
-  );
-  fleetRecord.supportHaulerReturnPosition =
-    cloneVector(returnPosition);
-  fleetRecord.supportHaulerDeliveryCompleteAtMs =
-    toInt(now, Date.now()) +
-    ingressDurationMs +
-    Math.max(
-      500,
-      toFiniteNumber(
-        config.miningNpcHaulerUnloadDurationMs,
-        DEFAULT_MINING_HAULER_UNLOAD_DURATION_MS,
-      ),
+
+  let activeCount = 0;
+  let activatedCount = 0;
+  const errors = [];
+  for (const entry of commandBurstEntries) {
+    const moduleItemID = toInt(
+      entry.moduleItem && entry.moduleItem.itemID,
+      0,
     );
-  fleetRecord.haulerOperationallyFull = false;
-  return true;
+    const activeEffect =
+      entry.entity.activeModuleEffects instanceof Map
+        ? entry.entity.activeModuleEffects.get(
+            moduleItemID,
+          )
+        : null;
+    if (activeEffect) {
+      activeCount += 1;
+      continue;
+    }
+    if (
+      !entry.chargeItem ||
+      toInt(entry.chargeItem.typeID, 0) <= 0
+    ) {
+      errors.push({
+        entityID: toInt(entry.entity.itemID, 0),
+        moduleItemID,
+        errorMsg:
+          "MINING_COMMAND_BURST_CHARGE_REQUIRED",
+      });
+      continue;
+    }
+    const activationResult =
+      scene.activateGenericModule(
+        buildNpcPseudoSession(
+          entry.entity,
+          hooks,
+        ),
+        entry.moduleItem,
+        entry.effectRecord.name,
+        {},
+      );
+    if (
+      activationResult &&
+      activationResult.success === true
+    ) {
+      activeCount += 1;
+      activatedCount += 1;
+    } else {
+      errors.push({
+        entityID: toInt(entry.entity.itemID, 0),
+        moduleItemID,
+        errorMsg:
+          activationResult &&
+            activationResult.errorMsg ||
+          "MINING_COMMAND_BURST_ACTIVATION_FAILED",
+      });
+    }
+  }
+  fleetRecord.commandBurstConfiguredCount =
+    commandBurstEntries.length;
+  fleetRecord.commandBurstActiveCount =
+    activeCount;
+  fleetRecord.commandBurstLastErrors = errors;
+  return {
+    configuredCount: commandBurstEntries.length,
+    activeCount,
+    activatedCount,
+    errors,
+  };
 }
 
-function tickOnGridHaulerDelivery(scene, fleetRecord, now) {
-  const supportHaulerState = String(
-    fleetRecord.supportHaulerState || "idle",
+function managedMiningOwnerMatches(fleetRecord, options = {}) {
+  const owner = normalizeManagedMiningOwner(options);
+  return Boolean(
+    fleetRecord &&
+    owner.operatorKind &&
+    owner.operatorID &&
+    String(fleetRecord.operatorKind || "") ===
+      owner.operatorKind &&
+    String(fleetRecord.operatorID || "") === owner.operatorID,
   );
-  if (supportHaulerState === "idle") {
-    return false;
+}
+
+function normalizeManagedIndustrialCrewRoster(roster) {
+  if (!Array.isArray(roster) || roster.length <= 0) {
+    return {
+      success: false,
+      errorMsg: "MANAGED_INDUSTRIAL_CREW_ROSTER_REQUIRED",
+    };
   }
-  const haulerEntity = scene.getEntityByID(
-    toInt(fleetRecord.supportHaulerEntityID, 0),
-  );
-  if (!haulerEntity) {
-    fleetRecord.supportHaulerState = "idle";
-    fleetRecord.supportHaulerEntityID = 0;
-    return false;
+  if (roster.length > MAX_MINING_NPC_COMMAND_SPAWN_COUNT) {
+    return {
+      success: false,
+      errorMsg: "MANAGED_INDUSTRIAL_CREW_ROSTER_TOO_LARGE",
+      data: {
+        requestedCount: roster.length,
+        maximumCount: MAX_MINING_NPC_COMMAND_SPAWN_COUNT,
+      },
+    };
   }
-  const ingressDurationMs = Math.max(
-    250,
-    toFiniteNumber(
-      config.miningNpcWarpIngressDurationMs,
-      DEFAULT_MINING_WARP_INGRESS_DURATION_MS,
-    ),
-  );
-  if (
-    supportHaulerState === "delivering" &&
-    now >= toFiniteNumber(
-      fleetRecord.supportHaulerDeliveryCompleteAtMs,
+
+  const normalizedRoster = [];
+  const memberIDs = new Set();
+  for (let index = 0; index < roster.length; index += 1) {
+    const source =
+      roster[index] && typeof roster[index] === "object"
+        ? roster[index]
+        : {};
+    const role = String(
+      source.role || "",
+    ).trim().toLowerCase();
+    if (!MANAGED_INDUSTRIAL_CREW_ROLES.has(role)) {
+      return {
+        success: false,
+        errorMsg: "MANAGED_INDUSTRIAL_CREW_ROLE_INVALID",
+        data: {
+          index,
+          role: role || null,
+        },
+      };
+    }
+
+    const explicitProfileID = String(
+      source.profileID || "",
+    ).trim();
+    const profileQuery = String(
+      source.profileQuery || "",
+    ).trim();
+    let profile = explicitProfileID
+      ? getNpcProfile(explicitProfileID)
+      : null;
+    if (!profile && !explicitProfileID && profileQuery) {
+      const profileResolution =
+        resolveNpcProfile(profileQuery, "");
+      profile =
+        profileResolution &&
+        profileResolution.success === true &&
+        profileResolution.data
+          ? profileResolution.data
+          : null;
+    }
+    if (!profile || !String(profile.profileID || "").trim()) {
+      return {
+        success: false,
+        errorMsg:
+          explicitProfileID || profileQuery
+            ? "MANAGED_INDUSTRIAL_CREW_PROFILE_NOT_FOUND"
+            : "MANAGED_INDUSTRIAL_CREW_PROFILE_REQUIRED",
+        data: {
+          index,
+          requestedProfile:
+            explicitProfileID || profileQuery || null,
+        },
+      };
+    }
+
+    const profileID = String(profile.profileID).trim();
+    const shipTypeID = normalizePositiveInteger(
+      profile.shipTypeID,
       0,
+    );
+    if (shipTypeID <= 0) {
+      return {
+        success: false,
+        errorMsg:
+          "MANAGED_INDUSTRIAL_CREW_PROFILE_INCOMPLETE",
+        data: {
+          index,
+          profileID,
+        },
+      };
+    }
+    const declaredRole = String(
+      profile.miningRole || "",
+    ).trim().toLowerCase();
+    if (declaredRole && declaredRole !== role) {
+      return {
+        success: false,
+        errorMsg:
+          "MANAGED_INDUSTRIAL_CREW_PROFILE_ROLE_MISMATCH",
+        data: {
+          index,
+          profileID,
+          requestedRole: role,
+          profileRole: declaredRole,
+        },
+      };
+    }
+
+    const memberID =
+      String(source.memberID || "").trim() ||
+      `${role}:${index + 1}`;
+    if (memberIDs.has(memberID)) {
+      return {
+        success: false,
+        errorMsg:
+          "MANAGED_INDUSTRIAL_CREW_MEMBER_DUPLICATE",
+        data: {
+          index,
+          memberID,
+        },
+      };
+    }
+    memberIDs.add(memberID);
+    normalizedRoster.push({
+      ...source,
+      index,
+      memberID,
+      role,
+      profileID,
+      shipTypeID,
+      profile,
+      pilotIdentity:
+        source.pilotIdentity &&
+        typeof source.pilotIdentity === "object"
+          ? { ...source.pilotIdentity }
+          : null,
+      livingUniverseActorID:
+        String(
+          source.livingUniverseActorID || "",
+        ).trim() || null,
+    });
+  }
+
+  if (
+    !normalizedRoster.some(
+      (member) => member.role === "miner",
     )
   ) {
-    const deliveredVolumeM3 = clearNpcMiningCargo(haulerEntity);
-    fleetRecord.lastHauledVolumeM3 = deliveredVolumeM3;
-    fleetRecord.lastHauledAtMs = now;
-    fleetRecord.supportDeliveryCount =
-      Math.max(0, toInt(fleetRecord.supportDeliveryCount, 0)) + 1;
-    npcService.runtime.warpToPoint(
-      haulerEntity.itemID,
-      fleetRecord.supportHaulerReturnPosition ||
-        buildFleetReferencePosition(scene, fleetRecord),
-      {
-        forceImmediateStart: true,
-        broadcastWarpStartToVisibleSessions: true,
-        visibilitySuppressMs: 250,
-        ingressDurationMs,
-      },
-    );
-    fleetRecord.supportHaulerState = "returning";
-    fleetRecord.supportHaulerReturnAtMs =
-      now + ingressDurationMs;
-    return true;
+    return {
+      success: false,
+      errorMsg: "MANAGED_INDUSTRIAL_CREW_MINER_REQUIRED",
+    };
   }
+  return {
+    success: true,
+    data: {
+      roster: normalizedRoster,
+    },
+  };
+}
+
+function normalizeManagedMiningOwner(options = {}) {
+  return {
+    operatorKind:
+      String(options.operatorKind || "").trim(),
+    operatorID:
+      String(options.operatorID || "").trim(),
+  };
+}
+
+function normalizeManagedThreatDoctrine(source = {}) {
+  const doctrine =
+    source && typeof source === "object"
+      ? source
+      : {};
+  return {
+    requiredCrewOvermatch: Math.max(
+      1,
+      toFiniteNumber(
+        doctrine.requiredCrewOvermatch,
+        toFiniteNumber(
+          config.miningNpcManagedDefenseRequiredOvermatch,
+          DEFAULT_MANAGED_MINING_DEFENSE_REQUIRED_OVERMATCH,
+        ),
+      ),
+    ),
+    maximumThreatBountyISK: Math.max(
+      0,
+      toFiniteNumber(
+        doctrine.maximumThreatBountyISK,
+        toFiniteNumber(
+          config.miningNpcManagedDefenseMaxBountyISK,
+          DEFAULT_MANAGED_MINING_DEFENSE_MAX_BOUNTY_ISK,
+        ),
+      ),
+    ),
+    projectedCasualtyProbabilityCeiling: Math.max(
+      0,
+      toFiniteNumber(
+        doctrine.projectedCasualtyProbabilityCeiling,
+        0.01,
+      ),
+    ),
+  };
+}
+
+function normalizeVector(source = null, fallback = { x: 1, y: 0, z: 0 }) {
+  const vector = cloneVector(source, fallback);
+  const length = Math.sqrt(
+    (vector.x ** 2) + (vector.y ** 2) + (vector.z ** 2),
+  );
+  if (!Number.isFinite(length) || length <= 0) {
+    return cloneVector(fallback);
+  }
+  return {
+    x: vector.x / length,
+    y: vector.y / length,
+    z: vector.z / length,
+  };
+}
+
+function notifyManagedDroneStockChanged(
+  fleetRecord,
+  controllerEntity,
+  stock,
+  event = {},
+) {
   if (
-    supportHaulerState === "returning" &&
-    now >= toFiniteNumber(fleetRecord.supportHaulerReturnAtMs, 0)
+    !fleetRecord ||
+    typeof fleetRecord.onManagedDroneStockChanged !== "function" ||
+    !stock
   ) {
-    fleetRecord.supportHaulerState = "idle";
-    fleetRecord.supportHaulerEntityID = 0;
-    fleetRecord.supportHaulerDeliveryCompleteAtMs = 0;
-    fleetRecord.supportHaulerReturnAtMs = 0;
-    fleetRecord.supportHaulerReturnPosition = null;
-    return false;
+    return null;
   }
-  return true;
+  const payload = {
+    ...event,
+    stock,
+    atMs: Math.max(
+      0,
+      toInt(event.atMs, Date.now()),
+    ),
+    fleetID: toInt(fleetRecord.fleetID, 0),
+    operatorKind: fleetRecord.operatorKind,
+    operatorID: fleetRecord.operatorID,
+    controllerEntityID: toInt(
+      controllerEntity && controllerEntity.itemID,
+      0,
+    ),
+    controllerTypeID: toInt(
+      controllerEntity && controllerEntity.typeID,
+      0,
+    ),
+  };
+  try {
+    return fleetRecord.onManagedDroneStockChanged(payload);
+  } catch (error) {
+    log.error(
+      `[MiningFleet] managed drone stock callback failed ` +
+      `fleet=${fleetRecord.fleetID} ` +
+      `controller=${payload.controllerEntityID}: ` +
+      String(error && error.message || error),
+    );
+    return {
+      success: false,
+      errorMsg: "MANAGED_DRONE_STOCK_CALLBACK_FAILED",
+    };
+  }
 }
 
 function processOnGridMiningSupport(
@@ -4624,242 +6405,60 @@ function processOnGridMiningSupport(
   }
 }
 
-function applyMiningFleetCommandBurstAffinity(
+function recallManagedFleetDefensiveDrones(
+  scene,
   fleetRecord,
-  scene = null,
+  reason = "recall",
 ) {
-  if (!fleetRecord) {
+  if (!fleetRecord || !isManagedIndustrialMiningFleet(fleetRecord)) {
     return 0;
   }
-  let activeScene = scene;
-  if (!activeScene) {
-    const runtime = getSpaceRuntime();
-    activeScene =
-      runtime.scenes instanceof Map
-        ? runtime.scenes.get(
-            toInt(fleetRecord.systemID, 0),
-          ) || null
-        : null;
+  let droneRuntime;
+  try {
+    droneRuntime = getManagedDroneRuntime();
+  } catch (_error) {
+    return 0;
   }
-  const affinityGroupID =
-    MINING_FLEET_COMMAND_BURST_AFFINITY_BASE +
-    Math.max(1, toInt(fleetRecord.fleetID, 1));
-  fleetRecord.commandBurstAffinityGroupID =
-    affinityGroupID;
-  let assignedCount = 0;
-  for (const entityID of [
-    ...(Array.isArray(fleetRecord.minerEntityIDs)
-      ? fleetRecord.minerEntityIDs
-      : []),
-    ...(Array.isArray(fleetRecord.haulerEntityIDs)
-      ? fleetRecord.haulerEntityIDs
-      : []),
-  ]) {
-    const entity =
-      activeScene &&
-      typeof activeScene.getEntityByID === "function"
-        ? activeScene.getEntityByID(entityID)
-        : null;
-    if (!entity) {
-      continue;
+  const activeScene = resolveFleetScene(scene, fleetRecord);
+  const flightIDsByControllerID =
+    getManagedFleetDefensiveDroneState(fleetRecord);
+  let recalledCount = 0;
+  for (const entityID of getFleetEntityIDs(fleetRecord)) {
+    const controllerEntity =
+      activeScene && activeScene.getEntityByID(entityID);
+    const flightID = String(
+      flightIDsByControllerID[String(entityID)] || "",
+    ).trim();
+    if (
+      flightID &&
+      controllerEntity &&
+      typeof droneRuntime.recallManagedTransientNpcDroneFlight === "function"
+    ) {
+      const result = droneRuntime.recallManagedTransientNpcDroneFlight(
+        activeScene,
+        controllerEntity,
+        { flightID, reason },
+      );
+      if (result && result.success === true) {
+        recalledCount += 1;
+      }
     }
-    entity.commandBurstAffinityGroupID =
-      affinityGroupID;
-    entity.remoteRepairBurstAffinityGroupID =
-      affinityGroupID;
-    assignedCount += 1;
+    if (
+      activeScene &&
+      typeof droneRuntime.cleanupManagedTransientNpcDroneFlightsForController ===
+        "function"
+    ) {
+      droneRuntime.cleanupManagedTransientNpcDroneFlightsForController(
+        activeScene,
+        controllerEntity || entityID,
+        { reason },
+      );
+    }
   }
-  return assignedCount;
-}
-
-function createMiningFleetRecord(options = {}) {
-  const minerEntityIDs = (Array.isArray(options.minerEntityIDs) ? options.minerEntityIDs : [])
-    .map((value) => normalizePositiveInteger(value, null))
-    .filter(Boolean);
-  const miningWorkerEntityIDs = (
-    Array.isArray(options.miningWorkerEntityIDs)
-      ? options.miningWorkerEntityIDs
-      : minerEntityIDs
-  )
-    .map((value) => normalizePositiveInteger(value, null))
-    .filter(
-      (entityID) =>
-        entityID && minerEntityIDs.includes(entityID),
-    );
-  const miningSupportEntityIDs = (
-    Array.isArray(options.miningSupportEntityIDs)
-      ? options.miningSupportEntityIDs
-      : []
-  )
-    .map((value) => normalizePositiveInteger(value, null))
-    .filter(
-      (entityID) =>
-        entityID && minerEntityIDs.includes(entityID),
-    );
-  const haulerEntityIDs = (Array.isArray(options.haulerEntityIDs) ? options.haulerEntityIDs : [])
-    .map((value) => normalizePositiveInteger(value, null))
-    .filter(Boolean);
-  const responseEntityIDs = (Array.isArray(options.responseEntityIDs) ? options.responseEntityIDs : [])
-    .map((value) => normalizePositiveInteger(value, null))
-    .filter(Boolean);
-  const createdAtMs = Math.max(0, toInt(options.createdAtMs, Date.now()));
-  const fleetRecord = {
-    fleetID: nextMiningFleetID++,
-    source: String(options.source || "gm"),
-    operatorKind:
-      String(options.operatorKind || "").trim() || null,
-    operatorID:
-      String(options.operatorID || "").trim() || null,
-    threatDoctrine: normalizeManagedThreatDoctrine(
-      options.threatDoctrine,
-    ),
-    physicalShipLimit: Math.max(
-      0,
-      toInt(options.physicalShipLimit, 0),
-    ),
-    cargoOwnerID: normalizePositiveInteger(options.cargoOwnerID, 0),
-    cargoCorporationID: normalizePositiveInteger(
-      options.cargoCorporationID,
-      0,
-    ),
-    cargoTransient: options.cargoTransient !== false,
-    jetcanNamePrefix: String(options.jetcanNamePrefix || "").trim() || null,
-    externalContainerCollector:
-      typeof options.externalContainerCollector === "function"
-        ? options.externalContainerCollector
-        : null,
-    externalManifestID:
-      String(options.externalManifestID || "").trim() || null,
-    externalCollectionError: null,
-    nextExternalCollectionAttemptAtMs: 0,
-    onManagedFleetDestroyed:
-      typeof options.onManagedFleetDestroyed === "function"
-        ? options.onManagedFleetDestroyed
-        : null,
-    onManagedDroneStockChanged:
-      typeof options.onManagedDroneStockChanged === "function"
-        ? options.onManagedDroneStockChanged
-        : null,
-    managedResourcesReleased: false,
-    startupKey: String(options.startupKey || "").trim() || null,
-    createdByCharacterID: normalizePositiveInteger(options.createdByCharacterID, 0),
-    systemID: normalizePositiveInteger(options.systemID, 0),
-    targetShipID: normalizePositiveInteger(options.targetShipID, 0),
-    minerEntityIDs,
-    // Support hulls remain in minerEntityIDs so all legacy fleet lifecycle
-    // code still sees them. These subsets preserve each managed crew role.
-    miningWorkerEntityIDs,
-    miningSupportEntityIDs,
-    supportEntityIDs: miningSupportEntityIDs,
-    haulerEntityIDs,
-    responseEntityIDs,
-    managedRoster: (
-      Array.isArray(options.managedRoster)
-        ? options.managedRoster
-        : []
-    )
-      .map((entry) => ({
-        memberID:
-          String(entry && entry.memberID || "").trim() ||
-          null,
-        index: Math.max(
-          0,
-          toInt(entry && entry.index, 0),
-        ),
-        entityID: normalizePositiveInteger(
-          entry && entry.entityID,
-          0,
-        ),
-        role:
-          String(entry && entry.role || "").trim() ||
-          null,
-        profileID:
-          String(entry && entry.profileID || "").trim() ||
-          null,
-        pilotIdentity:
-          entry &&
-          entry.pilotIdentity &&
-          typeof entry.pilotIdentity === "object"
-            ? { ...entry.pilotIdentity }
-            : null,
-        livingUniverseActorID:
-          String(
-            entry && entry.livingUniverseActorID || "",
-          ).trim() || null,
-      }))
-      .filter((entry) => entry.entityID > 0),
-    spawnSelectionName: options.spawnSelectionName ? String(options.spawnSelectionName) : null,
-    haulerSelectionName: options.haulerSelectionName ? String(options.haulerSelectionName) : null,
-    responseSelectionName: options.responseSelectionName ? String(options.responseSelectionName) : null,
-    originAnchor: options.originAnchor || null,
-    activeAsteroidID: normalizePositiveInteger(options.activeAsteroidID, 0),
-    assignedAsteroidIDsByMinerID:
-      options.assignedAsteroidIDsByMinerID &&
-      typeof options.assignedAsteroidIDsByMinerID === "object"
-        ? { ...options.assignedAsteroidIDsByMinerID }
-        : {},
-    state: String(options.state || "mining"),
-    createdAtMs,
-    nextThinkAtMs: 0,
-    haulCompleteAtMs: 0,
-    haulerReturnAtMs: 0,
-    haulerNextArrivalAtMs: Math.max(
-      0,
-      toInt(
-        options.haulerNextArrivalAtMs,
-        haulerEntityIDs.length > 0
-          ? createdAtMs + getHaulerInitialDelayMs()
-          : 0,
-      ),
-    ),
-    resumeAtMs: 0,
-    retreatSitePosition: null,
-    retreatWarpPendingEntityIDs: [],
-    nextRetreatWarpRetryAtMs: 0,
-    lastRetreatWarpErrors: [],
-    managedSiteReturnAtMs: 0,
-    responseDespawnAtMs: 0,
-    responseRetreating: options.responseRetreating === true,
-    lastHauledVolumeM3: 0,
-    lastHauledAtMs: 0,
-    lastAggressorID: normalizePositiveInteger(options.lastAggressorID, 0),
-    lastAggressedAtMs: Math.max(0, toInt(options.lastAggressedAtMs, 0)),
-    lastProcessedAggressionAtMs: Math.max(0, toInt(options.lastProcessedAggressionAtMs, 0)),
-    lastResponseAtMs: Math.max(0, toInt(options.lastResponseAtMs, 0)),
-    responseTargetID: normalizePositiveInteger(options.responseTargetID, 0),
-    responseStandingClass: String(options.responseStandingClass || "").trim() || null,
-    responseStandingValue: toFiniteNumber(options.responseStandingValue, 0),
-    onGridSupport: options.onGridSupport === true,
-    jetcanRecordsByID: {},
-    activeJetcanIDByMinerID: {},
-    activeTractorCanID: 0,
-    activeTractorHaulerID: 0,
-    activeTractorModuleID: 0,
-    supportHaulerState: "idle",
-    supportHaulerEntityID: 0,
-    supportHaulerDeliveryCompleteAtMs: 0,
-    supportHaulerReturnAtMs: 0,
-    supportHaulerReturnPosition: null,
-    supportDeliveryCount: 0,
-    haulerOperationallyFull: false,
-    defensiveDroneFlightIDsByControllerID: {},
-    defenseDroneLossDetected: false,
-    defenseDecision: null,
-    managedThreatScanCount: 0,
-    lastManagedThreatScanAtMs: -1,
-    lastManagedThreatScanCandidateCount: 0,
-    lastManagedThreatScanResult: null,
-    jetcansCreated: 0,
-    jetcansCollected: 0,
-    jetcanVolumeTransferredM3: 0,
-  };
-  fleetRecord.memberBindings = fleetRecord.managedRoster;
-  applyMiningFleetCommandBurstAffinity(
-    fleetRecord,
-    options.scene || null,
-  );
-  miningFleetStateByID.set(fleetRecord.fleetID, fleetRecord);
-  return fleetRecord;
+  fleetRecord.defensiveDroneFlightIDsByControllerID = {};
+  fleetRecord.defenseDroneLossDetected = false;
+  fleetRecord.defenseDecision = null;
+  return recalledCount;
 }
 
 function registerAmbientMiningFleet(options = {}) {
@@ -4921,17 +6520,6 @@ function registerAmbientMiningFleet(options = {}) {
   };
 }
 
-function getMiningFleetsForSystem(systemID) {
-  const normalizedSystemID = normalizePositiveInteger(systemID, 0);
-  const fleets = [];
-  for (const fleetRecord of miningFleetStateByID.values()) {
-    if (normalizePositiveInteger(fleetRecord && fleetRecord.systemID, 0) === normalizedSystemID) {
-      fleets.push(fleetRecord);
-    }
-  }
-  return fleets;
-}
-
 function releaseManagedFleetResources(fleetRecord, reason) {
   if (
     !fleetRecord ||
@@ -4961,267 +6549,893 @@ function releaseManagedFleetResources(fleetRecord, reason) {
   return true;
 }
 
-function cleanupMiningFleetRuntimeResources(
+function removeMiningJetcan(
   scene,
   fleetRecord,
+  containerID,
   options = {},
 ) {
-  if (!fleetRecord) {
-    return {
-      burstCount: 0,
-      droneFlightCount: 0,
-      supportRemovedCount: 0,
-    };
+  const normalizedContainerID = toInt(containerID, 0);
+  detachMiningJetcanRecord(
+    fleetRecord,
+    normalizedContainerID,
+  );
+  removeInventoryItem(normalizedContainerID, {
+    removeContents: options.removeContents !== false,
+  });
+  const systemID = toInt(
+    scene && scene.systemID,
+    toInt(fleetRecord && fleetRecord.systemID, 0),
+  );
+  if (systemID > 0) {
+    getSpaceRuntime().removeDynamicEntity(
+      systemID,
+      normalizedContainerID,
+      {
+        terminalDestructionEffectID:
+          MINING_JETCAN_DESTRUCTION_EFFECT_ID,
+        persistSpaceState: false,
+      },
+    );
   }
-  const reason = String(options.reason || "fleet_cleanup");
-  const activeScene = resolveFleetScene(scene, fleetRecord);
-  const burstCount = deactivateMiningSupportBursts(
-    activeScene,
-    fleetRecord,
-    options.hooks || null,
-    reason,
+}
+
+function removeNpcMiningCargoQuantity(entity, cargoItem, quantity) {
+  const requestedQuantity = Math.max(0, toInt(quantity, 0));
+  const currentQuantity = Math.max(
+    0,
+    toInt(cargoItem && cargoItem.quantity, 0),
   );
-  const droneFlightCount = recallManagedFleetDefensiveDrones(
-    activeScene,
-    fleetRecord,
-    reason,
+  if (
+    !entity ||
+    !cargoItem ||
+    requestedQuantity <= 0 ||
+    currentQuantity <= 0
+  ) {
+    return 0;
+  }
+  const removedQuantity = Math.min(currentQuantity, requestedQuantity);
+  const remainingQuantity = currentQuantity - removedQuantity;
+  if (remainingQuantity > 0) {
+    cargoItem.quantity = remainingQuantity;
+    cargoItem.stacksize = remainingQuantity;
+    ensureNpcCargoStoreEntry(entity, cargoItem);
+    return removedQuantity;
+  }
+  entity.nativeCargoItems = (
+    Array.isArray(entity.nativeCargoItems) ? entity.nativeCargoItems : []
+  ).filter(
+    (entry) =>
+      toInt(entry && entry.itemID, 0) !== toInt(cargoItem.itemID, 0),
   );
-  const supportResult = cleanupMiningFleetSupport(
-    activeScene,
-    fleetRecord.fleetID,
-    {
-      hooks: options.hooks || null,
-      unregister: false,
-      reason,
-    },
+  if (toInt(cargoItem.itemID, 0) > 0) {
+    nativeNpcStore.removeNativeCargo(cargoItem.itemID);
+  }
+  return removedQuantity;
+}
+
+function resolveActiveMiningJetcan(
+  scene,
+  fleetRecord,
+  minerEntity,
+  now,
+) {
+  const minerEntityID = toInt(minerEntity && minerEntity.itemID, 0);
+  const activeContainerID = toInt(
+    fleetRecord &&
+      fleetRecord.activeJetcanIDByMinerID &&
+      fleetRecord.activeJetcanIDByMinerID[String(minerEntityID)],
+    0,
   );
+  if (activeContainerID > 0) {
+    const record = getMiningJetcanRecord(
+      fleetRecord,
+      activeContainerID,
+    );
+    const entity = scene.getEntityByID(activeContainerID);
+    if (
+      record &&
+      entity &&
+      canEntitiesInteractLocally(minerEntity, entity) &&
+      record.sealedAtMs <= 0 &&
+      record.tractorStartedAtMs <= 0 &&
+      record.collectedAtMs <= 0
+    ) {
+      return record;
+    }
+    delete fleetRecord.activeJetcanIDByMinerID[
+      String(minerEntityID)
+    ];
+  }
+  return createMiningJetcan(scene, fleetRecord, minerEntity, now);
+}
+
+function resolveFleetScene(scene, fleetRecord) {
+  if (scene) return scene;
+  const runtime = getSpaceRuntime();
+  if (!runtime || typeof runtime.getSceneByDescriptor !== "function" || !fleetRecord) {
+    return null;
+  }
+  const descriptor = fleetRecord.sceneDescriptor || {
+    sceneKey: fleetRecord.sceneKey,
+    sceneKind: fleetRecord.sceneKind,
+    instanceID: toInt(fleetRecord.instanceID, 0),
+    solarSystemID: toInt(fleetRecord.systemID, 0),
+    locationID: toInt(fleetRecord.systemID, 0),
+  };
+  return runtime.getSceneByDescriptor(descriptor) || null;
+}
+
+function resolveManagedEntityDroneDoctrine(entity) {
+  const controller = entity
+    ? npcService.getControllerByEntityID(
+        toInt(entity.itemID, 0),
+      )
+    : null;
+  const definition =
+    controller &&
+    controller.definitionSnapshot &&
+    typeof controller.definitionSnapshot === "object"
+      ? controller.definitionSnapshot
+      : null;
+  const loadout =
+    definition &&
+    definition.loadout &&
+    typeof definition.loadout === "object"
+      ? definition.loadout
+      : {};
+  const governance =
+    entity &&
+    entity.doctrineGovernance &&
+    typeof entity.doctrineGovernance === "object"
+      ? entity.doctrineGovernance
+      : {};
+  const bayEntries = [
+    entity && entity.governedDroneBay,
+    entity && entity.droneBay,
+    entity && entity.npcDroneBay,
+    governance.droneBay,
+    loadout.droneBay,
+  ].find(
+    (entries) =>
+      Array.isArray(entries) && entries.length > 0,
+  ) || [];
+  const defenseFlights = [
+    entity && entity.defensiveDroneFlights,
+    entity && entity.defenseFlights,
+    governance.defenseFlights,
+    loadout.defenseFlights,
+  ].find(
+    (entries) =>
+      Array.isArray(entries) && entries.length > 0,
+  ) || [];
   return {
-    burstCount,
-    droneFlightCount,
-    supportRemovedCount: Math.max(
-      0,
-      toInt(
-        supportResult &&
-          supportResult.data &&
-          supportResult.data.removedCount,
-        0,
-      ),
-    ),
+    bayEntries,
+    defenseFlights,
   };
 }
 
-function pruneMiningFleet(fleetRecord) {
-  if (!fleetRecord) {
-    return null;
-  }
-  fleetRecord.minerEntityIDs = (Array.isArray(fleetRecord.minerEntityIDs) ? fleetRecord.minerEntityIDs : [])
-    .filter((entityID) => npcService.getControllerByEntityID(entityID));
-  fleetRecord.miningWorkerEntityIDs = (
-    Array.isArray(fleetRecord.miningWorkerEntityIDs)
-      ? fleetRecord.miningWorkerEntityIDs
-      : fleetRecord.minerEntityIDs
-  ).filter(
-    (entityID) =>
-      fleetRecord.minerEntityIDs.includes(entityID),
+function resolveManagedIndustrialCrewMemberAffiliation(member) {
+  const identity =
+    member &&
+    member.pilotIdentity &&
+    typeof member.pilotIdentity === "object"
+      ? member.pilotIdentity
+      : null;
+  const pilotCharacterID = normalizePositiveInteger(
+    identity && identity.characterID,
+    0,
   );
-  fleetRecord.miningSupportEntityIDs = (
-    Array.isArray(fleetRecord.miningSupportEntityIDs)
-      ? fleetRecord.miningSupportEntityIDs
-      : []
-  ).filter(
-    (entityID) =>
-      fleetRecord.minerEntityIDs.includes(entityID),
+  const corporationID = normalizePositiveInteger(
+    identity && identity.corporationID,
+    0,
   );
-  fleetRecord.supportEntityIDs =
-    fleetRecord.miningSupportEntityIDs;
-  fleetRecord.haulerEntityIDs = (Array.isArray(fleetRecord.haulerEntityIDs) ? fleetRecord.haulerEntityIDs : [])
-    .filter((entityID) => npcService.getControllerByEntityID(entityID));
-  fleetRecord.responseEntityIDs = (Array.isArray(fleetRecord.responseEntityIDs) ? fleetRecord.responseEntityIDs : [])
-    .filter((entityID) => npcService.getControllerByEntityID(entityID));
-  if (fleetRecord.haulerEntityIDs.length <= 0) {
-    fleetRecord.haulerNextArrivalAtMs = 0;
+  if (pilotCharacterID <= 0 || corporationID <= 0) {
+    return {
+      success: false,
+      errorMsg:
+        pilotCharacterID <= 0
+          ? "MANAGED_INDUSTRIAL_CREW_PILOT_IDENTITY_REQUIRED"
+          : "MANAGED_INDUSTRIAL_CREW_CORPORATION_IDENTITY_REQUIRED",
+    };
   }
-  if (fleetRecord.responseEntityIDs.length <= 0) {
-    fleetRecord.responseTargetID = 0;
-    fleetRecord.responseDespawnAtMs = 0;
-    fleetRecord.responseRetreating = false;
-  }
-  const assignmentMap = getFleetMinerAssignmentMap(fleetRecord);
-  for (const minerEntityID of Object.keys(assignmentMap)) {
-    if (!fleetRecord.minerEntityIDs.includes(toInt(minerEntityID, 0))) {
-      delete assignmentMap[minerEntityID];
-    }
-  }
-  if (Array.isArray(fleetRecord.managedRoster)) {
-    const activeEntityIDs = new Set([
-      ...fleetRecord.minerEntityIDs,
-      ...fleetRecord.haulerEntityIDs,
-      ...fleetRecord.responseEntityIDs,
-    ]);
-    fleetRecord.managedRoster = fleetRecord.managedRoster
-      .filter(
-        (entry) =>
-          activeEntityIDs.has(
-            toInt(entry && entry.entityID, 0),
-          ),
-      );
-    fleetRecord.memberBindings = fleetRecord.managedRoster;
-  }
-  if (
-    fleetRecord.minerEntityIDs.length === 0 &&
-    fleetRecord.haulerEntityIDs.length === 0 &&
-    fleetRecord.responseEntityIDs.length === 0
-  ) {
-    cleanupMiningFleetRuntimeResources(null, fleetRecord, {
-      reason: "entities_missing",
-    });
-    releaseManagedFleetResources(
-      fleetRecord,
-      "entities_missing",
-    );
-    miningFleetStateByID.delete(fleetRecord.fleetID);
-    return null;
-  }
-  return fleetRecord;
+  return {
+    success: true,
+    data: {
+      pilotCharacterID,
+      corporationID,
+      allianceID: Math.max(
+        0,
+        toInt(identity.allianceID, 0),
+      ),
+      warFactionID: Math.max(
+        0,
+        toInt(
+          identity.warFactionID ??
+            identity.militiaFactionID,
+          0,
+        ),
+      ),
+    },
+  };
 }
 
-function destroyFleetEntities(fleetRecord, options = {}) {
-  cleanupMiningFleetRuntimeResources(
-    options.scene || null,
-    fleetRecord,
-    {
-      hooks: options.hooks || null,
-      reason: options.reason || "fleet_destroy",
-    },
+function resolveManagedThreatSizeClass(entity) {
+  const itemType =
+    resolveItemByTypeID(
+      toInt(entity && entity.typeID, 0),
+    ) || {};
+  const groupName = String(
+    itemType.groupName ||
+    itemType.group ||
+    entity && entity.groupName ||
+    "",
+  ).toLowerCase();
+  for (const sizeClass of [
+    "frigate",
+    "destroyer",
+    "cruiser",
+    "battlecruiser",
+    "battleship",
+    "capital",
+  ]) {
+    if (groupName.includes(sizeClass)) {
+      return sizeClass;
+    }
+  }
+  const radius = Math.max(
+    0,
+    toFiniteNumber(
+      entity && entity.radius,
+      toFiniteNumber(itemType.radius, 0),
+    ),
   );
-  const entityIDs = [...new Set([
-    ...(Array.isArray(fleetRecord && fleetRecord.minerEntityIDs) ? fleetRecord.minerEntityIDs : []),
-    ...(Array.isArray(fleetRecord && fleetRecord.haulerEntityIDs) ? fleetRecord.haulerEntityIDs : []),
-    ...(Array.isArray(fleetRecord && fleetRecord.responseEntityIDs) ? fleetRecord.responseEntityIDs : []),
-  ])];
+  if (radius > 0 && radius <= 60) return "frigate";
+  if (radius > 0 && radius <= 100) return "destroyer";
+  if (radius > 0 && radius <= 250) return "cruiser";
+  if (radius > 0 && radius <= 400) {
+    return "battlecruiser";
+  }
+  if (radius > 0 && radius <= 800) return "battleship";
+  return "unknown";
+}
+
+function resolveNpcCargoCapacityFromResourceState(
+  resourceState,
+  fallbackCapacityM3 = 0,
+) {
+  const miningHoldCapacityM3 = Math.max(
+    0,
+    toFiniteNumber(resourceState && resourceState.generalMiningHoldCapacity, 0),
+  );
+  if (miningHoldCapacityM3 > 0) {
+    return miningHoldCapacityM3;
+  }
+
+  const cargoCapacityM3 = Math.max(
+    0,
+    toFiniteNumber(resourceState && resourceState.cargoCapacity, 0),
+  );
+  const fleetHangarCapacityM3 = Math.max(
+    0,
+    toFiniteNumber(
+      resourceState &&
+        resourceState.attributes &&
+        resourceState.attributes[FLEET_HANGAR_CAPACITY_ATTRIBUTE_ID],
+      0,
+    ),
+  );
+  if (fleetHangarCapacityM3 > 0) {
+    return fleetHangarCapacityM3 + cargoCapacityM3;
+  }
+  if (cargoCapacityM3 > 0) {
+    return cargoCapacityM3;
+  }
+  return Math.max(0, toFiniteNumber(fallbackCapacityM3, 0));
+}
+
+function resolveTractorModule(entity) {
+  return getNpcFittedModuleItems(entity)
+    .filter((moduleItem) => isModuleOnline(moduleItem))
+    .map((moduleItem) => ({
+      moduleItem,
+      effectRecord: getTypeEffectRecords(
+        toInt(moduleItem && moduleItem.typeID, 0),
+      ).find(
+        (effectRecord) =>
+          String(effectRecord && effectRecord.name || "") ===
+          MINING_TRACTOR_EFFECT_NAME,
+      ) || null,
+    }))
+    .find((entry) => entry.effectRecord) || null;
+}
+
+function retryPendingFleetRetreat(
+  scene,
+  fleetRecord,
+  now = Date.now(),
+) {
+  const pendingEntityIDs = [
+    ...new Set(
+      (
+        Array.isArray(
+          fleetRecord &&
+            fleetRecord.retreatWarpPendingEntityIDs,
+        )
+          ? fleetRecord.retreatWarpPendingEntityIDs
+          : []
+      )
+        .map((entityID) =>
+          normalizePositiveInteger(entityID, 0))
+        .filter((entityID) => entityID > 0),
+    ),
+  ];
+  if (
+    !fleetRecord ||
+    pendingEntityIDs.length <= 0 ||
+    !fleetRecord.originAnchor ||
+    !fleetRecord.originAnchor.position
+  ) {
+    return {
+      attemptedCount: 0,
+      startedCount: 0,
+      pendingCount: pendingEntityIDs.length,
+    };
+  }
+  const retryAtMs = Math.max(
+    0,
+    toInt(fleetRecord.nextRetreatWarpRetryAtMs, 0),
+  );
+  if (retryAtMs > now) {
+    return {
+      attemptedCount: 0,
+      startedCount: 0,
+      pendingCount: pendingEntityIDs.length,
+    };
+  }
+
+  const ingressDurationMs = Math.max(
+    250,
+    toFiniteNumber(
+      config.miningNpcWarpIngressDurationMs,
+      DEFAULT_MINING_WARP_INGRESS_DURATION_MS,
+    ),
+  );
+  const remainingEntityIDs = [];
+  const errors = [];
+  let attemptedCount = 0;
+  let startedCount = 0;
+  for (const entityID of pendingEntityIDs) {
+    if (!npcService.getControllerByEntityID(entityID)) {
+      continue;
+    }
+    const entity =
+      scene &&
+      typeof scene.getEntityByID === "function"
+        ? scene.getEntityByID(entityID)
+        : null;
+    if (
+      entity &&
+      (
+        entity.mode === "WARP" ||
+        entity.pendingWarp ||
+        entity.warpState ||
+        entity.sessionlessWarpIngress
+      )
+    ) {
+      remainingEntityIDs.push(entityID);
+      continue;
+    }
+    attemptedCount += 1;
+    const warpResult = npcService.runtime.warpToPoint(
+      entityID,
+      fleetRecord.originAnchor.position,
+      {
+        forceImmediateStart: true,
+        broadcastWarpStartToVisibleSessions: true,
+        visibilitySuppressMs: 250,
+        ingressDurationMs,
+      },
+    );
+    if (warpResult && warpResult.success === true) {
+      startedCount += 1;
+    } else {
+      remainingEntityIDs.push(entityID);
+      errors.push({
+        entityID,
+        errorMsg:
+          warpResult &&
+            warpResult.errorMsg ||
+          "NPC_WARP_FAILED",
+      });
+    }
+  }
+  fleetRecord.retreatWarpPendingEntityIDs =
+    remainingEntityIDs;
+  fleetRecord.nextRetreatWarpRetryAtMs =
+    remainingEntityIDs.length > 0
+      ? Math.max(0, toInt(now, Date.now())) + 1_000
+      : 0;
+  fleetRecord.lastRetreatWarpErrors = errors;
+  return {
+    attemptedCount,
+    startedCount,
+    pendingCount: remainingEntityIDs.length,
+  };
+}
+
+function rollbackManagedIndustrialCrewSpawn(
+  entityIDs,
+  fleetRecord = null,
+) {
+  if (fleetRecord && toInt(fleetRecord.fleetID, 0) > 0) {
+    miningFleetStateByID.delete(
+      toInt(fleetRecord.fleetID, 0),
+    );
+  }
+  return rollbackManagedMiningSpawn(entityIDs);
+}
+
+function rollbackManagedMiningSpawn(entityIDs) {
   let destroyedCount = 0;
-  for (const entityID of entityIDs) {
-    const destroyResult = npcService.destroyNpcControllerByEntityID(entityID, {
-      removeContents: true,
-    });
-    if (destroyResult && destroyResult.success) {
-      destroyedCount += 1;
+  const normalizedEntityIDs = [...new Set(
+    (Array.isArray(entityIDs) ? entityIDs : [])
+      .map(
+        (entityID) =>
+          normalizePositiveInteger(entityID, 0),
+      )
+      .filter((entityID) => entityID > 0),
+  )];
+  for (const entityID of normalizedEntityIDs.reverse()) {
+    try {
+      const result =
+        npcService.destroyNpcControllerByEntityID(entityID, {
+          removeContents: true,
+        });
+      if (result && result.success === true) {
+        destroyedCount += 1;
+      }
+    } catch (_error) {
+      // Continue rolling back the remaining hulls.
     }
   }
   return destroyedCount;
 }
 
-function normalizeManagedMiningOwner(options = {}) {
-  return {
-    operatorKind:
-      String(options.operatorKind || "").trim(),
-    operatorID:
-      String(options.operatorID || "").trim(),
-  };
-}
-
-function managedMiningOwnerMatches(fleetRecord, options = {}) {
-  const owner = normalizeManagedMiningOwner(options);
-  return Boolean(
-    fleetRecord &&
-    owner.operatorKind &&
-    owner.operatorID &&
-    String(fleetRecord.operatorKind || "") ===
-      owner.operatorKind &&
-    String(fleetRecord.operatorID || "") === owner.operatorID,
-  );
-}
-
-function getManagedMiningFleet(fleetID, options = {}) {
-  const fleetRecord =
-    miningFleetStateByID.get(toInt(fleetID, 0)) || null;
+function routeMinerCargoToJetcans(
+  scene,
+  fleetRecord,
+  minerEntity,
+  now,
+  options = {},
+) {
   if (
+    !scene ||
     !fleetRecord ||
-    !managedMiningOwnerMatches(fleetRecord, options)
+    !minerEntity ||
+    !npcService.getControllerByEntityID(toInt(minerEntity.itemID, 0))
   ) {
-    return null;
+    return 0;
   }
-  return pruneMiningFleet(fleetRecord);
-}
+  if (
+    options.force !== true &&
+    config.miningNpcJetcansRequireFullHold !== false &&
+    !getNpcMiningCargoFullState(
+      minerEntity,
+      toFiniteNumber(
+        config.miningNpcMinerCargoCapacityM3,
+        DEFAULT_MINING_MINER_CARGO_CAPACITY_M3,
+      ),
+    ).operationallyFull
+  ) {
+    return 0;
+  }
 
-function destroyManagedMiningFleet(fleetID, options = {}) {
-  const normalizedFleetID = toInt(fleetID, 0);
-  const fleetRecord =
-    miningFleetStateByID.get(normalizedFleetID) || null;
-  if (!fleetRecord) {
-    return {
-      success: true,
-      data: {
-        fleetID: normalizedFleetID,
-        destroyedCount: 0,
-      },
-    };
-  }
-  if (!managedMiningOwnerMatches(fleetRecord, options)) {
-    return {
-      success: false,
-      errorMsg: "MANAGED_MINING_OWNER_MISMATCH",
-    };
-  }
-  const reason = String(
-    options.reason || "managed_destroy",
-  );
-  const destroyedCount = destroyFleetEntities(fleetRecord, {
-    scene: options.scene || null,
-    hooks: options.hooks || null,
-    reason,
-  });
-  releaseManagedFleetResources(fleetRecord, reason);
-  miningFleetStateByID.delete(normalizedFleetID);
-  return {
-    success: true,
-    data: {
-      fleetID: normalizedFleetID,
-      destroyedCount,
-    },
-  };
-}
-
-function destroyManagedMiningFleetsByOwner(options = {}) {
-  const owner = normalizeManagedMiningOwner(options);
-  if (!owner.operatorKind || !owner.operatorID) {
-    return {
-      success: false,
-      errorMsg: "MANAGED_MINING_OWNER_REQUIRED",
-    };
-  }
-  const fleetIDs = [...miningFleetStateByID.values()]
-    .filter(
-      (fleetRecord) =>
-        managedMiningOwnerMatches(fleetRecord, owner),
-    )
-    .map((fleetRecord) => fleetRecord.fleetID);
-  let destroyedCount = 0;
-  for (const fleetID of fleetIDs) {
-    const result = destroyManagedMiningFleet(fleetID, {
-      ...owner,
-      scene: options.scene || null,
-      hooks: options.hooks || null,
-      reason: options.reason,
-    });
-    if (result && result.success === true) {
-      destroyedCount += Math.max(
-        0,
-        toInt(
-          result.data && result.data.destroyedCount,
-          0,
-        ),
+  let transferredVolumeM3 = 0;
+  const touchedJetcanRecords = new Set();
+  const finishJettison = () => {
+    for (const jetcanRecord of touchedJetcanRecords) {
+      jetcanRecord.sealedAtMs = Math.max(1, toInt(now, Date.now()));
+      const minerKey = String(
+        toInt(jetcanRecord.minerEntityID, 0),
       );
+      if (
+        toInt(
+          fleetRecord.activeJetcanIDByMinerID &&
+            fleetRecord.activeJetcanIDByMinerID[minerKey],
+          0,
+        ) === toInt(jetcanRecord.containerID, 0)
+      ) {
+        delete fleetRecord.activeJetcanIDByMinerID[minerKey];
+      }
+    }
+    return transferredVolumeM3;
+  };
+
+  for (const cargoItem of [...getNpcOreCargoItems(minerEntity)]) {
+    const typeID = toInt(cargoItem && cargoItem.typeID, 0);
+    const typeRecord = resolveItemByTypeID(typeID) || null;
+    const unitVolumeM3 = Math.max(
+      MINING_CARGO_FULL_EPSILON_M3,
+      toFiniteNumber(
+        cargoItem && cargoItem.volume,
+        toFiniteNumber(typeRecord && typeRecord.volume, 0),
+      ),
+    );
+    let remainingQuantity = Math.max(
+      0,
+      toInt(cargoItem && cargoItem.quantity, 0),
+    );
+    while (typeRecord && remainingQuantity > 0) {
+      const jetcanRecord = resolveActiveMiningJetcan(
+        scene,
+        fleetRecord,
+        minerEntity,
+        now,
+      );
+      if (!jetcanRecord) {
+        return finishJettison();
+      }
+      touchedJetcanRecords.add(jetcanRecord);
+      const usedVolumeM3 = getMiningJetcanUsedVolumeM3(
+        jetcanRecord.containerID,
+      );
+      const availableVolumeM3 = Math.max(
+        0,
+        getMiningJetcanCapacityM3() - usedVolumeM3,
+      );
+      const quantityThatFits = Math.min(
+        remainingQuantity,
+        Math.max(0, Math.floor(availableVolumeM3 / unitVolumeM3)),
+      );
+      if (quantityThatFits <= 0) {
+        delete fleetRecord.activeJetcanIDByMinerID[
+          String(minerEntity.itemID)
+        ];
+        continue;
+      }
+      const grantResult = grantItemToOwnerLocation(
+        normalizePositiveInteger(
+          fleetRecord.cargoOwnerID,
+          normalizePositiveInteger(minerEntity.ownerID, 0),
+        ),
+        jetcanRecord.containerID,
+        0,
+        typeRecord,
+        quantityThatFits,
+        { transient: fleetRecord.cargoTransient !== false },
+      );
+      if (!grantResult || !grantResult.success) {
+        return finishJettison();
+      }
+      const removedQuantity = removeNpcMiningCargoQuantity(
+        minerEntity,
+        cargoItem,
+        quantityThatFits,
+      );
+      if (removedQuantity <= 0) {
+        return finishJettison();
+      }
+      remainingQuantity -= removedQuantity;
+      transferredVolumeM3 += removedQuantity * unitVolumeM3;
+      if (
+        getMiningJetcanUsedVolumeM3(jetcanRecord.containerID) >=
+        getMiningJetcanCapacityM3() - 1
+      ) {
+        delete fleetRecord.activeJetcanIDByMinerID[
+          String(minerEntity.itemID)
+        ];
+      }
     }
   }
-  return {
-    success: true,
-    data: {
-      fleetIDs,
-      fleetCount: fleetIDs.length,
-      destroyedCount,
-    },
+  return finishJettison();
+}
+
+function scanManagedIndustrialFleetThreat(
+  scene,
+  fleetRecord,
+  now = Date.now(),
+) {
+  const scanAtMs = Math.max(0, toInt(now, 0));
+  const fleetEntityIDSet =
+    new Set(getFleetEntityIDs(fleetRecord));
+  const assignedTarget =
+    scene.getEntityByID(
+      toInt(fleetRecord.activeAsteroidID, 0),
+    ) ||
+    scene.getEntityByID(
+      toInt(fleetRecord.targetShipID, 0),
+    ) ||
+    null;
+  const interactionSource =
+    getFleetEntities(scene, fleetRecord)[0] ||
+    assignedTarget ||
+    null;
+  const isAwayFromSite = [
+    "aggressed",
+    "panic",
+    "returning_to_site",
+  ].includes(String(fleetRecord.state || ""));
+  const assignedSitePosition =
+    assignedTarget && assignedTarget.position ||
+    fleetRecord.retreatSitePosition ||
+    null;
+  const referencePosition =
+    isAwayFromSite && assignedSitePosition
+      ? assignedSitePosition
+      : buildFleetReferencePosition(
+          scene,
+          fleetRecord,
+        );
+  const scanRangeMeters = Math.max(
+    0,
+    toFiniteNumber(
+      config.miningNpcManagedDefenseScanRangeMeters,
+      DEFAULT_MANAGED_MINING_DEFENSE_SCAN_RANGE_METERS,
+    ),
+  );
+  const isCandidate = (entity) => {
+    if (
+      !entity ||
+      entity.kind !== "ship" ||
+      entity.nativeNpc !== true ||
+      fleetEntityIDSet.has(toInt(entity.itemID, 0)) ||
+      (
+        interactionSource &&
+        !canEntitiesInteractLocally(
+          interactionSource,
+          entity,
+        )
+      )
+    ) {
+      return false;
+    }
+    if (toFiniteNumber(entity.bounty, 0) <= 0) {
+      return false;
+    }
+    return (
+      !referencePosition ||
+      !entity.position ||
+      distance(
+        referencePosition,
+        entity.position,
+      ) <= scanRangeMeters
+    );
   };
+
+  const scanIntervalMs = Math.max(
+    250,
+    toInt(
+      config.miningNpcManagedDefenseScanIntervalMs,
+      DEFAULT_MANAGED_MINING_DEFENSE_SCAN_INTERVAL_MS,
+    ),
+  );
+  const lastScanAtMs = toInt(
+    fleetRecord.lastManagedThreatScanAtMs,
+    -1,
+  );
+  if (
+    lastScanAtMs >= 0 &&
+    scanAtMs >= lastScanAtMs &&
+    scanAtMs - lastScanAtMs < scanIntervalMs
+  ) {
+    const cached =
+      fleetRecord.lastManagedThreatScanResult || null;
+    if (!cached) {
+      return null;
+    }
+    const cachedEntity = scene.getEntityByID(
+      toInt(cached.entityID, 0),
+    );
+    return isCandidate(cachedEntity)
+      ? {
+          ...cached,
+          entity: cachedEntity,
+          cached: true,
+        }
+      : null;
+  }
+
+  fleetRecord.lastManagedThreatScanAtMs =
+    scanAtMs;
+  fleetRecord.managedThreatScanCount =
+    Math.max(
+      0,
+      toInt(fleetRecord.managedThreatScanCount, 0),
+    ) + 1;
+
+  const bubbleIDs = new Set();
+  if (assignedTarget) {
+    const targetBubbleID = toInt(
+      assignedTarget.bubbleID,
+      0,
+    );
+    if (targetBubbleID > 0) {
+      bubbleIDs.add(targetBubbleID);
+    }
+  }
+  for (const entityID of fleetEntityIDSet) {
+    const crewEntity =
+      scene.getEntityByID(entityID);
+    const bubbleID = toInt(
+      crewEntity && crewEntity.bubbleID,
+      0,
+    );
+    if (bubbleID > 0) {
+      bubbleIDs.add(bubbleID);
+    }
+  }
+  const dynamicEntities = [];
+  const seenEntityIDs = new Set();
+  const appendEntities = (entities) => {
+    for (const entity of entities || []) {
+      const entityID = toInt(
+        entity && entity.itemID,
+        0,
+      );
+      if (
+        entityID <= 0 ||
+        seenEntityIDs.has(entityID)
+      ) {
+        continue;
+      }
+      seenEntityIDs.add(entityID);
+      dynamicEntities.push(entity);
+    }
+  };
+  if (
+    bubbleIDs.size > 0 &&
+    typeof scene.getDynamicEntitiesInBubble ===
+      "function"
+  ) {
+    for (const bubbleID of bubbleIDs) {
+      appendEntities(
+        scene.getDynamicEntitiesInBubble(bubbleID),
+      );
+    }
+  } else if (
+    typeof scene.getDynamicEntities === "function"
+  ) {
+    appendEntities(scene.getDynamicEntities());
+  } else if (scene.dynamicEntities instanceof Map) {
+    appendEntities(scene.dynamicEntities.values());
+  }
+
+  let selected = null;
+  let candidateCount = 0;
+  for (const entity of dynamicEntities) {
+    if (!isCandidate(entity)) {
+      continue;
+    }
+    candidateCount += 1;
+    const itemType =
+      resolveItemByTypeID(
+        toInt(entity.typeID, 0),
+      ) || {};
+    const threatName = String(
+      entity.itemName ||
+      entity.slimName ||
+      itemType.name ||
+      "",
+    );
+    const sizeClass =
+      resolveManagedThreatSizeClass(entity);
+    const sizeRank = {
+      unknown: 7,
+      capital: 6,
+      battleship: 5,
+      battlecruiser: 4,
+      cruiser: 3,
+      destroyer: 2,
+      frigate: 1,
+    }[sizeClass] || 7;
+    const candidate = {
+      entity,
+      distanceMeters:
+        referencePosition && entity.position
+          ? distance(
+              referencePosition,
+              entity.position,
+            )
+          : 0,
+      riskRank:
+        (entity.capitalNpc === true ? 100 : 0) +
+        (
+          MANAGED_MINING_DEFENSE_REJECTED_NAME_PATTERN
+            .test(threatName)
+            ? 50
+            : 0
+        ) +
+        sizeRank,
+      bounty: Math.max(
+        0,
+        toFiniteNumber(entity.bounty, 0),
+      ),
+    };
+    if (
+      !selected ||
+      candidate.riskRank > selected.riskRank ||
+      (
+        candidate.riskRank === selected.riskRank &&
+        (
+          candidate.bounty > selected.bounty ||
+          (
+            candidate.bounty === selected.bounty &&
+            (
+              candidate.distanceMeters <
+                selected.distanceMeters ||
+              (
+                candidate.distanceMeters ===
+                  selected.distanceMeters &&
+                toInt(candidate.entity.itemID, 0) <
+                  toInt(selected.entity.itemID, 0)
+              )
+            )
+          )
+        )
+      )
+    ) {
+      selected = candidate;
+    }
+  }
+
+  fleetRecord.lastManagedThreatScanCandidateCount =
+    candidateCount;
+  fleetRecord.lastManagedThreatScanEvaluatedEntityCount =
+    dynamicEntities.length;
+  fleetRecord.lastManagedThreatScanResult = selected
+    ? {
+        entityID: toInt(selected.entity.itemID, 0),
+        distanceMeters: selected.distanceMeters,
+        riskRank: selected.riskRank,
+        bounty: selected.bounty,
+      }
+    : null;
+  return selected
+    ? {
+        ...fleetRecord.lastManagedThreatScanResult,
+        entity: selected.entity,
+        cached: false,
+      }
+    : null;
+}
+
+function selectManagedDefenseFlight(
+  defenseFlights,
+  targetSizeClass,
+) {
+  return (
+    Array.isArray(defenseFlights)
+      ? defenseFlights
+      : []
+  ).find((flight) => {
+    const droneTypeID = toInt(
+      flight && (flight.droneTypeID ?? flight.typeID),
+      0,
+    );
+    const launchCount = Math.max(
+      0,
+      toInt(
+        flight &&
+          (flight.launchCount ?? flight.quantity),
+        0,
+      ),
+    );
+    const targetSizeClasses = Array.isArray(
+      flight && flight.targetSizeClasses,
+    )
+      ? flight.targetSizeClasses.map((entry) =>
+          String(entry || "").trim().toLowerCase())
+      : [];
+    return (
+      droneTypeID > 0 &&
+      launchCount > 0 &&
+      (
+        targetSizeClasses.length <= 0 ||
+        targetSizeClasses.includes(targetSizeClass)
+      )
+    );
+  }) || null;
 }
 
 function settleManagedMiningFleetCargo(
@@ -5346,945 +7560,44 @@ function settleManagedMiningFleetCargo(
   };
 }
 
-function buildSpawnResultEntityIDs(spawnResult) {
-  return (
-    spawnResult &&
-    spawnResult.data &&
-    Array.isArray(spawnResult.data.spawned)
-      ? spawnResult.data.spawned
-        .map((entry) => normalizePositiveInteger(entry && entry.entity && entry.entity.itemID, null))
-        .filter(Boolean)
-      : []
-  );
-}
-
-function buildCappedGroupProfilePlan(
-  groupResolution,
-  amount,
-  physicalShipLimit,
+function shouldManagedDefenseRetreat(
+  scene,
+  fleetRecord,
 ) {
-  const limit = Math.max(
+  if (fleetRecord.defenseDroneLossDetected === true) {
+    return "DEFENSIVE_DRONE_LOST";
+  }
+  const minimumShieldRatio = Math.max(
     0,
-    toInt(physicalShipLimit, 0),
-  );
-  if (limit <= 0) {
-    return null;
-  }
-  const profileIDs = [];
-  for (
-    let iteration = 0;
-    iteration < Math.max(1, toInt(amount, 1));
-    iteration += 1
-  ) {
-    const definitionPlan = buildDefinitionsForSpawnGroup(
-      groupResolution && groupResolution.data,
-      { entityType: "npc" },
-    );
-    if (
-      !definitionPlan ||
-      definitionPlan.success !== true ||
-      !definitionPlan.data
-    ) {
-      return definitionPlan || {
-        success: false,
-        errorMsg: "NPC_GROUP_SPAWN_PLAN_FAILED",
-      };
-    }
-    for (const definition of definitionPlan.data.definitions || []) {
-      const profileID = String(
-        definition &&
-          definition.profile &&
-          definition.profile.profileID ||
-          "",
-      ).trim();
-      if (!profileID) {
-        return {
-          success: false,
-          errorMsg: "NPC_DEFINITION_INCOMPLETE",
-        };
-      }
-      profileIDs.push(profileID);
-      if (profileIDs.length >= limit) {
-        return {
-          success: true,
-          data: { profileIDs },
-        };
-      }
-    }
-  }
-  return profileIDs.length > 0
-    ? { success: true, data: { profileIDs } }
-    : {
-        success: false,
-        errorMsg: "NPC_GROUP_SPAWN_PLAN_EMPTY",
-      };
-}
-
-function spawnFleetWing(systemID, centerTarget, options = {}) {
-  const amount = Math.max(1, toInt(options.amount, 1));
-  const physicalShipLimit = Math.max(
-    0,
-    toInt(options.physicalShipLimit, 0),
-  );
-  const profileQuery = String(options.profileQuery || "").trim();
-  const originAnchor = options.originAnchor || null;
-  const sharedSpawnOptions = {
-    ...(options.entityScopeMetadata && typeof options.entityScopeMetadata === "object"
-      ? { entityScopeMetadata: options.entityScopeMetadata }
-      : {}),
-    transient: true,
-    broadcast: false,
-    skipInitialBehaviorTick: true,
-    operatorKind:
-      String(options.operatorKind || "").trim() ||
-      undefined,
-    preferredTargetID: normalizePositiveInteger(options.preferredTargetID, 0),
-    anchorDescriptor: originAnchor
-      ? {
-          kind: "coordinates",
-          position: originAnchor.position,
-          direction: originAnchor.direction,
-          name: String(options.anchorName || "Mining Fleet Warp Origin"),
-        }
-      : null,
-  };
-  const groupResolution = profileQuery
-    ? resolveNpcSpawnGroup(profileQuery, "")
-    : {
-      success: false,
-    };
-  let spawnResult = null;
-  if (groupResolution.success && groupResolution.data) {
-    const spawned = [];
-    let partialFailure = null;
-    const cappedProfilePlan = buildCappedGroupProfilePlan(
-      groupResolution,
-      amount,
-      physicalShipLimit,
-    );
-    if (cappedProfilePlan) {
-      // Native group calls materialize every configured entry at once.
-      // Spawn an already-capped exact-profile plan so managed fleets never
-      // temporarily exceed their reserved physical budget.
-      if (
-        cappedProfilePlan.success !== true ||
-        !cappedProfilePlan.data
-      ) {
-        return cappedProfilePlan;
-      }
-      const cappedProfileIDs =
-        cappedProfilePlan.data.profileIDs || [];
-      for (
-        let index = 0;
-        index < cappedProfileIDs.length;
-        index += 1
-      ) {
-        const profileSpawnResult =
-          npcService.spawnNpcBatchInSystem(systemID, {
-            ...sharedSpawnOptions,
-            profileQuery: cappedProfileIDs[index],
-            amount: 1,
-            // The capped plan already selected one exact profile. Do not
-            // reinterpret it as a broader pool when aliases overlap.
-            preferPools: false,
-          });
-        if (
-          !profileSpawnResult.success ||
-          !profileSpawnResult.data ||
-          !Array.isArray(profileSpawnResult.data.spawned) ||
-          profileSpawnResult.data.spawned.length <= 0
-        ) {
-          if (spawned.length <= 0) {
-            return profileSpawnResult;
-          }
-          partialFailure = {
-            failedAt: index + 1,
-            errorMsg:
-              profileSpawnResult.errorMsg ||
-              "NPC_PROFILE_SPAWN_FAILED",
-          };
-          break;
-        }
-        const profileSpawned =
-          profileSpawnResult.data.spawned;
-        spawned.push(profileSpawned[0]);
-        // Guard against a future exact-profile resolver regression.
-        for (const unexpectedEntry of profileSpawned.slice(1)) {
-          const unexpectedEntityID =
-            normalizePositiveInteger(
-              unexpectedEntry &&
-                unexpectedEntry.entity &&
-                unexpectedEntry.entity.itemID,
-              0,
-            );
-          if (unexpectedEntityID > 0) {
-            npcService.destroyNpcControllerByEntityID(
-              unexpectedEntityID,
-              { removeContents: true },
-            );
-          }
-        }
-        if (profileSpawned.length > 1) {
-          partialFailure = {
-            failedAt: index + 1,
-            errorMsg:
-              "NPC_PROFILE_SPAWN_EXCEEDED_PHYSICAL_LIMIT",
-            removedUnexpectedCount:
-              profileSpawned.length - 1,
-          };
-        }
-        if (profileSpawnResult.data.partialFailure) {
-          partialFailure =
-            profileSpawnResult.data.partialFailure;
-          break;
-        }
-      }
-    } else {
-      // Ambient fleets retain native group semantics: amount one means one
-      // complete configured spawn group.
-      for (
-        let iteration = 0;
-        iteration < amount;
-        iteration += 1
-      ) {
-        const groupSpawnResult =
-          npcService.spawnNpcGroupInSystem(systemID, {
-            ...sharedSpawnOptions,
-            spawnGroupQuery: profileQuery,
-            entityType: ENTITY_TYPE.NPC,
-          });
-        if (
-          !groupSpawnResult.success ||
-          !groupSpawnResult.data ||
-          !Array.isArray(groupSpawnResult.data.spawned) ||
-          groupSpawnResult.data.spawned.length <= 0
-        ) {
-          if (spawned.length <= 0) {
-            return groupSpawnResult;
-          }
-          partialFailure = {
-            failedAt: iteration + 1,
-            errorMsg:
-              groupSpawnResult.errorMsg ||
-              "NPC_GROUP_SPAWN_FAILED",
-          };
-          break;
-        }
-        spawned.push(...groupSpawnResult.data.spawned);
-        if (groupSpawnResult.data.partialFailure) {
-          partialFailure =
-            groupSpawnResult.data.partialFailure;
-          break;
-        }
-      }
-    }
-    spawnResult = {
-      success: true,
-      data: {
-        selectionKind: "group",
-        selectionID: groupResolution.data.spawnGroupID,
-        selectionName: groupResolution.data.name || groupResolution.data.spawnGroupID,
-        requestedAmount: amount,
-        physicalShipLimit,
-        spawned,
-        partialFailure,
-      },
-      suggestions: [],
-    };
-  } else {
-    spawnResult = npcService.spawnNpcBatchInSystem(systemID, {
-      ...sharedSpawnOptions,
-      profileQuery,
-      amount:
-        physicalShipLimit > 0
-          ? Math.min(amount, physicalShipLimit)
-          : amount,
-    });
-  }
-  if (!spawnResult.success || !spawnResult.data || !Array.isArray(spawnResult.data.spawned) || spawnResult.data.spawned.length <= 0) {
-    return spawnResult;
-  }
-
-  if (options.warpIn !== false && centerTarget && centerTarget.position) {
-    const landingRadiusMeters = Math.max(
-      500,
-      toFiniteNumber(
-        options.landingRadiusMeters,
-        DEFAULT_MINING_WARP_LANDING_RADIUS_METERS,
-      ),
-    );
-    const warpRequests = spawnResult.data.spawned.map((entry, index, list) => ({
-      entityID: normalizePositiveInteger(entry && entry.entity && entry.entity.itemID, 0),
-      point: buildMiningWarpLandingPoint(
-        centerTarget.position,
-        index,
-        list.length,
-        landingRadiusMeters,
-      ),
-      options: {
-        forceImmediateStart: true,
-        broadcastWarpStartToVisibleSessions: true,
-        visibilitySuppressMs: 250,
-        ingressDurationMs: Math.max(
-          250,
-          toFiniteNumber(
-            config.miningNpcWarpIngressDurationMs,
-            DEFAULT_MINING_WARP_INGRESS_DURATION_MS,
-          ),
-        ),
-      },
-    }));
-    const warpResult = npcService.runtime.warpBatchToPoints(warpRequests, {
-      groupWake: true,
-    });
-    if (!warpResult.success) {
-      // Callers only receive the failed warp result, so clean up the already
-      // spawned entities here rather than leaking an untracked partial wing.
-      for (const entityID of buildSpawnResultEntityIDs(spawnResult)) {
-        npcService.destroyNpcControllerByEntityID(entityID, {
-          removeContents: true,
-        });
-      }
-      return warpResult;
-    }
-  }
-
-  return spawnResult;
-}
-
-function resolveSessionScene(session) {
-  if (!session || !session._space) {
-    return null;
-  }
-  const spaceRuntime = require(path.join(__dirname, "../../space/runtime"));
-  return spaceRuntime.ensureScene(normalizePositiveInteger(session._space.systemID, 0));
-}
-
-function spawnMiningFleetInternal(scene, options = {}) {
-  const systemID = normalizePositiveInteger(options.systemID || (scene && scene.systemID), 0);
-  const centerTarget = options.centerTarget || buildSpawnTarget(scene);
-  if (!systemID || !centerTarget || !centerTarget.position) {
-    return {
-      success: false,
-      errorMsg: "SPAWN_TARGET_NOT_FOUND",
-    };
-  }
-
-  const originAnchor = options.originAnchor || buildOffgridOriginAnchor(scene, centerTarget);
-  const entityScopeMetadata = buildChildEntityScopeMetadata(centerTarget);
-  const physicalShipLimit = Math.max(
-    0,
-    toInt(options.physicalShipLimit, 0),
-  );
-  const haulerAmount = Math.max(
-    0,
-    toInt(
-      options.haulerAmount,
-      toInt(
-        config.miningNpcHaulerDefaultCount,
-        DEFAULT_MINING_HAULER_COUNT,
-      ),
-    ),
-  );
-  const reservedHaulerSlots =
-    physicalShipLimit > 0
-      ? Math.min(
-          haulerAmount,
-          Math.max(0, physicalShipLimit - 1),
-        )
-      : 0;
-  const minerPhysicalShipLimit =
-    physicalShipLimit > 0
-      ? Math.max(1, physicalShipLimit - reservedHaulerSlots)
-      : 0;
-  const resolvedMinerQuery = resolveMiningFleetQuery(
-    scene,
-    options.minerQuery,
-    systemID,
-  );
-  const minerSpawnResult = spawnFleetWing(systemID, centerTarget, {
-    amount: Math.max(
+    Math.min(
       1,
-      toInt(
-        options.minerAmount,
-        toInt(config.miningNpcFleetDefaultCount, DEFAULT_MINING_FLEET_COUNT),
+      toFiniteNumber(
+        config
+          .miningNpcManagedDefenseRetreatShieldRatio,
+        DEFAULT_MANAGED_MINING_DEFENSE_RETREAT_SHIELD_RATIO,
       ),
     ),
-    profileQuery: resolvedMinerQuery,
-    entityScopeMetadata,
-    operatorKind: options.operatorKind,
-    physicalShipLimit: minerPhysicalShipLimit,
-    preferredTargetID: 0,
-    originAnchor,
-    warpIn: true,
-    landingRadiusMeters: toFiniteNumber(
-      config.miningNpcFleetLandingRadiusMeters,
-      DEFAULT_MINING_WARP_LANDING_RADIUS_METERS,
-    ),
-  });
-  if (!minerSpawnResult.success || !minerSpawnResult.data) {
-    return minerSpawnResult;
-  }
-
-  const minerEntityCount =
-    buildSpawnResultEntityIDs(minerSpawnResult).length;
-  const remainingPhysicalShipLimit =
-    physicalShipLimit > 0
-      ? Math.max(0, physicalShipLimit - minerEntityCount)
-      : 0;
-  let haulerSpawnResult = null;
-  if (
-    haulerAmount > 0 &&
-    (
-      physicalShipLimit <= 0 ||
-      remainingPhysicalShipLimit > 0
-    )
-  ) {
-    const resolvedHaulerQuery = resolveMiningHaulerQuery(
-      scene,
-      options.haulerQuery,
-      systemID,
-    );
-    haulerSpawnResult = spawnFleetWing(systemID, originAnchor, {
-      amount:
-        physicalShipLimit > 0
-          ? Math.min(
-              haulerAmount,
-              remainingPhysicalShipLimit,
-            )
-          : haulerAmount,
-      profileQuery: resolvedHaulerQuery,
-      entityScopeMetadata,
-      operatorKind: options.operatorKind,
-      physicalShipLimit: remainingPhysicalShipLimit,
-      preferredTargetID: 0,
-      originAnchor,
-      warpIn: false,
-    });
-    if (!haulerSpawnResult.success || !haulerSpawnResult.data) {
-      const minerEntityIDs = buildSpawnResultEntityIDs(minerSpawnResult);
-      for (const entityID of minerEntityIDs) {
-        npcService.destroyNpcControllerByEntityID(entityID, {
-          removeContents: true,
-        });
-      }
-      return haulerSpawnResult;
-    }
-  }
-
-  for (const entityID of buildSpawnResultEntityIDs(minerSpawnResult)) {
-    applyPassiveMiningFleetOverrides(entityID, {
-      movementMode: "orbit",
-      orbitDistanceMeters: 1_200,
-      followRangeMeters: 800,
-      idleAnchorOrbit: false,
-      issueStopOrder: false,
-      clearCombatPreference: true,
-    });
-  }
-  for (const entityID of buildSpawnResultEntityIDs(haulerSpawnResult)) {
-    applyPassiveMiningFleetOverrides(entityID, {
-      movementMode: "stop",
-      orbitDistanceMeters: 500,
-      followRangeMeters: 500,
-      idleAnchorOrbit: false,
-      idleAnchorOrbitDistanceMeters: 500,
-      clearCombatPreference: true,
-    });
-  }
-
-  return {
-    success: true,
-    data: {
-      originAnchor,
-      minerSpawnResult,
-      haulerSpawnResult,
-      centerTarget,
-      minerEntityIDs: buildSpawnResultEntityIDs(minerSpawnResult),
-      haulerEntityIDs: buildSpawnResultEntityIDs(haulerSpawnResult),
-    },
-  };
-}
-
-function adoptManagedPilotIdentity(
-  scene,
-  entityIDs,
-  options = {},
-) {
-  const identity =
-    options.pilotIdentity &&
-    typeof options.pilotIdentity === "object"
-      ? options.pilotIdentity
-      : null;
-  const pilotCharacterID = normalizePositiveInteger(
-    identity && identity.characterID,
-    0,
   );
-  if (!scene || pilotCharacterID <= 0) {
-    return;
-  }
-  const pilotName = String(
-    identity.characterName || "Industrial Hireling",
-  ).trim();
-  const actorID = String(
-    options.livingUniverseActorID || "",
-  ).trim();
-  for (const entityID of Array.isArray(entityIDs) ? entityIDs : []) {
-    const entity =
-      typeof scene.getEntityByID === "function"
-        ? scene.getEntityByID(entityID)
-        : null;
+  for (
+    const entityID of getFleetEntityIDs(fleetRecord)
+  ) {
+    const entity = scene.getEntityByID(entityID);
     if (!entity) {
-      continue;
+      return "CREW_SHIP_MISSING";
     }
-    entity.npcPilotCharacterID = pilotCharacterID;
-    entity.livingUniverseActorID = actorID || null;
-    entity.npcRole = String(
-      options.managedRole ||
-        entity.npcRole ||
-        "industrial",
-    );
-    entity.itemName = pilotName;
-    entity.slimName = pilotName;
+    const health =
+      getEntityCombatHealthSnapshot(entity);
+    if (
+      health.structureDamageRatio > 0 ||
+      health.armorDamageRatio > 0 ||
+      health.shieldRatio < minimumShieldRatio
+    ) {
+      return "ZERO_LOSS_MARGIN_BROKEN";
+    }
   }
+  return null;
 }
 
-function rollbackManagedMiningSpawn(entityIDs) {
-  let destroyedCount = 0;
-  const normalizedEntityIDs = [...new Set(
-    (Array.isArray(entityIDs) ? entityIDs : [])
-      .map(
-        (entityID) =>
-          normalizePositiveInteger(entityID, 0),
-      )
-      .filter((entityID) => entityID > 0),
-  )];
-  for (const entityID of normalizedEntityIDs.reverse()) {
-    try {
-      const result =
-        npcService.destroyNpcControllerByEntityID(entityID, {
-          removeContents: true,
-        });
-      if (result && result.success === true) {
-        destroyedCount += 1;
-      }
-    } catch (_error) {
-      // Continue rolling back the remaining hulls.
-    }
-  }
-  return destroyedCount;
-}
-
-function normalizeManagedIndustrialCrewRoster(roster) {
-  if (!Array.isArray(roster) || roster.length <= 0) {
-    return {
-      success: false,
-      errorMsg: "MANAGED_INDUSTRIAL_CREW_ROSTER_REQUIRED",
-    };
-  }
-  if (roster.length > MAX_MINING_NPC_COMMAND_SPAWN_COUNT) {
-    return {
-      success: false,
-      errorMsg: "MANAGED_INDUSTRIAL_CREW_ROSTER_TOO_LARGE",
-      data: {
-        requestedCount: roster.length,
-        maximumCount: MAX_MINING_NPC_COMMAND_SPAWN_COUNT,
-      },
-    };
-  }
-
-  const normalizedRoster = [];
-  const memberIDs = new Set();
-  for (let index = 0; index < roster.length; index += 1) {
-    const source =
-      roster[index] && typeof roster[index] === "object"
-        ? roster[index]
-        : {};
-    const role = String(
-      source.role || "",
-    ).trim().toLowerCase();
-    if (!MANAGED_INDUSTRIAL_CREW_ROLES.has(role)) {
-      return {
-        success: false,
-        errorMsg: "MANAGED_INDUSTRIAL_CREW_ROLE_INVALID",
-        data: {
-          index,
-          role: role || null,
-        },
-      };
-    }
-
-    const explicitProfileID = String(
-      source.profileID || "",
-    ).trim();
-    const profileQuery = String(
-      source.profileQuery || "",
-    ).trim();
-    let profile = explicitProfileID
-      ? getNpcProfile(explicitProfileID)
-      : null;
-    if (!profile && !explicitProfileID && profileQuery) {
-      const profileResolution =
-        resolveNpcProfile(profileQuery, "");
-      profile =
-        profileResolution &&
-        profileResolution.success === true &&
-        profileResolution.data
-          ? profileResolution.data
-          : null;
-    }
-    if (!profile || !String(profile.profileID || "").trim()) {
-      return {
-        success: false,
-        errorMsg:
-          explicitProfileID || profileQuery
-            ? "MANAGED_INDUSTRIAL_CREW_PROFILE_NOT_FOUND"
-            : "MANAGED_INDUSTRIAL_CREW_PROFILE_REQUIRED",
-        data: {
-          index,
-          requestedProfile:
-            explicitProfileID || profileQuery || null,
-        },
-      };
-    }
-
-    const profileID = String(profile.profileID).trim();
-    const shipTypeID = normalizePositiveInteger(
-      profile.shipTypeID,
-      0,
-    );
-    if (shipTypeID <= 0) {
-      return {
-        success: false,
-        errorMsg:
-          "MANAGED_INDUSTRIAL_CREW_PROFILE_INCOMPLETE",
-        data: {
-          index,
-          profileID,
-        },
-      };
-    }
-    const declaredRole = String(
-      profile.miningRole || "",
-    ).trim().toLowerCase();
-    if (declaredRole && declaredRole !== role) {
-      return {
-        success: false,
-        errorMsg:
-          "MANAGED_INDUSTRIAL_CREW_PROFILE_ROLE_MISMATCH",
-        data: {
-          index,
-          profileID,
-          requestedRole: role,
-          profileRole: declaredRole,
-        },
-      };
-    }
-
-    const memberID =
-      String(source.memberID || "").trim() ||
-      `${role}:${index + 1}`;
-    if (memberIDs.has(memberID)) {
-      return {
-        success: false,
-        errorMsg:
-          "MANAGED_INDUSTRIAL_CREW_MEMBER_DUPLICATE",
-        data: {
-          index,
-          memberID,
-        },
-      };
-    }
-    memberIDs.add(memberID);
-    normalizedRoster.push({
-      ...source,
-      index,
-      memberID,
-      role,
-      profileID,
-      shipTypeID,
-      profile,
-      pilotIdentity:
-        source.pilotIdentity &&
-        typeof source.pilotIdentity === "object"
-          ? { ...source.pilotIdentity }
-          : null,
-      livingUniverseActorID:
-        String(
-          source.livingUniverseActorID || "",
-        ).trim() || null,
-    });
-  }
-
-  if (
-    !normalizedRoster.some(
-      (member) => member.role === "miner",
-    )
-  ) {
-    return {
-      success: false,
-      errorMsg: "MANAGED_INDUSTRIAL_CREW_MINER_REQUIRED",
-    };
-  }
-  return {
-    success: true,
-    data: {
-      roster: normalizedRoster,
-    },
-  };
-}
-
-function rollbackManagedIndustrialCrewSpawn(
-  entityIDs,
-  fleetRecord = null,
-) {
-  if (fleetRecord && toInt(fleetRecord.fleetID, 0) > 0) {
-    miningFleetStateByID.delete(
-      toInt(fleetRecord.fleetID, 0),
-    );
-  }
-  return rollbackManagedMiningSpawn(entityIDs);
-}
-
-function resolveManagedIndustrialCrewMemberAffiliation(member) {
-  const identity =
-    member &&
-    member.pilotIdentity &&
-    typeof member.pilotIdentity === "object"
-      ? member.pilotIdentity
-      : null;
-  const pilotCharacterID = normalizePositiveInteger(
-    identity && identity.characterID,
-    0,
-  );
-  const corporationID = normalizePositiveInteger(
-    identity && identity.corporationID,
-    0,
-  );
-  if (pilotCharacterID <= 0 || corporationID <= 0) {
-    return {
-      success: false,
-      errorMsg:
-        pilotCharacterID <= 0
-          ? "MANAGED_INDUSTRIAL_CREW_PILOT_IDENTITY_REQUIRED"
-          : "MANAGED_INDUSTRIAL_CREW_CORPORATION_IDENTITY_REQUIRED",
-    };
-  }
-  return {
-    success: true,
-    data: {
-      pilotCharacterID,
-      corporationID,
-      allianceID: Math.max(
-        0,
-        toInt(identity.allianceID, 0),
-      ),
-      warFactionID: Math.max(
-        0,
-        toInt(
-          identity.warFactionID ??
-            identity.militiaFactionID,
-          0,
-        ),
-      ),
-    },
-  };
-}
-
-function validateManagedIndustrialCrewMemberPresentation(
-  entity,
-  entityRecord,
-  affiliation,
-) {
-  if (
-    !entity ||
-    !entityRecord ||
-    !affiliation
-  ) {
-    return {
-      success: false,
-      errorMsg:
-        "MANAGED_INDUSTRIAL_CREW_PRESENTATION_REQUIRED",
-    };
-  }
-  const expected = {
-    ownerID: affiliation.pilotCharacterID,
-    corporationID: affiliation.corporationID,
-    allianceID: affiliation.allianceID,
-    warFactionID: affiliation.warFactionID,
-  };
-  const actualEntity = {
-    ownerID: normalizePositiveInteger(entity.ownerID, 0),
-    corporationID: normalizePositiveInteger(
-      entity.corporationID,
-      0,
-    ),
-    allianceID: Math.max(0, toInt(entity.allianceID, 0)),
-    warFactionID: Math.max(
-      0,
-      toInt(entity.warFactionID, 0),
-    ),
-  };
-  const actualRecord = {
-    ownerID: normalizePositiveInteger(
-      entityRecord.ownerID,
-      0,
-    ),
-    corporationID: normalizePositiveInteger(
-      entityRecord.corporationID,
-      0,
-    ),
-    allianceID: Math.max(
-      0,
-      toInt(entityRecord.allianceID, 0),
-    ),
-    warFactionID: Math.max(
-      0,
-      toInt(entityRecord.warFactionID, 0),
-    ),
-  };
-  if (
-    Object.keys(expected).some(
-      (key) =>
-        actualEntity[key] !== expected[key] ||
-        actualRecord[key] !== expected[key],
-    )
-  ) {
-    return {
-      success: false,
-      errorMsg:
-        "MANAGED_INDUSTRIAL_CREW_AFFILIATION_MISMATCH",
-      data: {
-        expected,
-        actualEntity,
-        actualRecord,
-      },
-    };
-  }
-  if (
-    entity.nativeNpc !== true ||
-    entity.nativeNpcOccupied !== true ||
-    entityRecord.nativeNpc !== true ||
-    entityRecord.nativeNpcOccupied !== true ||
-    entityRecord.loadoutGoverned !== true
-  ) {
-    return {
-      success: false,
-      errorMsg:
-        "MANAGED_INDUSTRIAL_CREW_NATIVE_GOVERNANCE_REQUIRED",
-    };
-  }
-  const entityBounty = Number(entity.bounty);
-  const recordBounty = Number(entityRecord.bounty);
-  if (
-    !Number.isFinite(entityBounty) ||
-    entityBounty !== 0 ||
-    !Number.isFinite(recordBounty) ||
-    recordBounty !== 0
-  ) {
-    return {
-      success: false,
-      errorMsg:
-        "MANAGED_INDUSTRIAL_CREW_ZERO_BOUNTY_REQUIRED",
-    };
-  }
-  if (
-    normalizePositiveInteger(entity.characterID, 0) > 0 ||
-    normalizePositiveInteger(
-      entity.pilotCharacterID,
-      0,
-    ) > 0 ||
-    normalizePositiveInteger(
-      entity.npcPilotCharacterID,
-      0,
-    ) !== affiliation.pilotCharacterID
-  ) {
-    return {
-      success: false,
-      errorMsg:
-        "MANAGED_INDUSTRIAL_CREW_PILOT_PRESENTATION_MISMATCH",
-    };
-  }
-  return {
-    success: true,
-  };
-}
-
-function applyManagedIndustrialCrewMemberState(
-  scene,
-  member,
-  entityID,
-  options = {},
-) {
-  if (member.role === "hauler") {
-    applyPassiveMiningFleetOverrides(entityID, {
-      movementMode: "stop",
-      orbitDistanceMeters: 500,
-      followRangeMeters: 500,
-      idleAnchorOrbit: false,
-      idleAnchorOrbitDistanceMeters: 500,
-      clearCombatPreference: true,
-    });
-  } else if (member.role === "mining_support") {
-    applyPassiveMiningFleetOverrides(entityID, {
-      movementMode: "orbit",
-      orbitDistanceMeters: 3_500,
-      followRangeMeters: 1_500,
-      idleAnchorOrbit: false,
-      issueStopOrder: false,
-      clearCombatPreference: true,
-    });
-  } else {
-    applyPassiveMiningFleetOverrides(entityID, {
-      movementMode: "orbit",
-      orbitDistanceMeters: 1_200,
-      followRangeMeters: 800,
-      idleAnchorOrbit: false,
-      issueStopOrder: false,
-      clearCombatPreference: true,
-    });
-  }
-
-  adoptManagedPilotIdentity(scene, [entityID], {
-    ...options,
-    ...member,
-    pilotIdentity:
-      member.pilotIdentity || options.pilotIdentity,
-    livingUniverseActorID:
-      String(
-        member.livingUniverseActorID || "",
-      ).trim() ||
-      String(
-        options.livingUniverseActorID || "",
-      ).trim() ||
-      null,
-    managedRole: member.role,
-  });
-  const entity =
-    scene && typeof scene.getEntityByID === "function"
-      ? scene.getEntityByID(entityID)
-      : null;
-  if (!entity) {
-    return false;
-  }
-  entity.npcRole = member.role;
-  entity.managedIndustrialCrewMemberID = member.memberID;
-  entity.managedIndustrialCrewProfileID =
-    member.profileID;
-  entity.managedIndustrialCrewRole = member.role;
-  return true;
-}
-
-/**
- * Materialize one exact mixed industrial crew. The caller owns any physical
- * budget reservation and must reserve the complete roster before invoking
- * this operation.
- *
- * The roster is fully resolved before the first spawn. Each member then gets
- * exactly one requested profile, the entire crew warps in as one batch, and
- * the managed fleet is registered only after every hull and member identity
- * has been validated. Any failure destroys every hull created by this call.
- */
 function spawnManagedIndustrialMiningCrew(
   scene,
   options = {},
@@ -6392,6 +7705,7 @@ function spawnManagedIndustrialMiningCrew(
       const affiliation = affiliationResult.data;
       const spawnResult =
         npcService.spawnNpcBatchInSystem(systemID, {
+          sceneDescriptor: scene.sceneDescriptor,
           transient: true,
           broadcast: false,
           skipInitialBehaviorTick: true,
@@ -6984,1158 +8298,37 @@ function spawnManagedMiningHauler(scene, options = {}) {
   };
 }
 
-function issueResponseOrders(responseEntityIDs = [], aggressorEntityID = 0) {
-  const normalizedAggressorEntityID = normalizePositiveInteger(aggressorEntityID, 0);
-  for (const entityID of Array.isArray(responseEntityIDs) ? responseEntityIDs : []) {
-    npcService.setBehaviorOverrides(entityID, {
-      autoAggro: true,
-      autoActivateWeapons: true,
-      autoAggroTargetClasses: [ENTITY_TYPE.PLAYER],
-      targetPreference: "preferredTargetThenNearestPlayer",
-      movementMode: "orbit",
-      orbitDistanceMeters: 1_800,
-      followRangeMeters: 1_500,
-      aggressionRangeMeters: 250_000,
-      idleAnchorOrbit: false,
-      returnToHomeWhenIdle: true,
-      leashRangeMeters: 250_000,
-    });
-    if (normalizedAggressorEntityID > 0) {
-      npcService.issueManualOrder(entityID, {
-        type: "attack",
-        targetID: normalizedAggressorEntityID,
-        allowWeapons: true,
-        keepLock: true,
-        movementMode: "orbit",
-        orbitDistanceMeters: 1_800,
-      });
-    }
-    npcService.wakeNpcController(entityID, 0);
-  }
-}
-
-function retreatResponseWingToOrigin(fleetRecord, options = {}) {
-  if (!fleetRecord || !fleetRecord.originAnchor || !fleetRecord.originAnchor.position) {
-    return 0;
-  }
-  const ingressDurationMs = Math.max(
-    250,
-    toFiniteNumber(
-      config.miningNpcWarpIngressDurationMs,
-      DEFAULT_MINING_WARP_INGRESS_DURATION_MS,
-    ),
-  );
-  let retreatedCount = 0;
-  for (const entityID of Array.isArray(fleetRecord.responseEntityIDs) ? fleetRecord.responseEntityIDs : []) {
-    if (!npcService.getControllerByEntityID(entityID)) {
-      continue;
-    }
-    npcService.issueManualOrder(entityID, {
-      type: "returnHome",
-      allowWeapons: false,
-    });
-    npcService.runtime.warpToPoint(entityID, fleetRecord.originAnchor.position, {
-      forceImmediateStart: true,
-      broadcastWarpStartToVisibleSessions: true,
-      visibilitySuppressMs: 250,
-      ingressDurationMs,
-    });
-    retreatedCount += 1;
-  }
-  if (retreatedCount > 0) {
-    fleetRecord.responseRetreating = true;
-    fleetRecord.responseTargetID = 0;
-    fleetRecord.responseDespawnAtMs = Math.max(
-      0,
-      toInt(options.nowMs, 0) + ingressDurationMs,
-    );
-  }
-  return retreatedCount;
-}
-
-function destroyResponseWing(fleetRecord) {
-  let destroyedCount = 0;
-  for (const entityID of Array.isArray(fleetRecord && fleetRecord.responseEntityIDs) ? fleetRecord.responseEntityIDs : []) {
-    const destroyResult = npcService.destroyNpcControllerByEntityID(entityID, {
-      removeContents: true,
-    });
-    if (destroyResult && destroyResult.success) {
-      destroyedCount += 1;
-    }
-  }
-  fleetRecord.responseEntityIDs = [];
-  fleetRecord.responseTargetID = 0;
-  fleetRecord.responseDespawnAtMs = 0;
-  fleetRecord.responseRetreating = false;
-  return destroyedCount;
-}
-
-function spawnResponseWingForFleet(scene, fleetRecord, aggressorEntity, responsePlan, options = {}) {
+function startOnGridHaulerDelivery(
+  scene,
+  fleetRecord,
+  haulerEntity,
+  now,
+  options = {},
+) {
   if (
     !scene ||
     !fleetRecord ||
-    !aggressorEntity ||
-    !responsePlan ||
-    responsePlan.amount <= 0 ||
-    !String(responsePlan.profileQuery || "").trim()
+    fleetRecord.onGridSupport !== true ||
+    !haulerEntity ||
+    !npcService.getControllerByEntityID(toInt(haulerEntity.itemID, 0)) ||
+    fleetRecord.externalContainerCollector ||
+    String(fleetRecord.supportHaulerState || "idle") !== "idle"
   ) {
-    return {
-      success: true,
-      data: {
-        spawnedEntityIDs: [],
-        standingProfile: responsePlan ? responsePlan.standingProfile : null,
-        selectionName: null,
-      },
-    };
-  }
-
-  const spawnResult = spawnFleetWing(scene.systemID, aggressorEntity, {
-    amount: responsePlan.amount,
-    profileQuery: responsePlan.profileQuery,
-    entityScopeMetadata: buildChildEntityScopeMetadata(aggressorEntity),
-    preferredTargetID: normalizePositiveInteger(aggressorEntity.itemID, 0),
-    originAnchor: fleetRecord.originAnchor,
-    warpIn: true,
-    landingRadiusMeters: toFiniteNumber(
-      config.miningNpcFleetLandingRadiusMeters,
-      DEFAULT_MINING_WARP_LANDING_RADIUS_METERS,
-    ),
-  });
-  if (!spawnResult.success || !spawnResult.data) {
-    return spawnResult;
-  }
-
-  const spawnedEntityIDs = buildSpawnResultEntityIDs(spawnResult);
-  issueResponseOrders(
-    spawnedEntityIDs,
-    normalizePositiveInteger(aggressorEntity.itemID, 0),
-  );
-  fleetRecord.responseEntityIDs.push(...spawnedEntityIDs);
-  fleetRecord.responseSelectionName =
-    spawnResult.data.selectionName ||
-    String(responsePlan.profileQuery || "").trim() ||
-    null;
-  fleetRecord.responseTargetID = normalizePositiveInteger(aggressorEntity.itemID, 0);
-  fleetRecord.responseRetreating = false;
-  fleetRecord.responseStandingClass =
-    responsePlan.standingProfile && responsePlan.standingProfile.standingClass
-      ? responsePlan.standingProfile.standingClass
-      : null;
-  fleetRecord.responseStandingValue =
-    responsePlan.standingProfile && Number.isFinite(responsePlan.standingProfile.standing)
-      ? responsePlan.standingProfile.standing
-      : 0;
-  fleetRecord.lastResponseAtMs = Math.max(0, toInt(options.nowMs, Date.now()));
-  fleetRecord.responseDespawnAtMs =
-    fleetRecord.lastResponseAtMs + getResponseRetreatDelayMs();
-  return {
-    success: true,
-    data: {
-      spawnedEntityIDs,
-      standingProfile: responsePlan.standingProfile || null,
-      selectionName: fleetRecord.responseSelectionName,
-    },
-  };
-}
-
-function triggerFleetAggression(scene, fleetRecord, options = {}) {
-  if (!scene || !fleetRecord) {
-    return {
-      success: false,
-      errorMsg: "SCENE_NOT_FOUND",
-    };
-  }
-
-  const now = Math.max(0, toInt(options.nowMs, Date.now()));
-  const aggressorEntity =
-    options.aggressorEntity ||
-    scene.getEntityByID(normalizePositiveInteger(options.aggressorEntityID, 0)) ||
-    null;
-  if (!aggressorEntity) {
-    return {
-      success: false,
-      errorMsg: "AGGRESSOR_NOT_FOUND",
-    };
-  }
-
-  const aggressionEventAtMs = Math.max(
-    0,
-    toInt(options.aggressionEventAtMs, now),
-  );
-  if (
-    options.force !== true &&
-    aggressionEventAtMs > 0 &&
-    aggressionEventAtMs <= Math.max(0, toInt(fleetRecord.lastProcessedAggressionAtMs, 0))
-  ) {
-    return {
-      success: true,
-      data: {
-        noChange: true,
-        standingClass: fleetRecord.responseStandingClass || null,
-        retreatedCount: 0,
-        responseSpawnedCount: 0,
-      },
-    };
-  }
-
-  if (isManagedIndustrialMiningFleet(fleetRecord)) {
-    const aggressorEntityID =
-      normalizePositiveInteger(
-        aggressorEntity.itemID,
-        0,
-      );
-    fleetRecord.lastAggressorID = aggressorEntityID;
-    fleetRecord.lastAggressedAtMs =
-      aggressionEventAtMs || now;
-    fleetRecord.lastProcessedAggressionAtMs =
-      aggressionEventAtMs || now;
-    fleetRecord.responseTargetID = aggressorEntityID;
-    fleetRecord.responseStandingClass = null;
-    fleetRecord.responseStandingValue = 0;
-    if (fleetRecord.responseEntityIDs.length > 0) {
-      destroyResponseWing(fleetRecord);
-    }
-
-    const assessment = options.panic === true
-      ? {
-          engage: false,
-          reason: "PANIC_ORDER",
-        }
-      : assessManagedIndustrialThreat(
-          scene,
-          fleetRecord,
-          aggressorEntity,
-        );
-    if (assessment.engage === true) {
-      const participatingFleets = (
-        Array.isArray(assessment.participatingFleets) &&
-        assessment.participatingFleets.length > 0
-          ? assessment.participatingFleets
-          : [fleetRecord]
-      );
-      for (const participatingFleet of participatingFleets) {
-        clearFleetManualOrders([
-          ...participatingFleet.minerEntityIDs,
-          ...participatingFleet.haulerEntityIDs,
-        ]);
-        deactivateMiningModulesForFleet(
-          scene,
-          participatingFleet,
-          options.hooks,
-          "defense",
-        );
-      }
-      const defenseResult =
-        beginManagedFleetDroneDefense(
-          scene,
-          fleetRecord,
-          aggressorEntity,
-          assessment,
-          { nowMs: now },
-        );
-      if (defenseResult.success === true) {
-        const defenseDecision = {
-          reason: assessment.reason,
-          targetSizeClass:
-            assessment.targetSizeClass,
-          defensePower: assessment.defensePower,
-          threatPower: assessment.threatPower,
-          requiredOvermatch:
-            assessment.requiredOvermatch,
-          participatingFleetCount:
-            participatingFleets.length,
-          participatingFleetIDs:
-            participatingFleets.map(
-              (participatingFleet) =>
-                toInt(
-                  participatingFleet.fleetID,
-                  0,
-                ),
-            ),
-          decidedAtMs: now,
-        };
-        for (const participatingFleet of participatingFleets) {
-          participatingFleet.state = "defending";
-          participatingFleet.resumeAtMs = 0;
-          participatingFleet.lastAggressorID =
-            aggressorEntityID;
-          participatingFleet.lastAggressedAtMs =
-            aggressionEventAtMs || now;
-          participatingFleet.lastProcessedAggressionAtMs =
-            aggressionEventAtMs || now;
-          participatingFleet.responseTargetID =
-            aggressorEntityID;
-          participatingFleet.defenseDecision = {
-            ...defenseDecision,
-          };
-        }
-        return {
-          success: true,
-          data: {
-            standingClass: null,
-            standingValue: 0,
-            defended: true,
-            defenseDecision:
-              defenseDecision,
-            defensiveFlightCount: toInt(
-              defenseResult.data &&
-                defenseResult.data.flightCount,
-              0,
-            ),
-            retreatedCount: 0,
-            responseSpawnedCount: 0,
-            responseSelectionName: null,
-          },
-        };
-      }
-      assessment.reason =
-        defenseResult.errorMsg ||
-        "DEFENSE_LAUNCH_FAILED";
-    }
-
-    const retreatedCount = retreatFleetToOrigin(
-      fleetRecord,
-      {
-        state:
-          options.panic === true
-            ? "panic"
-            : "aggressed",
-        resumeAtMs:
-          now +
-          Math.max(
-            1_000,
-            toInt(
-              config
-                .miningNpcManagedDefenseRetreatCooldownMs,
-              DEFAULT_MANAGED_MINING_DEFENSE_RETREAT_COOLDOWN_MS,
-            ),
-          ),
-        scene,
-        hooks: options.hooks,
-        nowMs: now,
-        reason: String(
-          assessment.reason || "unsafe_threat",
-        ).toLowerCase(),
-      },
-    );
-    fleetRecord.defenseDecision = {
-      reason:
-        assessment.reason || "UNSAFE_THREAT",
-      targetSizeClass:
-        assessment.targetSizeClass || null,
-      decidedAtMs: now,
-    };
-    return {
-      success: true,
-      data: {
-        standingClass: null,
-        standingValue: 0,
-        defended: false,
-        defenseDecision:
-          fleetRecord.defenseDecision,
-        retreatedCount,
-        responseSpawnedCount: 0,
-        responseSelectionName: null,
-      },
-    };
-  }
-
-  const autoResumeDelayMs = Math.max(
-    0,
-    toInt(
-      config.miningNpcFleetAutoResumeDelayMs,
-      0,
-    ),
-  );
-  const responsePlan = resolveResponsePlan(scene, fleetRecord, aggressorEntity, {
-    amount: options.responseAmount,
-    profileQuery: options.responseQuery,
-  });
-  const retreatedCount = retreatFleetToOrigin(fleetRecord, {
-    state: options.panic === true ? "panic" : "aggressed",
-    resumeAtMs: autoResumeDelayMs > 0 ? (now + autoResumeDelayMs) : 0,
-    scene,
-    hooks: options.hooks,
-    nowMs: now,
-    reason: "aggression",
-  });
-  fleetRecord.lastAggressorID = normalizePositiveInteger(aggressorEntity.itemID, 0);
-  fleetRecord.lastAggressedAtMs = aggressionEventAtMs || now;
-  fleetRecord.lastProcessedAggressionAtMs = aggressionEventAtMs || now;
-  fleetRecord.responseTargetID = normalizePositiveInteger(aggressorEntity.itemID, 0);
-
-  let responseSpawnedCount = 0;
-  let responseSelectionName = fleetRecord.responseSelectionName || null;
-  const cooldownMs = getResponseCooldownMs();
-  const hasDeployableResponse =
-    responsePlan.amount > 0 &&
-    String(responsePlan.profileQuery || "").trim().length > 0;
-  const canSpawnResponse =
-    hasDeployableResponse &&
-    (
-      fleetRecord.lastResponseAtMs <= 0 ||
-      cooldownMs <= 0 ||
-      now - fleetRecord.lastResponseAtMs >= cooldownMs ||
-      fleetRecord.responseEntityIDs.length <= 0
-    );
-
-  if (canSpawnResponse) {
-    const spawnResult = spawnResponseWingForFleet(
-      scene,
-      fleetRecord,
-      aggressorEntity,
-      responsePlan,
-      { nowMs: now },
-    );
-    if (!spawnResult.success) {
-      return spawnResult;
-    }
-    responseSpawnedCount = Array.isArray(spawnResult.data && spawnResult.data.spawnedEntityIDs)
-      ? spawnResult.data.spawnedEntityIDs.length
-      : 0;
-    responseSelectionName = spawnResult.data && spawnResult.data.selectionName
-      ? spawnResult.data.selectionName
-      : responseSelectionName;
-  } else if (fleetRecord.responseEntityIDs.length > 0) {
-    issueResponseOrders(
-      fleetRecord.responseEntityIDs,
-      normalizePositiveInteger(aggressorEntity.itemID, 0),
-    );
-    fleetRecord.responseDespawnAtMs = now + getResponseRetreatDelayMs();
-  }
-
-  return {
-    success: true,
-    data: {
-      standingClass:
-        responsePlan.standingProfile && responsePlan.standingProfile.standingClass
-          ? responsePlan.standingProfile.standingClass
-          : null,
-      standingValue:
-        responsePlan.standingProfile && Number.isFinite(responsePlan.standingProfile.standing)
-          ? responsePlan.standingProfile.standing
-          : 0,
-      retreatedCount,
-      responseSpawnedCount,
-      responseSelectionName,
-    },
-  };
-}
-
-function handleMiningFleetCommand(session, argumentText) {
-  if (!session || !session.characterID || !session._space) {
-    return {
-      success: false,
-      message: "You must be in space before using /npcminer.",
-    };
-  }
-
-  const parsedArguments = parseNpcSpawnArguments(
-    argumentText,
-    Math.max(1, toInt(config.miningNpcFleetDefaultCount, DEFAULT_MINING_FLEET_COUNT)),
-  );
-  if (!parsedArguments.success) {
-    return {
-      success: false,
-      message: "Usage: /npcminer [amount] [profile|pool|group]",
-    };
-  }
-  if (parsedArguments.amount > MAX_MINING_NPC_COMMAND_SPAWN_COUNT) {
-    return {
-      success: false,
-      message: `Mining fleet spawn count must be between 1 and ${MAX_MINING_NPC_COMMAND_SPAWN_COUNT}.`,
-    };
-  }
-
-  const scene = resolveSessionScene(session);
-  const centerTarget = buildSpawnTarget(scene, session);
-  const spawnResult = spawnMiningFleetInternal(scene, {
-    systemID: session._space.systemID,
-    centerTarget,
-    preferredTargetID: normalizePositiveInteger(session._space.shipID, 0),
-    minerAmount: parsedArguments.amount,
-    minerQuery: parsedArguments.query || String(config.miningNpcFleetProfileOrPool || ""),
-    haulerAmount: Math.max(0, toInt(config.miningNpcHaulerDefaultCount, DEFAULT_MINING_HAULER_COUNT)),
-    haulerQuery: String(config.miningNpcHaulerProfileOrPool || ""),
-  });
-  if (!spawnResult.success || !spawnResult.data) {
-    const suggestions = Array.isArray(spawnResult && spawnResult.suggestions)
-      ? ` Suggestions: ${spawnResult.suggestions.join(", ")}`
-      : "";
-    return {
-      success: false,
-      message: `Mining fleet spawn failed: ${spawnResult.errorMsg || "UNKNOWN_ERROR"}.${suggestions}`.trim(),
-    };
-  }
-
-  const fleetRecord = createMiningFleetRecord({
-    source: "gm",
-    createdByCharacterID: session.characterID,
-    systemID: session._space.systemID,
-    targetShipID: session._space.shipID,
-    minerEntityIDs: spawnResult.data.minerEntityIDs,
-    haulerEntityIDs: spawnResult.data.haulerEntityIDs,
-    originAnchor: spawnResult.data.originAnchor,
-    spawnSelectionName:
-      spawnResult.data.minerSpawnResult &&
-      spawnResult.data.minerSpawnResult.data &&
-      spawnResult.data.minerSpawnResult.data.selectionName,
-    haulerSelectionName:
-      spawnResult.data.haulerSpawnResult &&
-      spawnResult.data.haulerSpawnResult.data &&
-      spawnResult.data.haulerSpawnResult.data.selectionName,
-  });
-  return {
-    success: true,
-    message: [
-      `Spawned mining fleet ${fleetRecord.fleetID} with ${fleetRecord.minerEntityIDs.length} miner hull${fleetRecord.minerEntityIDs.length === 1 ? "" : "s"}.`,
-      fleetRecord.haulerEntityIDs.length > 0
-        ? `Attached ${fleetRecord.haulerEntityIDs.length} hauler hull${fleetRecord.haulerEntityIDs.length === 1 ? "" : "s"}.`
-        : "No hauler wing was attached.",
-      `Selection: ${fleetRecord.spawnSelectionName || parsedArguments.query || resolveMiningFleetQuery(scene, "", session._space.systemID)}.`,
-      "The fleet is transient only and will not persist across restart.",
-    ].join(" "),
-  };
-}
-
-function retreatFleetToOrigin(fleetRecord, options = {}) {
-  if (!fleetRecord) {
-    return 0;
-  }
-  if (options.scene) {
-    const returnTarget =
-      options.scene.getEntityByID(
-        toInt(fleetRecord.activeAsteroidID, 0),
-      ) ||
-      options.scene.getEntityByID(
-        toInt(fleetRecord.targetShipID, 0),
-      ) ||
-      null;
-    const returnPosition =
-      returnTarget && returnTarget.position ||
-      buildFleetReferencePosition(
-        options.scene,
-        fleetRecord,
-      );
-    if (returnPosition) {
-      fleetRecord.retreatSitePosition =
-        cloneVector(returnPosition);
-    }
-  }
-  recallManagedFleetDefensiveDrones(
-    options.scene || null,
-    fleetRecord,
-    options.reason || "retreat",
-  );
-  if (
-    !fleetRecord.originAnchor ||
-    !fleetRecord.originAnchor.position
-  ) {
-    return 0;
-  }
-  clearFleetManualOrders([
-    ...(Array.isArray(fleetRecord.minerEntityIDs) ? fleetRecord.minerEntityIDs : []),
-    ...(Array.isArray(fleetRecord.haulerEntityIDs) ? fleetRecord.haulerEntityIDs : []),
-  ]);
-  if (options.scene && options.hooks) {
-    deactivateMiningModulesForFleet(
-      options.scene,
-      fleetRecord,
-      options.hooks,
-      options.reason || "state",
-    );
-  }
-  if (options.scene) {
-    deactivateMiningSupportBursts(
-      options.scene,
-      fleetRecord,
-      options.hooks || null,
-      options.reason || "state",
-    );
-  }
-  const ingressDurationMs = Math.max(
-    250,
-    toFiniteNumber(
-      config.miningNpcWarpIngressDurationMs,
-      DEFAULT_MINING_WARP_INGRESS_DURATION_MS,
-    ),
-  );
-  const entityIDs = [
-    ...(Array.isArray(fleetRecord.minerEntityIDs) ? fleetRecord.minerEntityIDs : []),
-    ...(Array.isArray(fleetRecord.haulerEntityIDs) ? fleetRecord.haulerEntityIDs : []),
-  ];
-  let retreatedCount = 0;
-  const failedEntityIDs = [];
-  const errors = [];
-  for (const entityID of entityIDs) {
-    if (!npcService.getControllerByEntityID(entityID)) {
-      continue;
-    }
-    const warpResult = npcService.runtime.warpToPoint(entityID, fleetRecord.originAnchor.position, {
-      forceImmediateStart: true,
-      broadcastWarpStartToVisibleSessions: true,
-      visibilitySuppressMs: 250,
-      ingressDurationMs,
-    });
-    if (warpResult && warpResult.success === true) {
-      retreatedCount += 1;
-    } else {
-      failedEntityIDs.push(entityID);
-      errors.push({
-        entityID,
-        errorMsg:
-          warpResult &&
-            warpResult.errorMsg ||
-          "NPC_WARP_FAILED",
-      });
-    }
-  }
-  fleetRecord.state = String(options.state || "retreating");
-  fleetRecord.resumeAtMs = Math.max(0, toInt(options.resumeAtMs, 0));
-  fleetRecord.retreatWarpPendingEntityIDs =
-    failedEntityIDs;
-  fleetRecord.nextRetreatWarpRetryAtMs =
-    failedEntityIDs.length > 0
-      ? Math.max(
-          0,
-          toInt(
-            options.nowMs,
-            options.scene &&
-              typeof options.scene.getCurrentSimTimeMs ===
-                "function"
-              ? options.scene.getCurrentSimTimeMs()
-              : Date.now(),
-          ),
-        ) + 1_000
-      : 0;
-  fleetRecord.lastRetreatWarpErrors = errors;
-  fleetRecord.nextThinkAtMs = 0;
-  return retreatedCount;
-}
-
-function retryPendingFleetRetreat(
-  scene,
-  fleetRecord,
-  now = Date.now(),
-) {
-  const pendingEntityIDs = [
-    ...new Set(
-      (
-        Array.isArray(
-          fleetRecord &&
-            fleetRecord.retreatWarpPendingEntityIDs,
-        )
-          ? fleetRecord.retreatWarpPendingEntityIDs
-          : []
-      )
-        .map((entityID) =>
-          normalizePositiveInteger(entityID, 0))
-        .filter((entityID) => entityID > 0),
-    ),
-  ];
-  if (
-    !fleetRecord ||
-    pendingEntityIDs.length <= 0 ||
-    !fleetRecord.originAnchor ||
-    !fleetRecord.originAnchor.position
-  ) {
-    return {
-      attemptedCount: 0,
-      startedCount: 0,
-      pendingCount: pendingEntityIDs.length,
-    };
-  }
-  const retryAtMs = Math.max(
-    0,
-    toInt(fleetRecord.nextRetreatWarpRetryAtMs, 0),
-  );
-  if (retryAtMs > now) {
-    return {
-      attemptedCount: 0,
-      startedCount: 0,
-      pendingCount: pendingEntityIDs.length,
-    };
-  }
-
-  const ingressDurationMs = Math.max(
-    250,
-    toFiniteNumber(
-      config.miningNpcWarpIngressDurationMs,
-      DEFAULT_MINING_WARP_INGRESS_DURATION_MS,
-    ),
-  );
-  const remainingEntityIDs = [];
-  const errors = [];
-  let attemptedCount = 0;
-  let startedCount = 0;
-  for (const entityID of pendingEntityIDs) {
-    if (!npcService.getControllerByEntityID(entityID)) {
-      continue;
-    }
-    const entity =
-      scene &&
-      typeof scene.getEntityByID === "function"
-        ? scene.getEntityByID(entityID)
-        : null;
-    if (
-      entity &&
-      (
-        entity.mode === "WARP" ||
-        entity.pendingWarp ||
-        entity.warpState ||
-        entity.sessionlessWarpIngress
-      )
-    ) {
-      remainingEntityIDs.push(entityID);
-      continue;
-    }
-    attemptedCount += 1;
-    const warpResult = npcService.runtime.warpToPoint(
-      entityID,
-      fleetRecord.originAnchor.position,
-      {
-        forceImmediateStart: true,
-        broadcastWarpStartToVisibleSessions: true,
-        visibilitySuppressMs: 250,
-        ingressDurationMs,
-      },
-    );
-    if (warpResult && warpResult.success === true) {
-      startedCount += 1;
-    } else {
-      remainingEntityIDs.push(entityID);
-      errors.push({
-        entityID,
-        errorMsg:
-          warpResult &&
-            warpResult.errorMsg ||
-          "NPC_WARP_FAILED",
-      });
-    }
-  }
-  fleetRecord.retreatWarpPendingEntityIDs =
-    remainingEntityIDs;
-  fleetRecord.nextRetreatWarpRetryAtMs =
-    remainingEntityIDs.length > 0
-      ? Math.max(0, toInt(now, Date.now())) + 1_000
-      : 0;
-  fleetRecord.lastRetreatWarpErrors = errors;
-  return {
-    attemptedCount,
-    startedCount,
-    pendingCount: remainingEntityIDs.length,
-  };
-}
-
-function handleMiningFleetAggroCommand(session, argumentText, options = {}) {
-  if (!session || !session.characterID || !session._space) {
-    return {
-      success: false,
-      message: "You must be in space before using /npcmineraggro.",
-    };
-  }
-
-  const fleets = getMiningFleetsForSystem(session._space.systemID)
-    .map((fleetRecord) => pruneMiningFleet(fleetRecord))
-    .filter(Boolean);
-  if (fleets.length <= 0) {
-    return {
-      success: false,
-      message: "No tracked mining fleets are active in your current system.",
-    };
-  }
-
-  const parsedArguments = parseNpcSpawnArguments(
-    argumentText,
-    Math.max(1, toInt(config.miningNpcResponseDefaultCount, DEFAULT_MINING_RESPONSE_COUNT)),
-  );
-  if (!parsedArguments.success) {
-    return {
-      success: false,
-      message: "Usage: /npcmineraggro [amount] [profile|pool|group]",
-    };
-  }
-  if (parsedArguments.amount > MAX_MINING_NPC_COMMAND_SPAWN_COUNT) {
-    return {
-      success: false,
-      message: `Mining response spawn count must be between 1 and ${MAX_MINING_NPC_COMMAND_SPAWN_COUNT}.`,
-    };
-  }
-
-  const scene = resolveSessionScene(session);
-  const aggressorEntity = scene && scene.getEntityByID(
-    normalizePositiveInteger(session._space.shipID, 0),
-  );
-  if (!scene || !aggressorEntity) {
-    return {
-      success: false,
-      message: "Unable to resolve your active ship for /npcmineraggro.",
-    };
-  }
-
-  let retreatedCount = 0;
-  let responseSpawnedCount = 0;
-  let lastSelectionName = null;
-  let lastStandingClass = null;
-  for (const fleetRecord of fleets) {
-    const aggressionResult = triggerFleetAggression(scene, fleetRecord, {
-      aggressorEntity,
-      responseAmount: parsedArguments.amount,
-      responseQuery:
-        parsedArguments.query ||
-        String(config.miningNpcResponseProfileOrPool || DEFAULT_MINING_RESPONSE_QUERY),
-      panic: options.panic === true,
-      force: true,
-      nowMs: Date.now(),
-      aggressionEventAtMs: Date.now(),
-    });
-    if (!aggressionResult.success) {
-      return {
-        success: false,
-        message: `Mining response spawn failed: ${aggressionResult.errorMsg || "UNKNOWN_ERROR"}.`,
-      };
-    }
-    retreatedCount += Math.max(0, toInt(aggressionResult.data && aggressionResult.data.retreatedCount, 0));
-    responseSpawnedCount += Math.max(
-      0,
-      toInt(aggressionResult.data && aggressionResult.data.responseSpawnedCount, 0),
-    );
-    if (aggressionResult.data && aggressionResult.data.responseSelectionName) {
-      lastSelectionName = aggressionResult.data.responseSelectionName;
-    }
-    if (aggressionResult.data && aggressionResult.data.standingClass) {
-      lastStandingClass = aggressionResult.data.standingClass;
-    }
-  }
-
-  return {
-    success: true,
-    message: [
-      `Simulated aggression against ${fleets.length} tracked mining fleet${fleets.length === 1 ? "" : "s"}.`,
-      retreatedCount > 0
-        ? `${retreatedCount} miner/hauler hull${retreatedCount === 1 ? "" : "s"} initiated retreat warp.`
-        : "No miner retreat warp was needed.",
-      responseSpawnedCount > 0
-        ? `Spawned ${responseSpawnedCount} response hull${responseSpawnedCount === 1 ? "" : "s"} from ${lastSelectionName || parsedArguments.query || String(config.miningNpcResponseProfileOrPool || DEFAULT_MINING_RESPONSE_QUERY)}.`
-        : "No additional response hulls were required.",
-      lastStandingClass
-        ? `Standing class resolved as ${lastStandingClass}.`
-        : "Standing class resolution was unavailable.",
-    ].join(" "),
-  };
-}
-
-function handleMiningFleetClearCommand(session) {
-  const systemID = normalizePositiveInteger(
-    session &&
-      session._space &&
-      session._space.systemID,
-    0,
-  );
-  if (!systemID) {
-    return {
-      success: false,
-      message: "You must be in space before using /npcminerclear.",
-    };
-  }
-
-  const fleets = getMiningFleetsForSystem(systemID);
-  let destroyedCount = 0;
-  for (const fleetRecord of fleets) {
-    destroyedCount += destroyFleetEntities(fleetRecord, {
-      reason: "gm_clear",
-    });
-    releaseManagedFleetResources(fleetRecord, "gm_clear");
-    miningFleetStateByID.delete(fleetRecord.fleetID);
-  }
-
-  return {
-    success: true,
-    message: `Cleared ${fleets.length} tracked mining fleet${fleets.length === 1 ? "" : "s"} and destroyed ${destroyedCount} associated NPC hull${destroyedCount === 1 ? "" : "s"}.`,
-  };
-}
-
-function formatFleetSummary(scene, fleetRecord) {
-  const cargoState = scene ? getFleetCargoState(scene, fleetRecord) : {
-    minerUsedVolumeM3: 0,
-    minerCapacityM3: 0,
-    haulerCapacityM3: 0,
-    minerFillRatio: 0,
-  };
-  const nextHaulerMs = Math.max(
-    0,
-    toInt(fleetRecord.haulerNextArrivalAtMs, 0) - Date.now(),
-  );
-  return [
-    `fleet ${fleetRecord.fleetID}`,
-    `state=${fleetRecord.state}`,
-    `miners=${fleetRecord.minerEntityIDs.length}`,
-    `haulers=${fleetRecord.haulerEntityIDs.length}`,
-    `response=${fleetRecord.responseEntityIDs.length}`,
-    fleetRecord.lastAggressorID > 0
-      ? `aggressor=${fleetRecord.lastAggressorID}`
-      : "aggressor=none",
-    fleetRecord.responseStandingClass
-      ? `standing=${fleetRecord.responseStandingClass}`
-      : "standing=unknown",
-    fleetRecord.haulerEntityIDs.length > 0
-      ? `haulerEta=${Math.ceil(nextHaulerMs / 1000)}s`
-      : "haulerEta=off",
-    `cargo=${cargoState.minerUsedVolumeM3.toFixed(1)}/${cargoState.minerCapacityM3.toFixed(1)}m3`,
-  ].join(", ");
-}
-
-function handleMiningFleetStatusCommand(session) {
-  const systemID = normalizePositiveInteger(
-    session &&
-      session._space &&
-      session._space.systemID,
-    0,
-  );
-  if (!systemID) {
-    return {
-      success: false,
-      message: "You must be in space before using /npcminerstatus.",
-    };
-  }
-
-  const scene = resolveSessionScene(session);
-  const fleets = getMiningFleetsForSystem(systemID)
-    .map((fleetRecord) => pruneMiningFleet(fleetRecord))
-    .filter(Boolean);
-  if (fleets.length <= 0) {
-    return {
-      success: true,
-      message: "No tracked mining fleets are active in your current system.",
-    };
-  }
-
-  return {
-    success: true,
-    message: `Tracked mining fleets in system ${systemID}: ${fleets.map((fleetRecord) => formatFleetSummary(scene, fleetRecord)).join("; ")}.`,
-  };
-}
-
-function handleMiningFleetRetreatCommand(session) {
-  const systemID = normalizePositiveInteger(session && session._space && session._space.systemID, 0);
-  if (!systemID) {
-    return {
-      success: false,
-      message: "You must be in space before using /npcminerretreat.",
-    };
-  }
-  const fleets = getMiningFleetsForSystem(systemID)
-    .map((fleetRecord) => pruneMiningFleet(fleetRecord))
-    .filter(Boolean);
-  if (fleets.length <= 0) {
-    return {
-      success: false,
-      message: "No tracked mining fleets are active in your current system.",
-    };
-  }
-  let retreatedCount = 0;
-  for (const fleetRecord of fleets) {
-    retreatedCount += retreatFleetToOrigin(fleetRecord, {
-      state: "retreating",
-    });
-  }
-  return {
-    success: true,
-    message: `Retreated ${retreatedCount} miner/hauler hull${retreatedCount === 1 ? "" : "s"} across ${fleets.length} fleet${fleets.length === 1 ? "" : "s"}.`,
-  };
-}
-
-function handleMiningFleetResumeCommand(session) {
-  const systemID = normalizePositiveInteger(session && session._space && session._space.systemID, 0);
-  if (!systemID) {
-    return {
-      success: false,
-      message: "You must be in space before using /npcminerresume.",
-    };
-  }
-  const fleets = getMiningFleetsForSystem(systemID)
-    .map((fleetRecord) => pruneMiningFleet(fleetRecord))
-    .filter(Boolean);
-  if (fleets.length <= 0) {
-    return {
-      success: false,
-      message: "No tracked mining fleets are active in your current system.",
-    };
-  }
-  for (const fleetRecord of fleets) {
-    fleetRecord.state = "mining";
-    fleetRecord.resumeAtMs = 0;
-    fleetRecord.nextThinkAtMs = 0;
-  }
-  return {
-    success: true,
-    message: `Resumed ${fleets.length} tracked mining fleet${fleets.length === 1 ? "" : "s"}.`,
-  };
-}
-
-function handleMiningFleetHaulCommand(session) {
-  const systemID = normalizePositiveInteger(session && session._space && session._space.systemID, 0);
-  if (!systemID) {
-    return {
-      success: false,
-      message: "You must be in space before using /npcminerhaul.",
-    };
-  }
-  const fleets = getMiningFleetsForSystem(systemID)
-    .map((fleetRecord) => pruneMiningFleet(fleetRecord))
-    .filter(Boolean);
-  if (fleets.length <= 0) {
-    return {
-      success: false,
-      message: "No tracked mining fleets are active in your current system.",
-    };
-  }
-  for (const fleetRecord of fleets) {
-    fleetRecord.state = "hauling";
-    fleetRecord.nextThinkAtMs = 0;
-    fleetRecord.haulCompleteAtMs = 0;
-  }
-  return {
-    success: true,
-    message: `Forced hauling behavior on ${fleets.length} tracked mining fleet${fleets.length === 1 ? "" : "s"}.`,
-  };
-}
-
-function resolveStartupFleetCount() {
-  return Math.max(0, toInt(config.miningNpcStartupFleetCount, 0));
-}
-
-function handleSceneCreated(scene) {
-  if (!scene || config.miningNpcStartupEnabled !== true) {
-    return;
-  }
-  const allowedSystemIDs = parseSystemIdList(config.miningNpcStartupSystemIDs);
-  if (allowedSystemIDs.length > 0 && !allowedSystemIDs.includes(toInt(scene.systemID, 0))) {
-    return;
-  }
-
-  const startupKey = `${toInt(scene.systemID, 0)}:${resolveStartupFleetCount()}`;
-  if (startupSceneSeedSet.has(startupKey)) {
-    return;
-  }
-  startupSceneSeedSet.add(startupKey);
-
-  const fleetCount = resolveStartupFleetCount();
-  if (fleetCount <= 0) {
-    return;
-  }
-
-  ensureSceneMiningState(scene);
-  const centerTarget = buildSpawnTarget(scene);
-  for (let index = 0; index < fleetCount; index += 1) {
-    const operatorKind = "startup_industrial_crew";
-    const operatorID =
-      `${toInt(scene.systemID, 0)}:${index + 1}`;
-    const minerAmount = Math.max(
-      1,
-      toInt(
-        config.miningNpcStartupFleetMinerCount,
-        config.miningNpcFleetDefaultCount ||
-          DEFAULT_MINING_FLEET_COUNT,
-      ),
-    );
-    const haulerAmount = Math.max(
-      0,
-      toInt(
-        config.miningNpcStartupFleetHaulerCount,
-        config.miningNpcHaulerDefaultCount ||
-          DEFAULT_MINING_HAULER_COUNT,
-      ),
-    );
-    const spawnResult = spawnMiningFleetInternal(scene, {
-      systemID: scene.systemID,
-      centerTarget,
-      preferredTargetID: 0,
-      minerAmount,
-      minerQuery: String(config.miningNpcStartupFleetProfileOrPool || config.miningNpcFleetProfileOrPool || ""),
-      haulerAmount,
-      haulerQuery: String(config.miningNpcStartupHaulerProfileOrPool || config.miningNpcHaulerProfileOrPool || ""),
-      physicalShipLimit: minerAmount + haulerAmount,
-      operatorKind,
-      operatorID,
-    });
-    if (!spawnResult.success || !spawnResult.data) {
-      continue;
-    }
-    createMiningFleetRecord({
-      scene,
-      source: "startup",
-      startupKey: `${scene.systemID}:${index + 1}`,
-      operatorKind,
-      operatorID,
-      physicalShipLimit: minerAmount + haulerAmount,
-      systemID: scene.systemID,
-      targetShipID: 0,
-      minerEntityIDs: spawnResult.data.minerEntityIDs,
-      haulerEntityIDs: spawnResult.data.haulerEntityIDs,
-      originAnchor: spawnResult.data.originAnchor,
-      onGridSupport: true,
-      spawnSelectionName:
-        spawnResult.data.minerSpawnResult &&
-        spawnResult.data.minerSpawnResult.data &&
-        spawnResult.data.minerSpawnResult.data.selectionName,
-      haulerSelectionName:
-        spawnResult.data.haulerSpawnResult &&
-        spawnResult.data.haulerSpawnResult.data &&
-        spawnResult.data.haulerSpawnResult.data.selectionName,
-    });
-  }
-}
-
-function deactivateMiningModulesForEntity(scene, entity, hooks, reason = "state") {
-  if (!scene || !entity || !hooks || typeof hooks.buildNpcPseudoSession !== "function") {
-    return;
-  }
-  const pseudoSession = hooks.buildNpcPseudoSession(entity);
-  for (const moduleItem of getNpcFittedModuleItems(entity)) {
-    const effectRecord =
-      typeof hooks.findMiningEffectRecordForModule === "function"
-        ? hooks.findMiningEffectRecordForModule(moduleItem)
-        : getEffectTypeRecord(toInt(moduleItem && moduleItem.effectID, 0));
-    if (!effectRecord) {
-      continue;
-    }
-    const activeEffect = entity.activeModuleEffects instanceof Map
-      ? entity.activeModuleEffects.get(toInt(moduleItem.itemID, 0))
-      : null;
-    if (!activeEffect) {
-      continue;
-    }
-    scene.deactivateGenericModule(pseudoSession, moduleItem.itemID, {
-      reason,
-    });
-  }
-}
-
-function deactivateMiningModulesForFleet(scene, fleetRecord, hooks, reason = "state") {
-  for (const entityID of Array.isArray(fleetRecord && fleetRecord.minerEntityIDs) ? fleetRecord.minerEntityIDs : []) {
-    const entity = scene.getEntityByID(entityID);
-    if (!entity) {
-      continue;
-    }
-    deactivateMiningModulesForEntity(scene, entity, hooks, reason);
-  }
-}
-
-function startHaulCycle(scene, fleetRecord, now, hooks) {
-  if (!scene || !fleetRecord || fleetRecord.haulerEntityIDs.length <= 0) {
     return false;
   }
-  clearFleetManualOrders(fleetRecord.minerEntityIDs);
-  deactivateMiningModulesForFleet(scene, fleetRecord, hooks, "cargo");
-  const gatherTarget =
-    scene.getEntityByID(toInt(fleetRecord.activeAsteroidID, 0)) ||
-    scene.getEntityByID(toInt(fleetRecord.targetShipID, 0)) ||
-    null;
-  const gatherPoint =
-    (gatherTarget && gatherTarget.position) ||
-    (fleetRecord.originAnchor && fleetRecord.originAnchor.position) ||
-    { x: 0, y: 0, z: 0 };
+  const cargoState = getNpcMiningCargoFullState(
+    haulerEntity,
+    DEFAULT_MINING_HAULER_CARGO_CAPACITY_M3,
+  );
+  if (
+    cargoState.usedVolumeM3 <= 0 ||
+    (options.force !== true && !cargoState.operationallyFull)
+  ) {
+    return false;
+  }
+  if (!fleetRecord.originAnchor || !fleetRecord.originAnchor.position) {
+    return false;
+  }
   const ingressDurationMs = Math.max(
     250,
     toFiniteNumber(
@@ -8143,26 +8336,28 @@ function startHaulCycle(scene, fleetRecord, now, hooks) {
       DEFAULT_MINING_WARP_INGRESS_DURATION_MS,
     ),
   );
-  for (const [index, entityID] of fleetRecord.haulerEntityIDs.entries()) {
-    npcService.runtime.warpToPoint(entityID, buildMiningWarpLandingPoint(
-      gatherPoint,
-      index,
-      fleetRecord.haulerEntityIDs.length,
-      Math.max(
-        250,
-        toFiniteNumber(config.miningNpcHaulerLandingRadiusMeters, 750),
-      ),
-    ), {
+  const returnPosition =
+    buildFleetReferencePosition(scene, fleetRecord) ||
+    cloneVector(haulerEntity.position);
+  npcService.runtime.warpToPoint(
+    haulerEntity.itemID,
+    fleetRecord.originAnchor.position,
+    {
       forceImmediateStart: true,
       broadcastWarpStartToVisibleSessions: true,
       visibilitySuppressMs: 250,
       ingressDurationMs,
-    });
-  }
-  fleetRecord.state = "hauling";
-  fleetRecord.haulerNextArrivalAtMs = 0;
-  fleetRecord.haulCompleteAtMs =
-    now +
+    },
+  );
+  fleetRecord.supportHaulerState = "delivering";
+  fleetRecord.supportHaulerEntityID = toInt(
+    haulerEntity.itemID,
+    0,
+  );
+  fleetRecord.supportHaulerReturnPosition =
+    cloneVector(returnPosition);
+  fleetRecord.supportHaulerDeliveryCompleteAtMs =
+    toInt(now, Date.now()) +
     ingressDurationMs +
     Math.max(
       500,
@@ -8171,18 +8366,24 @@ function startHaulCycle(scene, fleetRecord, now, hooks) {
         DEFAULT_MINING_HAULER_UNLOAD_DURATION_MS,
       ),
     );
-  fleetRecord.nextThinkAtMs = fleetRecord.haulCompleteAtMs;
+  fleetRecord.haulerOperationallyFull = false;
   return true;
 }
 
-function completeHaulCycle(scene, fleetRecord, now) {
-  let hauledVolumeM3 = 0;
-  for (const entityID of Array.isArray(fleetRecord && fleetRecord.minerEntityIDs) ? fleetRecord.minerEntityIDs : []) {
-    const entity = scene.getEntityByID(entityID);
-    if (!entity) {
-      continue;
-    }
-    hauledVolumeM3 += clearNpcMiningCargo(entity);
+function tickOnGridHaulerDelivery(scene, fleetRecord, now) {
+  const supportHaulerState = String(
+    fleetRecord.supportHaulerState || "idle",
+  );
+  if (supportHaulerState === "idle") {
+    return false;
+  }
+  const haulerEntity = scene.getEntityByID(
+    toInt(fleetRecord.supportHaulerEntityID, 0),
+  );
+  if (!haulerEntity) {
+    fleetRecord.supportHaulerState = "idle";
+    fleetRecord.supportHaulerEntityID = 0;
+    return false;
   }
   const ingressDurationMs = Math.max(
     250,
@@ -8191,127 +8392,165 @@ function completeHaulCycle(scene, fleetRecord, now) {
       DEFAULT_MINING_WARP_INGRESS_DURATION_MS,
     ),
   );
-  if (fleetRecord.originAnchor && fleetRecord.originAnchor.position) {
-    for (const entityID of Array.isArray(fleetRecord.haulerEntityIDs) ? fleetRecord.haulerEntityIDs : []) {
-      npcService.runtime.warpToPoint(entityID, fleetRecord.originAnchor.position, {
+  if (
+    supportHaulerState === "delivering" &&
+    now >= toFiniteNumber(
+      fleetRecord.supportHaulerDeliveryCompleteAtMs,
+      0,
+    )
+  ) {
+    const deliveredVolumeM3 = clearNpcMiningCargo(haulerEntity);
+    fleetRecord.lastHauledVolumeM3 = deliveredVolumeM3;
+    fleetRecord.lastHauledAtMs = now;
+    fleetRecord.supportDeliveryCount =
+      Math.max(0, toInt(fleetRecord.supportDeliveryCount, 0)) + 1;
+    npcService.runtime.warpToPoint(
+      haulerEntity.itemID,
+      fleetRecord.supportHaulerReturnPosition ||
+        buildFleetReferencePosition(scene, fleetRecord),
+      {
         forceImmediateStart: true,
         broadcastWarpStartToVisibleSessions: true,
         visibilitySuppressMs: 250,
         ingressDurationMs,
-      });
-    }
-  }
-  fleetRecord.lastHauledVolumeM3 = hauledVolumeM3;
-  fleetRecord.lastHauledAtMs = now;
-  fleetRecord.haulerNextArrivalAtMs = now + getHaulerRepeatDelayMs();
-  fleetRecord.state = "haulereturn";
-  fleetRecord.haulerReturnAtMs = now + ingressDurationMs;
-  fleetRecord.nextThinkAtMs = fleetRecord.haulerReturnAtMs;
-}
-
-function shouldTriggerHauling(scene, fleetRecord, noAsteroidsRemain = false, now = Date.now()) {
-  if (!scene || !fleetRecord || fleetRecord.haulerEntityIDs.length <= 0) {
-    return false;
-  }
-  if (
-    toFiniteNumber(fleetRecord.haulerNextArrivalAtMs, 0) > 0 &&
-    now < toFiniteNumber(fleetRecord.haulerNextArrivalAtMs, 0)
-  ) {
-    return false;
-  }
-  const cargoState = getFleetCargoState(scene, fleetRecord);
-  const thresholdRatio = Math.max(
-    0.01,
-    Math.min(
-      1,
-      toFiniteNumber(
-        config.miningNpcHaulThresholdRatio,
-        DEFAULT_MINING_HAUL_THRESHOLD_RATIO,
-      ),
-    ),
-  );
-  if (noAsteroidsRemain && cargoState.minerUsedVolumeM3 > 0) {
+      },
+    );
+    fleetRecord.supportHaulerState = "returning";
+    fleetRecord.supportHaulerReturnAtMs =
+      now + ingressDurationMs;
     return true;
   }
-  return cargoState.minerFillRatio >= thresholdRatio;
-}
-
-function getManagedRetreatCooldownMs() {
-  return Math.max(
-    1_000,
-    toInt(
-      config
-        .miningNpcManagedDefenseRetreatCooldownMs,
-      DEFAULT_MANAGED_MINING_DEFENSE_RETREAT_COOLDOWN_MS,
-    ),
-  );
-}
-
-function isManagedRetreatThreatStillPresent(
-  scene,
-  fleetRecord,
-  now,
-) {
-  const scanRangeMeters = Math.max(
-    0,
-    toFiniteNumber(
-      config.miningNpcManagedDefenseScanRangeMeters,
-      DEFAULT_MANAGED_MINING_DEFENSE_SCAN_RANGE_METERS,
-    ),
-  );
-  const sitePosition =
-    fleetRecord.retreatSitePosition ||
-    (
-      scene.getEntityByID(
-        toInt(fleetRecord.activeAsteroidID, 0),
-      ) ||
-      scene.getEntityByID(
-        toInt(fleetRecord.targetShipID, 0),
-      ) ||
-      {}
-    ).position ||
-    null;
-  const interactionSource =
-    getFleetEntities(scene, fleetRecord)[0] ||
-    null;
-  const lastAggressor = scene.getEntityByID(
-    toInt(fleetRecord.lastAggressorID, 0),
-  );
   if (
-    lastAggressor &&
-    (
-      !interactionSource ||
-      canEntitiesInteractLocally(
-        interactionSource,
-        lastAggressor,
-      )
-    ) &&
-    (
-      !sitePosition ||
-      !lastAggressor.position ||
-      distance(
-        sitePosition,
-        lastAggressor.position,
-      ) <= scanRangeMeters
+    supportHaulerState === "returning" &&
+    now >= toFiniteNumber(fleetRecord.supportHaulerReturnAtMs, 0)
+  ) {
+    fleetRecord.supportHaulerState = "idle";
+    fleetRecord.supportHaulerEntityID = 0;
+    fleetRecord.supportHaulerDeliveryCompleteAtMs = 0;
+    fleetRecord.supportHaulerReturnAtMs = 0;
+    fleetRecord.supportHaulerReturnPosition = null;
+    return false;
+  }
+  return true;
+}
+
+function validateManagedIndustrialCrewMemberPresentation(
+  entity,
+  entityRecord,
+  affiliation,
+) {
+  if (
+    !entity ||
+    !entityRecord ||
+    !affiliation
+  ) {
+    return {
+      success: false,
+      errorMsg:
+        "MANAGED_INDUSTRIAL_CREW_PRESENTATION_REQUIRED",
+    };
+  }
+  const expected = {
+    ownerID: affiliation.pilotCharacterID,
+    corporationID: affiliation.corporationID,
+    allianceID: affiliation.allianceID,
+    warFactionID: affiliation.warFactionID,
+  };
+  const actualEntity = {
+    ownerID: normalizePositiveInteger(entity.ownerID, 0),
+    corporationID: normalizePositiveInteger(
+      entity.corporationID,
+      0,
+    ),
+    allianceID: Math.max(0, toInt(entity.allianceID, 0)),
+    warFactionID: Math.max(
+      0,
+      toInt(entity.warFactionID, 0),
+    ),
+  };
+  const actualRecord = {
+    ownerID: normalizePositiveInteger(
+      entityRecord.ownerID,
+      0,
+    ),
+    corporationID: normalizePositiveInteger(
+      entityRecord.corporationID,
+      0,
+    ),
+    allianceID: Math.max(
+      0,
+      toInt(entityRecord.allianceID, 0),
+    ),
+    warFactionID: Math.max(
+      0,
+      toInt(entityRecord.warFactionID, 0),
+    ),
+  };
+  if (
+    Object.keys(expected).some(
+      (key) =>
+        actualEntity[key] !== expected[key] ||
+        actualRecord[key] !== expected[key],
     )
   ) {
     return {
-      entity: lastAggressor,
-      reason: "LAST_AGGRESSOR_PRESENT",
+      success: false,
+      errorMsg:
+        "MANAGED_INDUSTRIAL_CREW_AFFILIATION_MISMATCH",
+      data: {
+        expected,
+        actualEntity,
+        actualRecord,
+      },
     };
   }
-  const proactiveThreat =
-    scanManagedIndustrialFleetThreat(
-      scene,
-      fleetRecord,
-      now,
-    );
-  return proactiveThreat && proactiveThreat.entity
-    ? {
-        entity: proactiveThreat.entity,
-        reason: "HOSTILE_NPC_PRESENT",
-      }
-    : null;
+  if (
+    entity.nativeNpc !== true ||
+    entity.nativeNpcOccupied !== true ||
+    entityRecord.nativeNpc !== true ||
+    entityRecord.nativeNpcOccupied !== true ||
+    entityRecord.loadoutGoverned !== true
+  ) {
+    return {
+      success: false,
+      errorMsg:
+        "MANAGED_INDUSTRIAL_CREW_NATIVE_GOVERNANCE_REQUIRED",
+    };
+  }
+  const entityBounty = Number(entity.bounty);
+  const recordBounty = Number(entityRecord.bounty);
+  if (
+    !Number.isFinite(entityBounty) ||
+    entityBounty !== 0 ||
+    !Number.isFinite(recordBounty) ||
+    recordBounty !== 0
+  ) {
+    return {
+      success: false,
+      errorMsg:
+        "MANAGED_INDUSTRIAL_CREW_ZERO_BOUNTY_REQUIRED",
+    };
+  }
+  if (
+    normalizePositiveInteger(entity.characterID, 0) > 0 ||
+    normalizePositiveInteger(
+      entity.pilotCharacterID,
+      0,
+    ) > 0 ||
+    normalizePositiveInteger(
+      entity.npcPilotCharacterID,
+      0,
+    ) !== affiliation.pilotCharacterID
+  ) {
+    return {
+      success: false,
+      errorMsg:
+        "MANAGED_INDUSTRIAL_CREW_PILOT_PRESENTATION_MISMATCH",
+    };
+  }
+  return {
+    success: true,
+  };
 }
 
 function warpManagedFleetBackToAssignedSite(
@@ -8381,608 +8620,16 @@ function warpManagedFleetBackToAssignedSite(
   return true;
 }
 
-function tickMiningFleet(scene, fleetRecord, now, hooks) {
-  if (!scene || !fleetRecord || !hooks) {
-    return;
-  }
-
-  const thinkIntervalMs = Math.max(
-    250,
-    toFiniteNumber(config.miningNpcFleetThinkIntervalMs, 1_000),
-  );
-  if (toFiniteNumber(fleetRecord.nextThinkAtMs, 0) > now) {
-    return;
-  }
-  fleetRecord.nextThinkAtMs = now + thinkIntervalMs;
-
-  const retreatRetry = retryPendingFleetRetreat(
-    scene,
-    fleetRecord,
-    now,
-  );
-  if (
-    retreatRetry.pendingCount > 0 ||
-    retreatRetry.startedCount > 0
-  ) {
-    return;
-  }
-
-  const latestAggression = getLatestFleetAggression(scene, fleetRecord, now);
-  if (
-    latestAggression &&
-    latestAggression.lastAggressedAtMs >
-      Math.max(0, toInt(fleetRecord.lastProcessedAggressionAtMs, 0))
-  ) {
-    triggerFleetAggression(scene, fleetRecord, {
-      aggressorEntity: latestAggression.aggressorEntity,
-      aggressionEventAtMs: latestAggression.lastAggressedAtMs,
-      nowMs: now,
-      hooks,
-    });
-  }
-
-  if (
-    isManagedIndustrialMiningFleet(fleetRecord) &&
-    fleetRecord.state === "defending"
-  ) {
-    const defenseState =
-      maintainManagedFleetDroneDefense(
-        scene,
-        fleetRecord,
-        now,
-      );
-    if (
-      defenseState.active === true ||
-      defenseState.retreated === true
-    ) {
-      return;
-    }
-  }
-
-  if (
-    isManagedIndustrialMiningFleet(fleetRecord) &&
-    (
-      fleetRecord.state === "aggressed" ||
-      fleetRecord.state === "panic"
-    )
-  ) {
-    if (
-      now <
-      toFiniteNumber(fleetRecord.resumeAtMs, 0)
-    ) {
-      return;
-    }
-    const remainingThreat =
-      isManagedRetreatThreatStillPresent(
-        scene,
-        fleetRecord,
-        now,
-      );
-    if (remainingThreat) {
-      fleetRecord.resumeAtMs =
-        now + getManagedRetreatCooldownMs();
-      fleetRecord.lastAggressorID = toInt(
-        remainingThreat.entity.itemID,
-        0,
-      );
-      return;
-    }
-    if (
-      !warpManagedFleetBackToAssignedSite(
-        scene,
-        fleetRecord,
-        now,
-      )
-    ) {
-      fleetRecord.resumeAtMs =
-        now + getManagedRetreatCooldownMs();
-    }
-    return;
-  }
-
-  if (
-    isManagedIndustrialMiningFleet(fleetRecord) &&
-    fleetRecord.state === "returning_to_site"
-  ) {
-    if (
-      now >=
-      toFiniteNumber(
-        fleetRecord.managedSiteReturnAtMs,
-        0,
-      )
-    ) {
-      fleetRecord.state = "mining";
-      fleetRecord.managedSiteReturnAtMs = 0;
-      fleetRecord.retreatSitePosition = null;
-      fleetRecord.lastManagedThreatScanAtMs = -1;
-    } else {
-      return;
-    }
-  }
-
-  if (
-    isManagedIndustrialMiningFleet(fleetRecord) &&
-    fleetRecord.state === "mining"
-  ) {
-    // A newly materialized crew starts at its safe origin and warps onto the
-    // assigned site. Scanning that destination while every hull is still in
-    // ingress can detect a belt rat, attempt to retreat to the current origin,
-    // and put the fleet into a cooldown even though no retreat warp started.
-    // Wait for the complete crew to land before making the first threat
-    // decision.
-    if (isFleetWarpInProgress(scene, fleetRecord)) {
-      return;
-    }
-    const proactiveThreat =
-      scanManagedIndustrialFleetThreat(
-        scene,
-        fleetRecord,
-        now,
-      );
-    if (
-      proactiveThreat &&
-      proactiveThreat.entity
-    ) {
-      triggerFleetAggression(scene, fleetRecord, {
-        aggressorEntity: proactiveThreat.entity,
-        aggressionEventAtMs: now,
-        nowMs: now,
-        hooks,
-        force: true,
-        proactive: true,
-      });
-      if (fleetRecord.state !== "mining") {
-        return;
-      }
-    }
-  }
-
-  if (fleetRecord.responseEntityIDs.length > 0) {
-    const activeResponseTarget = scene.getEntityByID(toInt(fleetRecord.responseTargetID, 0));
-    if (activeResponseTarget && fleetRecord.responseRetreating !== true) {
-      issueResponseOrders(fleetRecord.responseEntityIDs, activeResponseTarget.itemID);
-    }
-    if (
-      fleetRecord.responseDespawnAtMs > 0 &&
-      now >= fleetRecord.responseDespawnAtMs
-    ) {
-      if (fleetRecord.responseRetreating === true) {
-        destroyResponseWing(fleetRecord);
-      } else {
-        retreatResponseWingToOrigin(fleetRecord, { nowMs: now });
-      }
-    }
-  }
-
-  if (
-    (fleetRecord.state === "aggressed" || fleetRecord.state === "panic") &&
-    fleetRecord.resumeAtMs > 0 &&
-    now >= fleetRecord.resumeAtMs &&
-    fleetRecord.responseEntityIDs.length <= 0
-  ) {
-    fleetRecord.state = "mining";
-    fleetRecord.resumeAtMs = 0;
-  }
-
-  if (fleetRecord.state === "external_hauling") {
-    if (
-      now >=
-      toFiniteNumber(fleetRecord.haulCompleteAtMs, 0)
-    ) {
-      destroyFleetEntities(fleetRecord, {
-        scene,
-        reason: "external_departure",
-      });
-      releaseManagedFleetResources(
-        fleetRecord,
-        "external_departure",
-      );
-      miningFleetStateByID.delete(fleetRecord.fleetID);
-    }
-    return;
-  }
-  if (fleetRecord.state === "hauling") {
-    if (now >= toFiniteNumber(fleetRecord.haulCompleteAtMs, 0)) {
-      completeHaulCycle(scene, fleetRecord, now);
-    }
-    return;
-  }
-  if (fleetRecord.state === "haulereturn") {
-    if (now >= toFiniteNumber(fleetRecord.haulerReturnAtMs, 0)) {
-      fleetRecord.state = "mining";
-      fleetRecord.haulerReturnAtMs = 0;
-    }
-    return;
-  }
-  if (fleetRecord.state !== "mining") {
-    return;
-  }
-
-  maintainMiningSupportBursts(
-    scene,
-    fleetRecord,
-    hooks,
-  );
-  processOnGridMiningSupport(scene, fleetRecord, now, hooks);
-
-  const availableTargetEntries = resolveAvailableMineableTargetEntries(scene, fleetRecord);
-  if (availableTargetEntries.length <= 0) {
-    if (fleetRecord.onGridSupport === true) {
-      for (const minerEntityID of fleetRecord.minerEntityIDs || []) {
-        const minerEntity = scene.getEntityByID(minerEntityID);
-        if (minerEntity) {
-          routeMinerCargoToJetcans(
-            scene,
-            fleetRecord,
-            minerEntity,
-            now,
-            { force: true },
-          );
-        }
-      }
-      processOnGridMiningSupport(scene, fleetRecord, now, hooks);
-      const remainingMinerCargoM3 = (
-        fleetRecord.minerEntityIDs || []
-      )
-        .map((entityID) => scene.getEntityByID(entityID))
-        .filter(Boolean)
-        .reduce(
-          (sum, entity) => sum + getNpcOreCargoVolume(entity),
-          0,
-        );
-      const outstandingJetcanCount = Object.keys(
-        fleetRecord.jetcanRecordsByID || {},
-      ).length;
-      const haulerEntity = (fleetRecord.haulerEntityIDs || [])
-        .map((entityID) => scene.getEntityByID(entityID))
-        .find(Boolean) || null;
-      const haulerCargoM3 = getNpcOreCargoVolume(haulerEntity);
-      if (
-        remainingMinerCargoM3 <= 0 &&
-        outstandingJetcanCount <= 0 &&
-        haulerCargoM3 > 0 &&
-        String(fleetRecord.supportHaulerState || "idle") === "idle"
-      ) {
-        startOnGridHaulerDelivery(
-          scene,
-          fleetRecord,
-          haulerEntity,
-          now,
-          { force: true },
-        );
-      }
-      if (
-        remainingMinerCargoM3 > 0 ||
-        outstandingJetcanCount > 0 ||
-        haulerCargoM3 > 0 ||
-        String(fleetRecord.supportHaulerState || "idle") !== "idle"
-      ) {
-        return;
-      }
-    }
-    fleetRecord.activeAsteroidID = 0;
-    if (shouldTriggerHauling(scene, fleetRecord, true, now) && startHaulCycle(scene, fleetRecord, now, hooks)) {
-      return;
-    }
-    fleetRecord.state = "depleted";
-    retreatFleetToOrigin(fleetRecord, {
-      state: "depleted",
-      scene,
-      hooks,
-      reason: "depleted",
-    });
-    return;
-  }
-
-  if (shouldTriggerHauling(scene, fleetRecord, false, now) && startHaulCycle(scene, fleetRecord, now, hooks)) {
-    return;
-  }
-
-  const assignmentMap = pruneFleetMinerAssignments(scene, fleetRecord);
-  const claimCounts = buildAssignedMineableClaimCounts(scene, fleetRecord);
-  const targetAssignmentCounts = new Map();
-  const rangeBufferMeters = Math.max(
-    0,
-    toFiniteNumber(config.miningNpcFleetMiningRangeBufferMeters, 500),
-  );
-  const orbitDistanceMeters = Math.max(
-    500,
-    toFiniteNumber(config.miningNpcFleetOrbitDistanceMeters, 1_000),
-  );
-
-  for (const minerEntityID of Array.isArray(fleetRecord.minerEntityIDs) ? fleetRecord.minerEntityIDs : []) {
-    const minerEntity = scene.getEntityByID(minerEntityID);
-    if (!minerEntity || minerEntity.mode === "WARP" || minerEntity.pendingWarp) {
-      continue;
-    }
-
-    const miningModules = getNpcFittedModuleItems(minerEntity)
-      .filter((moduleItem) => isModuleOnline(moduleItem))
-      .map((moduleItem) => ({
-        moduleItem,
-        effectRecord:
-          typeof hooks.findMiningEffectRecordForModule === "function"
-            ? hooks.findMiningEffectRecordForModule(moduleItem)
-            : getEffectTypeRecord(toInt(moduleItem && moduleItem.effectID, 0)),
-      }))
-      .filter((entry) => entry.effectRecord);
-    if (miningModules.length <= 0) {
-      continue;
-    }
-
-    const primarySnapshot = hooks.buildEntityMiningSnapshot(
-      minerEntity,
-      miningModules[0].moduleItem,
-      miningModules[0].effectRecord,
-    );
-    if (!primarySnapshot) {
-      continue;
-    }
-
-    const targetEntity = chooseMineableTargetForMiner(
-      scene,
-      fleetRecord,
-      minerEntity,
-      availableTargetEntries,
-      claimCounts,
-      primarySnapshot,
-      hooks,
-    );
-    if (!targetEntity) {
-      delete assignmentMap[toInt(minerEntity.itemID, 0)];
-      continue;
-    }
-    const targetEntityID = toInt(targetEntity.itemID, 0);
-    targetAssignmentCounts.set(
-      targetEntityID,
-      toInt(targetAssignmentCounts.get(targetEntityID), 0) + 1,
-    );
-
-    const distanceToTarget = hooks.getSurfaceDistance(minerEntity, targetEntity);
-    const engagementRangeMeters = getMiningEngagementRangeMeters(
-      scene,
-      minerEntity,
-      primarySnapshot,
-      rangeBufferMeters,
-    );
-    if (distanceToTarget > engagementRangeMeters) {
-      syncMiningApproachOrder(
-        scene,
-        minerEntity,
-        targetEntity,
-        orbitDistanceMeters,
-      );
-      continue;
-    }
-
-    const targetLockResult = syncMiningTargetLock(
-      scene,
-      minerEntity,
-      targetEntity,
-      now,
-      hooks,
-    );
-    if (!targetLockResult || targetLockResult.success !== true) {
-      syncMiningApproachOrder(
-        scene,
-        minerEntity,
-        targetEntity,
-        orbitDistanceMeters,
-      );
-      continue;
-    }
-
-    syncMiningApproachOrder(
-      scene,
-      minerEntity,
-      targetEntity,
-      orbitDistanceMeters,
-    );
-    const pseudoSession = hooks.buildNpcPseudoSession(minerEntity);
-    for (const entry of miningModules) {
-      const activeEffect = minerEntity.activeModuleEffects instanceof Map
-        ? minerEntity.activeModuleEffects.get(toInt(entry.moduleItem.itemID, 0))
-        : null;
-      if (activeEffect && toInt(activeEffect.targetID, 0) !== toInt(targetEntity.itemID, 0)) {
-        scene.deactivateGenericModule(pseudoSession, entry.moduleItem.itemID, {
-          reason: "target",
-        });
-        continue;
-      }
-      if (!activeEffect) {
-      scene.activateGenericModule(pseudoSession, entry.moduleItem, entry.effectRecord.name, {
-        targetID: targetEntity.itemID,
-      });
-      }
-    }
-  }
-
-  const primaryTargetEntry = [...targetAssignmentCounts.entries()]
-    .sort((left, right) => right[1] - left[1] || left[0] - right[0])[0];
-  fleetRecord.activeAsteroidID = primaryTargetEntry ? toInt(primaryTargetEntry[0], 0) : 0;
-}
-
-function tickScene(scene, now, hooks = {}) {
-  const fleets = getMiningFleetsForSystem(scene && scene.systemID)
-    .map((fleetRecord) => pruneMiningFleet(fleetRecord))
-    .filter(Boolean);
-  if (fleets.length <= 0) {
-    return;
-  }
-  for (const fleetRecord of fleets) {
-    tickMiningFleet(scene, fleetRecord, now, hooks);
-  }
-}
-
-function resolveFleetScene(scene, fleetRecord) {
-  if (scene) {
-    return scene;
-  }
-  const runtime = getSpaceRuntime();
-  return runtime && runtime.scenes instanceof Map
-    ? runtime.scenes.get(
-        toInt(fleetRecord && fleetRecord.systemID, 0),
-      ) || null
-    : null;
-}
-
-function finalizeOnGridMiningSupport(
-  scene,
-  fleetID,
-  options = {},
-) {
-  const fleetRecord =
-    miningFleetStateByID.get(toInt(fleetID, 0)) || null;
-  if (!fleetRecord || fleetRecord.onGridSupport !== true) {
-    return {
-      success: true,
-      data: {
-        fleetID: toInt(fleetID, 0),
-        collectedCount: 0,
-      },
-    };
-  }
-  const activeScene = resolveFleetScene(scene, fleetRecord);
-  const haulerEntity = activeScene
-    ? fleetRecord.haulerEntityIDs
-      .map((entityID) => activeScene.getEntityByID(entityID))
-      .find(
-        (entity) =>
-          entity &&
-          npcService.getControllerByEntityID(
-            toInt(entity.itemID, 0),
-          ),
-      ) || null
-    : null;
-  let collectedCount = 0;
-  if (activeScene && haulerEntity) {
-    for (
-      const record of Object.values({
-        ...(fleetRecord.jetcanRecordsByID || {}),
-      })
-    ) {
-      if (!record || toInt(record.containerID, 0) <= 0) {
-        continue;
-      }
-      if (
-        collectMiningJetcan(
-          activeScene,
-          fleetRecord,
-          haulerEntity,
-          record.containerID,
-          options.hooks || null,
-          { force: true, nowMs: options.nowMs },
-        )
-      ) {
-        collectedCount += 1;
-      }
-    }
-  }
-  return {
-    success: true,
-    data: {
-      fleetID: fleetRecord.fleetID,
-      collectedCount,
-      remainingCount: Object.keys(
-        fleetRecord.jetcanRecordsByID || {},
-      ).length,
-    },
-  };
-}
-
-function cleanupMiningFleetSupport(
-  scene,
-  fleetID,
-  options = {},
-) {
-  const normalizedFleetID = toInt(fleetID, 0);
-  const fleetRecord =
-    miningFleetStateByID.get(normalizedFleetID) || null;
-  if (!fleetRecord) {
-    return {
-      success: true,
-      data: {
-        fleetID: normalizedFleetID,
-        removedCount: 0,
-      },
-    };
-  }
-  const activeScene = resolveFleetScene(scene, fleetRecord);
-  const haulerEntity =
-    activeScene &&
-    toInt(fleetRecord.activeTractorHaulerID, 0) > 0
-      ? activeScene.getEntityByID(
-          fleetRecord.activeTractorHaulerID,
-        )
-      : null;
-  deactivateFleetTractor(
-    activeScene,
-    fleetRecord,
-    haulerEntity,
-    options.hooks || null,
-    "cleanup",
-  );
-  let removedCount = 0;
-  let preservedCount = 0;
-  for (
-    const record of Object.values({
-      ...(fleetRecord.jetcanRecordsByID || {}),
-    })
-  ) {
-    if (!record || toInt(record.containerID, 0) <= 0) {
-      continue;
-    }
-    if (
-      options.removePersistentCargo !== true &&
-      (
-        record.external === true ||
-        fleetRecord.cargoTransient === false
-      )
-    ) {
-      // External cans belong to another actor, while non-transient mining
-      // cans are the employer's settled cargo. Drop only fleet bookkeeping;
-      // destroying either container here would erase cargo during stand-down.
-      detachMiningJetcanRecord(
-        fleetRecord,
-        record.containerID,
-      );
-      preservedCount += 1;
-      continue;
-    }
-    removeMiningJetcan(
-      activeScene,
-      fleetRecord,
-      record.containerID,
-      { removeContents: true },
-    );
-    removedCount += 1;
-  }
-  if (options.unregister === true) {
-    releaseManagedFleetResources(
-      fleetRecord,
-      options.reason || "support_cleanup",
-    );
-    miningFleetStateByID.delete(normalizedFleetID);
-  }
-  return {
-    success: true,
-    data: {
-      fleetID: normalizedFleetID,
-      removedCount,
-      preservedCount,
-    },
-  };
-}
-
 module.exports = {
   appendNpcMiningCargo,
   clearNpcMiningCargo,
+  getNpcOreCargoSummary,
+  getMiningFleetsForSystem,
+  getMiningFleetsForScene,
   estimateNpcMiningVolume,
   getNpcCargoCapacityM3,
   getNpcCargoCapacityM3ForTypeID,
   getNpcOreCargoItems,
-  getNpcOreCargoSummary,
-  getMiningFleetsForSystem,
   getManagedMiningFleet,
   settleManagedMiningFleetCargo,
   destroyManagedMiningFleet,
@@ -8992,9 +8639,10 @@ module.exports = {
   spawnManagedMiningHauler,
   finalizeOnGridMiningSupport,
   cleanupMiningFleetSupport,
-  pruneMiningFleet,
   registerAmbientMiningFleet,
+  pruneMiningFleet,
   handleSceneCreated,
+  handleSceneDisposed,
   handleMiningFleetCommand,
   handleMiningFleetAggroCommand,
   handleMiningFleetClearCommand,
@@ -9004,22 +8652,16 @@ module.exports = {
   handleMiningFleetHaulCommand,
   tickScene,
   _testing: {
+    MINING_FLEET_LIFETIME_MS,
+    spawnFleetWing,
+    spawnMiningFleetInternal,
     buildCappedGroupProfilePlan,
     normalizeManagedIndustrialCrewRoster,
     rollbackManagedIndustrialCrewSpawn,
     applyManagedIndustrialCrewMemberState,
-    spawnFleetWing,
-    spawnMiningFleetInternal,
-    createMiningFleetRecord,
-    getSecurityBandForSystemID,
-    resolveMiningFleetQuery,
-    resolveMiningHaulerQuery,
-    resolveResponsePlan,
-    shouldTriggerHauling,
     retreatFleetToOrigin,
     retryPendingFleetRetreat,
     isFleetWarpInProgress,
-    triggerFleetAggression,
     assessManagedIndustrialThreat,
     normalizeManagedThreatDoctrine,
     listCoLocatedManagedIndustrialFleets,
@@ -9029,14 +8671,6 @@ module.exports = {
     recallManagedFleetDefensiveDrones,
     getNpcMiningCargoFullState,
     getNpcCargoCapacityM3,
-    buildMiningMovementOrder,
-    areManualOrdersEquivalent,
-    applyPassiveMiningFleetOverrides,
-    syncMiningApproachOrder,
-    chooseFleetMineableTarget,
-    chooseMineableTargetForMiner,
-    syncMiningTargetLock,
-    tickMiningFleet,
     processOnGridMiningSupport,
     routeMinerCargoToJetcans,
     collectMiningJetcan,
@@ -9045,13 +8679,25 @@ module.exports = {
     maintainMiningSupportBursts,
     deactivateMiningSupportBursts,
     applyMiningFleetCommandBurstAffinity,
+    createMiningFleetRecord,
+    parseMiningFleetCommandArguments,
+    resolveNearestMineableTargetForKind,
+    getMiningFleetsForScene,
+    getSecurityBandForSystemID,
+    resolveMiningFleetQuery,
+    resolveMiningHaulerQuery,
+    resolveResponsePlan,
+    shouldTriggerHauling,
+    triggerFleetAggression,
+    buildMiningMovementOrder,
+    areManualOrdersEquivalent,
+    applyPassiveMiningFleetOverrides,
+    syncMiningApproachOrder,
+    chooseFleetMineableTarget,
+    chooseMineableTargetForMiner,
+    syncMiningTargetLock,
+    tickMiningFleet,
     clearState() {
-      for (const fleetRecord of [...miningFleetStateByID.values()]) {
-        cleanupMiningFleetRuntimeResources(null, fleetRecord, {
-          reason: "test_clear",
-        });
-        releaseManagedFleetResources(fleetRecord, "test_clear");
-      }
       miningFleetStateByID.clear();
       startupSceneSeedSet.clear();
       nextMiningFleetID = 1;

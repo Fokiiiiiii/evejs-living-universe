@@ -1,7 +1,18 @@
+"use strict";
+
+const {
+  cloneVector,
+} = require("../../common/vector");
+
+const {
+  toFiniteNumber,
+} = require("../../common/numbers");
+
 const path = require("path");
 
 const config = require(path.join(__dirname, "../../config"));
 const asteroidData = require(path.join(__dirname, "./asteroidData"));
+const { mulberry32 } = require(path.join(__dirname, "../../common/random"));
 const {
   resolveItemByTypeID,
 } = require(path.join(__dirname, "../../services/inventory/itemTypeRegistry"));
@@ -159,11 +170,6 @@ const GENERATED_ORE_ASTEROID_SHELL_TYPE_IDS = Object.freeze([
   64077,
 ]);
 
-function toFiniteNumber(value, fallback = 0) {
-  const numeric = Number(value);
-  return Number.isFinite(numeric) ? numeric : fallback;
-}
-
 function toPositiveInt(value, fallback = 0) {
   const numeric = Math.trunc(Number(value) || 0);
   return numeric > 0 ? numeric : fallback;
@@ -180,14 +186,6 @@ function clamp(value, minimum, maximum) {
     return maximum;
   }
   return value;
-}
-
-function cloneVector(vector, fallback = { x: 0, y: 0, z: 0 }) {
-  return {
-    x: toFiniteNumber(vector && vector.x, fallback.x),
-    y: toFiniteNumber(vector && vector.y, fallback.y),
-    z: toFiniteNumber(vector && vector.z, fallback.z),
-  };
 }
 
 function addVectors(left, right) {
@@ -234,15 +232,10 @@ function normalizeVector(vector, fallback = { x: 1, y: 0, z: 0 }) {
   return scaleVector(vector, 1 / length);
 }
 
+// The belt's seed is the generator's starting state as it is, so every belt keeps the layout it
+// has always had.
 function createRng(seed) {
-  let state = (Number(seed) || 1) >>> 0;
-  return () => {
-    state = (state + 0x6D2B79F5) >>> 0;
-    let output = state;
-    output = Math.imul(output ^ (output >>> 15), output | 1);
-    output ^= output + Math.imul(output ^ (output >>> 7), output | 61);
-    return ((output ^ (output >>> 14)) >>> 0) / 4294967296;
-  };
+  return mulberry32((Number(seed) || 1) >>> 0);
 }
 
 function buildAsteroidItemID(beltID, asteroidIndex) {

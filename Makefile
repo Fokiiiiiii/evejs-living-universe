@@ -44,7 +44,12 @@ fmt: ## Format all Go sources
 lint: vet test ## Vet and test
 
 manifest: modules ## Regenerate patches/manifest.json (v3) from overlay + baseline
-	$(GO) run ./cmd/xeve-patch manifest generate --baseline tmp/EveJS-v0.12.3.1
+	$(GO) run ./cmd/xeve-patch manifest generate \
+		--baseline tmp/EveJS-v0.12.9 \
+		--version $(VERSION) \
+		--evejs 0.12.9 \
+		--archive-name EveJS-v0.12.9-828823a.zip \
+		--archive-sha256 9A7F3F8901EDAB67DBC47B69E23CAD47D09980A49FA89EE08EF06E4A4310F96F
 
 modules: ## Regenerate patches/modules.json (module index) from the manifest
 	$(GO) run ./cmd/xeve-patch modules generate

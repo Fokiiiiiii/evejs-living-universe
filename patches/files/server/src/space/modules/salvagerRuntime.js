@@ -1,17 +1,28 @@
+"use strict";
+
+const {
+  toFiniteNumber,
+} = require("../../common/numbers");
+
 const path = require("path");
 
 const log = require(path.join(__dirname, "../../utils/logger"));
 const {
   ITEM_FLAGS,
   createSpaceItemForOwner,
-  findItemById,
-  getItemMutationVersion,
-  grantItemToOwnerLocation,
   grantItemsToCharacterLocation,
-  listContainerItems,
   moveItemToLocation,
   removeInventoryItem,
+  restoreInventoryItemChangesAtomic,
 } = require(path.join(__dirname, "../../services/inventory/itemStore"));
+const {
+  findItemById,
+  getProjectionVersion: getItemMutationVersion,
+  listContainerItems,
+} = require(path.join(
+  __dirname,
+  "../../services/inventory/simulationInventoryProjection",
+));
 const {
   getAttributeIDByNames,
   getEffectIDByNames,
@@ -27,6 +38,9 @@ const {
 } = require(path.join(__dirname, "./liveModuleAttributes"));
 const nativeNpcStore = require(path.join(__dirname, "../npc/nativeNpcStore"));
 const {
+  transferNativeWreckLootToContainer,
+} = require(path.join(__dirname, "../../services/inventory/salvageItemCustody"));
+const {
   buildChildEntityScopeMetadata,
   canEntitiesInteractLocally,
 } = require(path.join(
@@ -36,6 +50,12 @@ const {
 const {
   getActiveImplantLocationModifierSources,
 } = require(path.join(__dirname, "../../services/dogma/implants/activeImplantModifiers"));
+const {
+  LOOT_CUSTOM_INFO_KEY,
+  buildSpaceLootRightsSnapshot,
+  hasAuthoritativeSpaceLootRightsSnapshot,
+  readSpaceLootInfo,
+} = require(path.join(__dirname, "../../services/_shared/spaceLootEntitlement"));
 
 const EFFECT_SALVAGING = getEffectIDByNames("salvaging") || 2757;
 const EFFECT_SALVAGE_DRONE = getEffectIDByNames("salvageDroneEffect") || 5163;
@@ -180,11 +200,6 @@ function toPositiveInt(value, fallback = 0) {
   return numeric > 0 ? numeric : fallback;
 }
 
-function toFiniteNumber(value, fallback = 0) {
-  const numeric = Number(value);
-  return Number.isFinite(numeric) ? numeric : fallback;
-}
-
 function roundNumber(value, digits = 6) {
   return Number(toFiniteNumber(value, 0).toFixed(digits));
 }
@@ -267,6 +282,7 @@ function parseSalvageCustomInfo(customInfo) {
     const parsed = JSON.parse(customInfo);
     return parsed && typeof parsed === "object" ? parsed : {};
   } catch (_) {
+    // ignored: customInfo that is not JSON counts as empty
     return {};
   }
 }
@@ -287,6 +303,107 @@ function resolveLootContainerType() {
     return lookup.match;
   }
   return null;
+}
+
+function callSalvageMutationSafely(executor, fallbackErrorMsg) {
+  try {
+    return executor();
+  } catch (error) {
+    return {
+      success: false,
+      errorMsg:
+        String(error && error.message || "").trim() || fallbackErrorMsg,
+    };
+  }
+}
+
+function hasOwn(object, key) {
+  return Boolean(
+    object &&
+    typeof object === "object" &&
+    Object.prototype.hasOwnProperty.call(object, key),
+  );
+}
+
+function copyExplicitLootField(lootInfo, fieldName, sources = []) {
+  if (hasOwn(lootInfo, fieldName)) {
+    return;
+  }
+  for (const source of sources) {
+    if (!hasOwn(source, fieldName) || source[fieldName] === undefined) {
+      continue;
+    }
+    lootInfo[fieldName] = source[fieldName];
+    return;
+  }
+}
+
+// Salvaging a wreck with cargo replaces the wreck row with a Cargo Container.
+// That is a shape change, not a new loot-right event: the replacement must not
+// look up the owner's *current* corporation or fleet and silently mint new
+// rights. Preserve persisted evejsLoot first, then fill only fields explicitly
+// carried by the source record/live entity. Native wrecks store their snapshot
+// as top-level fields, while abandonment can still be live-only.
+function buildReplacementContainerLootCustomInfo(targetEntity, sourceRecord) {
+  const targetLootInfo = readSpaceLootInfo(targetEntity && targetEntity.customInfo);
+  const sourceLootInfo = readSpaceLootInfo(sourceRecord && sourceRecord.customInfo);
+  const lootInfo = {
+    ...targetLootInfo,
+    ...sourceLootInfo,
+  };
+  const explicitSources = [sourceRecord, targetEntity];
+
+  for (const fieldName of [
+    "corporationID",
+    "lootRightCorpID",
+    "allianceID",
+    "warFactionID",
+    "lootRightFleetID",
+  ]) {
+    copyExplicitLootField(lootInfo, fieldName, explicitSources);
+  }
+
+  const abandonmentSources = [sourceLootInfo, targetLootInfo, ...explicitSources];
+  const hasExplicitAbandonment = abandonmentSources.some(
+    (source) => hasOwn(source, "abandoned") || hasOwn(source, "lootAbandoned"),
+  );
+  if (hasExplicitAbandonment) {
+    // Abandonment is one-way. A live true therefore wins over a stale persisted
+    // false if both representations happen to be present during replacement.
+    lootInfo.abandoned = abandonmentSources.some(
+      (source) =>
+        source &&
+        (source.abandoned === true || source.lootAbandoned === true),
+    );
+  }
+
+  // Native records use lootRightsSnapshotVersion; inventory customInfo uses
+  // rightsSnapshotVersion. Only canonicalize a wreck that already carried an
+  // authoritative snapshot. Legacy wrecks deliberately resolve missing
+  // corporation/fleet fields from their owner's live membership; stamping an
+  // empty v1 snapshot here would silently revoke those pre-salvage rights.
+  const hasAuthoritativeSnapshot = Boolean(
+    hasAuthoritativeSpaceLootRightsSnapshot(sourceLootInfo) ||
+    hasAuthoritativeSpaceLootRightsSnapshot(targetLootInfo) ||
+    toPositiveInt(sourceLootInfo.lootRightsSnapshotVersion, 0) >= 1 ||
+    toPositiveInt(targetLootInfo.lootRightsSnapshotVersion, 0) >= 1 ||
+    toPositiveInt(sourceRecord && sourceRecord.lootRightsSnapshotVersion, 0) >= 1 ||
+    toPositiveInt(targetEntity && targetEntity.lootRightsSnapshotVersion, 0) >= 1
+  );
+  delete lootInfo.lootRightsSnapshotVersion;
+  if (!hasAuthoritativeSnapshot) {
+    delete lootInfo.rightsSnapshotVersion;
+  }
+  const canonicalLootInfo = hasAuthoritativeSnapshot
+    ? {
+      ...lootInfo,
+      ...buildSpaceLootRightsSnapshot(lootInfo),
+    }
+    : lootInfo;
+
+  return JSON.stringify({
+    [LOOT_CUSTOM_INFO_KEY]: canonicalLootInfo,
+  });
 }
 
 function buildSpaceContainerOptions(targetEntity, sourceRecord = null, nowMs = Date.now()) {
@@ -336,6 +453,10 @@ function buildSpaceContainerOptions(targetEntity, sourceRecord = null, nowMs = D
     createdAtMs,
     expiresAtMs: sourceExpiresAtMs > 0 ? sourceExpiresAtMs : fallbackExpiresAtMs,
     itemName: SALVAGED_LOOT_CONTAINER_NAME,
+    customInfo: buildReplacementContainerLootCustomInfo(
+      targetEntity,
+      sourceRecord,
+    ),
   };
 }
 
@@ -751,6 +872,7 @@ function resolveSalvagerActivation({
   skillMap = null,
   fittedItems = null,
   activeModuleContexts = null,
+  additionalDirectModifierEntries = null,
   options = {},
   callbacks = {},
 } = {}) {
@@ -812,7 +934,14 @@ function resolveSalvagerActivation({
     skillMap,
     fittedItems,
     activeModuleContexts,
-    { additionalLocationModifierSources },
+    {
+      additionalLocationModifierSources,
+      additionalDirectModifierEntries: Array.isArray(
+        additionalDirectModifierEntries,
+      )
+        ? additionalDirectModifierEntries
+        : [],
+    },
   );
   if (!moduleAttributes) {
     return {
@@ -878,6 +1007,9 @@ function resolveSalvagerActivation({
         ),
         maxGroupActive: Math.max(0, toInt(moduleAttributes[ATTRIBUTE_MAX_GROUP_ACTIVE], 0)),
         weaponFamily: null,
+        attributeOverrides: {
+          ...moduleAttributes,
+        },
         salvagerSnapshot: {
           maxRangeMeters,
           accessBasePercent,
@@ -933,11 +1065,11 @@ function syncSpawnedLootContainer(scene, containerRecord, callbacks = {}) {
     });
   }
 
+  // A persisted container alone is invisible to pilots already in the scene.
+  // Refuse completion so the caller restores the wreck and its contents.
   return {
-    success: true,
-    data: {
-      entity: null,
-    },
+    success: false,
+    errorMsg: "CONTAINER_SPAWN_UNAVAILABLE",
   };
 }
 
@@ -945,10 +1077,13 @@ function transferInventoryWreckLootToContainer(wreckID, containerID) {
   const changes = [];
   const contents = listContainerItems(null, wreckID, null);
   for (const item of contents) {
-    const moveResult = moveItemToLocation(
-      item.itemID,
-      containerID,
-      ITEM_FLAGS.HANGAR,
+    const moveResult = callSalvageMutationSafely(
+      () => moveItemToLocation(
+        item.itemID,
+        containerID,
+        ITEM_FLAGS.HANGAR,
+      ),
+      "LOOT_TRANSFER_FAILED",
     );
     if (!moveResult.success) {
       return {
@@ -965,55 +1100,6 @@ function transferInventoryWreckLootToContainer(wreckID, containerID) {
   };
 }
 
-function transferNativeWreckLootToContainer(wreckRecord, containerID, fallbackOwnerID = 0) {
-  const wreckID = toPositiveInt(wreckRecord && wreckRecord.wreckID, 0);
-  const changes = [];
-  const contents = nativeNpcStore.listNativeWreckItemsForWreck(wreckID);
-
-  for (const itemRecord of contents) {
-    const singleton = itemRecord && itemRecord.singleton === true;
-    const itemType = resolveItemByTypeID(itemRecord && itemRecord.typeID) || {
-      typeID: toPositiveInt(itemRecord && itemRecord.typeID, 0),
-      name: String(itemRecord && itemRecord.itemName || "Item"),
-    };
-    const quantity = singleton
-      ? 1
-      : Math.max(1, toPositiveInt(itemRecord && itemRecord.quantity, 1));
-    const ownerID = toPositiveInt(
-      (itemRecord && itemRecord.ownerID) || fallbackOwnerID,
-      0,
-    );
-    const grantResult = grantItemToOwnerLocation(
-      ownerID,
-      containerID,
-      ITEM_FLAGS.HANGAR,
-      itemType,
-      quantity,
-      {
-        singleton: singleton ? 1 : 0,
-        moduleState: itemRecord && itemRecord.moduleState
-          ? cloneValue(itemRecord.moduleState)
-          : undefined,
-      },
-    );
-    if (!grantResult.success) {
-      return {
-        success: false,
-        errorMsg: grantResult.errorMsg || "LOOT_TRANSFER_FAILED",
-        changes,
-      };
-    }
-
-    nativeNpcStore.removeNativeWreckItem(itemRecord.wreckItemID);
-    changes.push(...((grantResult.data && grantResult.data.changes) || []));
-  }
-
-  return {
-    success: true,
-    changes,
-  };
-}
-
 function replaceInventoryWreckWithLootContainer(scene, targetEntity, nowMs, callbacks = {}) {
   const wreckID = toPositiveInt(targetEntity && targetEntity.itemID, 0);
   const itemRecord = findItemById(wreckID);
@@ -1024,7 +1110,10 @@ function replaceInventoryWreckWithLootContainer(scene, targetEntity, nowMs, call
     };
   }
 
-  const createResult = createLootContainerAtWreck(targetEntity, itemRecord, nowMs);
+  const createResult = callSalvageMutationSafely(
+    () => createLootContainerAtWreck(targetEntity, itemRecord, nowMs),
+    "CONTAINER_CREATE_FAILED",
+  );
   if (!createResult.success) {
     return createResult;
   }
@@ -1036,30 +1125,31 @@ function replaceInventoryWreckWithLootContainer(scene, targetEntity, nowMs, call
     return {
       success: false,
       errorMsg: transferResult.errorMsg || "LOOT_TRANSFER_FAILED",
-      changes,
+      changes: [...changes, ...(transferResult.changes || [])],
     };
   }
   changes.push(...(transferResult.changes || []));
 
-  const removeResult = removeInventoryItem(wreckID, {
-    removeContents: false,
-  });
+  const removeResult = callSalvageMutationSafely(
+    () => removeInventoryItem(wreckID, {
+      removeContents: false,
+    }),
+    "WRECK_REMOVE_FAILED",
+  );
   if (!removeResult.success) {
-    return removeResult;
+    return {
+      success: false,
+      errorMsg: removeResult.errorMsg || "WRECK_REMOVE_FAILED",
+      changes,
+    };
   }
   changes.push(...((removeResult.data && removeResult.data.changes) || []));
-
-  if (scene && typeof scene.removeDynamicEntity === "function") {
-    scene.removeDynamicEntity(wreckID, {
-      allowSessionOwned: true,
-    });
-  }
-  syncSpawnedLootContainer(scene, container, callbacks);
 
   return {
     success: true,
     changes,
     containerID: container.itemID,
+    container,
   };
 }
 
@@ -1073,7 +1163,10 @@ function replaceNativeWreckWithLootContainer(scene, targetEntity, nowMs, callbac
     };
   }
 
-  const createResult = createLootContainerAtWreck(targetEntity, wreckRecord, nowMs);
+  const createResult = callSalvageMutationSafely(
+    () => createLootContainerAtWreck(targetEntity, wreckRecord, nowMs),
+    "CONTAINER_CREATE_FAILED",
+  );
   if (!createResult.success) {
     return createResult;
   }
@@ -1089,23 +1182,40 @@ function replaceNativeWreckWithLootContainer(scene, targetEntity, nowMs, callbac
     return {
       success: false,
       errorMsg: transferResult.errorMsg || "LOOT_TRANSFER_FAILED",
-      changes,
+      changes: [...changes, ...(transferResult.changes || [])],
+      nativeRollback: {
+        wreckRecord: cloneValue(wreckRecord),
+        removedSourceRecords: cloneValue(transferResult.removedSourceRecords || []),
+      },
     };
   }
   changes.push(...(transferResult.changes || []));
 
-  nativeNpcStore.removeNativeWreck(wreckID);
-  if (scene && typeof scene.removeDynamicEntity === "function") {
-    scene.removeDynamicEntity(wreckID, {
-      allowSessionOwned: true,
-    });
+  const removeResult = callSalvageMutationSafely(
+    () => nativeNpcStore.removeNativeWreck(wreckID),
+    "WRECK_REMOVE_FAILED",
+  );
+  if (!removeResult || removeResult.success !== true) {
+    return {
+      success: false,
+      errorMsg: removeResult && removeResult.errorMsg || "WRECK_REMOVE_FAILED",
+      changes,
+      nativeRollback: {
+        wreckRecord: cloneValue(wreckRecord),
+        removedSourceRecords: cloneValue(transferResult.removedSourceRecords || []),
+      },
+    };
   }
-  syncSpawnedLootContainer(scene, container, callbacks);
 
   return {
     success: true,
     changes,
     containerID: container.itemID,
+    container,
+    nativeRollback: {
+      wreckRecord: cloneValue(wreckRecord),
+      removedSourceRecords: cloneValue(transferResult.removedSourceRecords || []),
+    },
   };
 }
 
@@ -1118,27 +1228,40 @@ function removeSalvagedWreck(scene, targetEntity) {
     };
   }
   if (targetEntity && targetEntity.nativeNpcWreck === true) {
-    if (scene && typeof scene.removeDynamicEntity === "function") {
-      scene.removeDynamicEntity(wreckID, {
-        allowSessionOwned: true,
-      });
+    const wreckRecord = nativeNpcStore.getNativeWreck(wreckID);
+    if (!wreckRecord) {
+      return {
+        success: false,
+        errorMsg: "WRECK_NOT_FOUND",
+      };
     }
-    nativeNpcStore.removeNativeWreckCascade(wreckID);
+    const removeResult = callSalvageMutationSafely(
+      () => nativeNpcStore.removeNativeWreck(wreckID),
+      "WRECK_REMOVE_FAILED",
+    );
+    if (!removeResult || removeResult.success !== true) {
+      return {
+        success: false,
+        errorMsg: removeResult && removeResult.errorMsg || "WRECK_REMOVE_FAILED",
+      };
+    }
     return {
       success: true,
       changes: [],
+      nativeRollback: {
+        wreckRecord: cloneValue(wreckRecord),
+        removedSourceRecords: [],
+      },
     };
   }
-  const removeResult = removeInventoryItem(wreckID, {
-    removeContents: true,
-  });
+  const removeResult = callSalvageMutationSafely(
+    () => removeInventoryItem(wreckID, {
+      removeContents: true,
+    }),
+    "WRECK_REMOVE_FAILED",
+  );
   if (!removeResult.success) {
     return removeResult;
-  }
-  if (scene && typeof scene.removeDynamicEntity === "function") {
-    scene.removeDynamicEntity(wreckID, {
-      allowSessionOwned: true,
-    });
   }
   return {
     success: true,
@@ -1155,6 +1278,82 @@ function completeSuccessfulSalvage(scene, targetEntity, nowMs, callbacks = {}) {
   return removeSalvagedWreck(scene, targetEntity);
 }
 
+function restoreNativeSalvageState(nativeRollback = null) {
+  if (!nativeRollback || !nativeRollback.wreckRecord) {
+    return { success: true };
+  }
+  const wreckRecord = cloneValue(nativeRollback.wreckRecord);
+  const wreckResult = callSalvageMutationSafely(
+    () => nativeNpcStore.upsertNativeWreck(wreckRecord, {
+      transient: wreckRecord.transient === true,
+    }),
+    "NATIVE_WRECK_ROLLBACK_FAILED",
+  );
+  if (!wreckResult || wreckResult.success !== true) {
+    return {
+      success: false,
+      errorMsg: wreckResult && wreckResult.errorMsg || "NATIVE_WRECK_ROLLBACK_FAILED",
+    };
+  }
+  for (const sourceRecord of nativeRollback.removedSourceRecords || []) {
+    const itemResult = callSalvageMutationSafely(
+      () => nativeNpcStore.upsertNativeWreckItem(sourceRecord, {
+        transient: sourceRecord && sourceRecord.transient === true,
+      }),
+      "NATIVE_WRECK_ROLLBACK_FAILED",
+    );
+    if (!itemResult || itemResult.success !== true) {
+      return {
+        success: false,
+        errorMsg: itemResult && itemResult.errorMsg || "NATIVE_WRECK_ROLLBACK_FAILED",
+      };
+    }
+  }
+  return { success: true };
+}
+
+function compensateSalvageCompletion(completionResult, additionalChanges = []) {
+  const inventoryChanges = [
+    ...((completionResult && completionResult.changes) || []),
+    ...(Array.isArray(additionalChanges) ? additionalChanges : []),
+  ];
+  const inventoryResult = callSalvageMutationSafely(
+    () => restoreInventoryItemChangesAtomic(inventoryChanges),
+    "SALVAGE_INVENTORY_ROLLBACK_FAILED",
+  );
+  if (!inventoryResult || inventoryResult.success !== true) {
+    return {
+      success: false,
+      errorMsg:
+        inventoryResult && inventoryResult.errorMsg ||
+        "SALVAGE_INVENTORY_ROLLBACK_FAILED",
+    };
+  }
+  const nativeResult = restoreNativeSalvageState(
+    completionResult && completionResult.nativeRollback,
+  );
+  if (!nativeResult.success) {
+    return nativeResult;
+  }
+  return { success: true };
+}
+
+function removeSalvageSceneEntity(scene, entityID) {
+  if (!scene || typeof scene.removeDynamicEntity !== "function") {
+    return { success: true };
+  }
+  return callSalvageMutationSafely(
+    () => scene.removeDynamicEntity(entityID, {
+      allowSessionOwned: true,
+      // The compensated salvage transaction has already settled the wreck or
+      // replacement container in inventory. Generic scene persistence would
+      // otherwise try to update a removed wreck and report ITEM_NOT_FOUND.
+      persistSpaceState: false,
+    }),
+    "DYNAMIC_ENTITY_REMOVE_FAILED",
+  );
+}
+
 function syncInventoryChangesToSession(session, changes = [], callbacks = {}) {
   if (!session || !Array.isArray(changes) || changes.length <= 0) {
     return;
@@ -1169,6 +1368,44 @@ function resolveInventorySession(entity, callbacks = {}) {
     return callbacks.resolveSession(entity) || null;
   }
   return entity && entity.session ? entity.session : null;
+}
+
+function notifySalvageResult(session, targetEntity, message, rewards = []) {
+  if (!session || typeof session.sendNotification !== "function") {
+    return;
+  }
+  const entries = message === "CustomNotify"
+    ? [["notify", rewards.length === 0
+      ? "Salvaging succeeded, but nothing of value was found."
+      : `Salvaging succeeded. Recovered ${rewards.map((entry) => {
+      const type = resolveItemByTypeID(entry.itemType);
+      return `${entry.quantity} x ${type ? type.name : entry.itemType}`;
+    }).join(", ")} and placed it in your cargo hold.`]]
+    : [
+      ["itemID", targetEntity.itemID],
+      ["type", [4, targetEntity.typeID]],
+    ];
+  session.sendNotification("OnRemoteMessage", "clientID", [
+    message,
+    { type: "dict", entries },
+  ]);
+}
+
+function syncSalvageRewardsToSession(session, shipID, changes) {
+  if (!session || changes.length === 0) {
+    return;
+  }
+  // Match the cargo delivery protocol used by mining: the plural event and
+  // ShipCargo context refresh the open inventory and its count/value footer.
+  const { emitItemsChangedForSession } = require("../../services/character/characterState");
+  for (const change of changes) {
+    emitItemsChangedForSession(
+      session,
+      change.item,
+      change.previousData || change.previousState || {},
+      { locationContext: ["Ship", shipID, "ShipCargo"] },
+    );
+  }
 }
 
 function executeSalvagerCycle({
@@ -1203,8 +1440,14 @@ function executeSalvagerCycle({
   }
 
   const chancePercent = Math.max(0, toFiniteNumber(effectState.salvageChancePercent, 0));
+  const messageSession = callbacks.suppressSalvageMessages === true
+    ? null
+    : resolveInventorySession(entity, callbacks);
   const rollPercent = getRandom(callbacks) * 100;
   if (rollPercent >= chancePercent) {
+    notifySalvageResult(
+      messageSession, targetEntity, "SalvagingFailure",
+    );
     return {
       success: true,
       data: {
@@ -1234,8 +1477,15 @@ function executeSalvagerCycle({
     callbacks,
   });
   const rewardVolume = roundNumber(computeGrantVolume(rewardEntries), 6);
-  const cargoSnapshot = resolveCargoSnapshot(characterID, shipItem, fittedItems, skillMap);
-  if (!cargoSnapshot || rewardVolume > cargoSnapshot.availableVolume + 1e-6) {
+  // Drones carry the recovered items home before depositing them in ship cargo.
+  // Their inventory rows participate in the same rollback as module rewards.
+  const shipID = toPositiveInt(shipItem.itemID, toPositiveInt(entity && entity.itemID, 0));
+  const rewardLocationID = toPositiveInt(callbacks.salvageRewardLocationID, shipID);
+  const cargoSnapshot = rewardLocationID === shipID
+    ? resolveCargoSnapshot(characterID, shipItem, fittedItems, skillMap)
+    : null;
+  if (rewardLocationID === shipID &&
+      (!cargoSnapshot || rewardVolume > cargoSnapshot.availableVolume + 1e-6)) {
     return {
       success: false,
       stopReason: "cargo",
@@ -1246,29 +1496,153 @@ function executeSalvagerCycle({
     };
   }
 
-  let grantChanges = [];
-  if (rewardEntries.length > 0) {
-    const grantResult = grantItemsToCharacterLocation(
-      characterID,
-      toPositiveInt(shipItem.itemID, toPositiveInt(entity && entity.itemID, 0)),
-      ITEM_FLAGS.CARGO_HOLD,
-      rewardEntries,
-    );
-    if (!grantResult.success || !grantResult.data) {
-      return { success: false, stopReason: "cargo" };
-    }
-    grantChanges = grantResult.data.changes || [];
-    syncInventoryChangesToSession(resolveInventorySession(entity, callbacks), grantChanges, callbacks);
-  }
-
   const completionResult = completeSuccessfulSalvage(scene, targetEntity, nowMs, callbacks);
   if (!completionResult.success) {
-    return { success: false, stopReason: "target" };
+    const rollbackResult = compensateSalvageCompletion(completionResult);
+    if (!rollbackResult.success) {
+      log.error(
+        `[SalvagerRuntime] failed to compensate incomplete salvage target=${targetID}: ` +
+          rollbackResult.errorMsg,
+      );
+    }
+    return {
+      success: false,
+      stopReason: "target",
+      data: rollbackResult.success
+        ? undefined
+        : { rollbackErrorMsg: rollbackResult.errorMsg },
+    };
   }
+
+  // Rewards are deliberately granted only after the wreck replacement/removal
+  // reached its authoritative store boundary. They remain part of the same
+  // compensated saga: a failed grant, scene spawn, or scene removal restores
+  // the original wreck and all of its contents before the cycle may be retried.
+  let grantChanges = [];
+  if (rewardEntries.length > 0) {
+    const grantResult = callSalvageMutationSafely(
+      () => grantItemsToCharacterLocation(
+        characterID,
+        rewardLocationID,
+        ITEM_FLAGS.CARGO_HOLD,
+        rewardEntries,
+      ),
+      "SALVAGE_REWARD_GRANT_FAILED",
+    );
+    if (!grantResult.success || !grantResult.data) {
+      const rollbackResult = compensateSalvageCompletion(completionResult);
+      if (!rollbackResult.success) {
+        log.error(
+          `[SalvagerRuntime] failed to compensate salvage reward target=${targetID}: ` +
+            rollbackResult.errorMsg,
+        );
+      }
+      return {
+        success: false,
+        stopReason: "cargo",
+        data: rollbackResult.success
+          ? undefined
+          : { rollbackErrorMsg: rollbackResult.errorMsg },
+      };
+    }
+    grantChanges = grantResult.data.changes || [];
+  }
+
+  let replacementSpawned = false;
+  if (completionResult.container) {
+    const spawnResult = callSalvageMutationSafely(
+      () => syncSpawnedLootContainer(
+        scene,
+        completionResult.container,
+        callbacks,
+      ),
+      "CONTAINER_SPAWN_FAILED",
+    );
+    if (!spawnResult || spawnResult.success !== true) {
+      const rollbackResult = compensateSalvageCompletion(
+        completionResult,
+        grantChanges,
+      );
+      if (!rollbackResult.success) {
+        log.error(
+          `[SalvagerRuntime] failed to compensate container spawn target=${targetID}: ` +
+            rollbackResult.errorMsg,
+        );
+      }
+      return {
+        success: false,
+        stopReason: "target",
+        data: rollbackResult.success
+          ? undefined
+          : { rollbackErrorMsg: rollbackResult.errorMsg },
+      };
+    }
+    replacementSpawned = true;
+  }
+
+  let topologyRollbackErrorMsg = null;
+  const sceneRemoveResult = removeSalvageSceneEntity(scene, targetID);
+  if (sceneRemoveResult && sceneRemoveResult.success === false) {
+    const replacementCleanupResult = replacementSpawned
+      ? removeSalvageSceneEntity(scene, completionResult.containerID)
+      : { success: true };
+    if (!replacementCleanupResult || replacementCleanupResult.success !== true) {
+      // The replacement is still a live scene entity backed by the already
+      // committed container row. Rolling inventory back now would orphan that
+      // ball and make a retry duplicate both cargo and reward. Try once more to
+      // settle toward the committed replacement topology. If the old wreck
+      // still refuses removal, make it inert and surface a hard rollback error;
+      // custody remains authoritative for the replacement that is still live.
+      const settleOriginalResult = removeSalvageSceneEntity(scene, targetID);
+      if (!settleOriginalResult || settleOriginalResult.success !== true) {
+        targetEntity.salvaged = true;
+        targetEntity.salvageComplete = true;
+        topologyRollbackErrorMsg =
+          replacementCleanupResult && replacementCleanupResult.errorMsg ||
+          "SALVAGE_SCENE_ROLLBACK_FAILED";
+        log.error(
+          `[SalvagerRuntime] retained committed salvage after scene rollback failure ` +
+            `target=${targetID} container=${completionResult.containerID}: ` +
+            topologyRollbackErrorMsg,
+        );
+      }
+    } else {
+      const rollbackResult = compensateSalvageCompletion(
+        completionResult,
+        grantChanges,
+      );
+      if (!rollbackResult.success) {
+        log.error(
+          `[SalvagerRuntime] failed to compensate scene removal target=${targetID}: ` +
+            rollbackResult.errorMsg,
+        );
+      }
+      return {
+        success: false,
+        stopReason: "target",
+        data: rollbackResult.success
+          ? undefined
+          : { rollbackErrorMsg: rollbackResult.errorMsg },
+      };
+    }
+  }
+
+  syncSalvageRewardsToSession(
+    rewardLocationID === shipID ? resolveInventorySession(entity, callbacks) : null,
+    shipID,
+    grantChanges,
+  );
   syncInventoryChangesToSession(
     resolveInventorySession(entity, callbacks),
     completionResult.changes || [],
     callbacks,
+  );
+
+  notifySalvageResult(
+    messageSession,
+    targetEntity,
+    "CustomNotify",
+    rewardEntries,
   );
 
   if (callbacks && typeof callbacks.onWreckSalvaged === "function") {
@@ -1310,6 +1684,12 @@ function executeSalvagerCycle({
       rollPercent: roundNumber(rollPercent, 6),
       emptyReward: rewardEntries.length === 0,
       containerID: toPositiveInt(completionResult.containerID, 0) || null,
+      ...(topologyRollbackErrorMsg
+        ? {
+          rollbackErrorMsg: topologyRollbackErrorMsg,
+          authoritativeReplacementRetained: true,
+        }
+        : {}),
     },
   };
 }
@@ -1331,6 +1711,7 @@ module.exports = {
     buildSalvageRewardEntries,
     classifyWreckFaction,
     computeGrantVolume,
+    buildReplacementContainerLootCustomInfo,
     resolveAccessDifficultyBase,
     resolveEntitySize,
     isInventoryItemMarkedSalvaged,

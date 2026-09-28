@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::Duration as StdDuration;
+use std::time::{Duration as StdDuration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
@@ -32,6 +32,8 @@ const PRESET_JITA_ONLY: &str = "jita_only";
 const PRESET_NEW_CALDARI_ONLY: &str = "new_caldari_only";
 const JITA_SYSTEM_ID: u32 = 30000142;
 const NEW_CALDARI_SYSTEM_ID: u32 = 30000145;
+const SQLITE_BUILD_CACHE_SPILL: &str = "ON";
+const SYSTEM_SUMMARY_INSERT_BATCH_ROWS: usize = 1024;
 
 #[derive(Debug, Clone)]
 struct SeedPreset {
@@ -69,7 +71,7 @@ const MARKET_SEED_PRESETS: &[SeedPreset] = &[
 ];
 
 #[derive(Debug, Parser)]
-#[command(author, version, about = "Builds the standalone EvEJS market database")]
+#[command(author, version, about = "Eve.JS Elysian Market Seeder (by Elysian)")]
 struct Cli {
     #[arg(long, default_value = "config/market-seed.local.toml")]
     config: PathBuf,
@@ -103,10 +105,30 @@ struct BuildArgs {
         value_name = "SYSTEM_NAME"
     )]
     solar_system_names: Vec<String>,
+    #[arg(long = "region-id", value_delimiter = ',', value_name = "REGION_ID")]
+    region_ids: Vec<u32>,
+    #[arg(
+        long = "region-name",
+        value_delimiter = ',',
+        value_name = "REGION_NAME"
+    )]
+    region_names: Vec<String>,
     #[arg(long)]
     station_limit: Option<usize>,
     #[arg(long)]
     type_limit: Option<usize>,
+    #[arg(long)]
+    seed_insert_target_rows: Option<usize>,
+    #[arg(long)]
+    sqlite_temp_store: Option<String>,
+    #[arg(long)]
+    sqlite_page_size_bytes: Option<u32>,
+    #[arg(long)]
+    sqlite_cache_size_kib: Option<i32>,
+    #[arg(long)]
+    sqlite_worker_threads: Option<usize>,
+    #[arg(long)]
+    skip_analyze: bool,
 }
 
 #[derive(Debug, Args)]
@@ -175,6 +197,7 @@ struct ItemTypeRecord {
     category_id: Option<u32>,
     #[serde(rename = "groupName")]
     group_name: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     name: String,
     #[serde(rename = "basePrice")]
     base_price: Option<f64>,
@@ -184,6 +207,24 @@ struct ItemTypeRecord {
     #[serde(rename = "portionSize")]
     portion_size: Option<u32>,
     published: bool,
+}
+
+impl ItemTypeRecord {
+    fn display_name(&self) -> String {
+        let name = self.name.trim();
+        if name.is_empty() {
+            format!("Type {}", self.type_id)
+        } else {
+            name.to_string()
+        }
+    }
+}
+
+fn deserialize_nullable_string<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Clone)]
@@ -215,8 +256,9 @@ struct SeedSelection {
 }
 
 #[derive(Debug, Clone)]
-struct RegionSeedPlan {
-    region_id: u32,
+struct StationSeedChunk {
+    first_station_id: u64,
+    last_station_id: u64,
     station_count: usize,
 }
 
@@ -267,15 +309,41 @@ fn main() -> Result<()> {
 }
 
 fn build_database(config: &MarketSeedConfig, args: BuildArgs) -> Result<()> {
+    let build_started = Instant::now();
+    let mut phase_timings = Vec::<(&'static str, f64)>::new();
+    let phase_started = Instant::now();
     let spinner = new_spinner("Loading static data");
     let input = load_seed_input(config, &args)?;
+    record_phase(&mut phase_timings, "load_static_data", phase_started);
     let seed_row_count = input.stations.len() as u64 * input.item_types.len() as u64;
     let parallelism = config.build.parallelism.max(1);
+    let seed_insert_target_rows = args
+        .seed_insert_target_rows
+        .unwrap_or(config.build.seed_insert_target_rows)
+        .max(1);
+    let sqlite_temp_store = args
+        .sqlite_temp_store
+        .as_deref()
+        .unwrap_or(&config.build.sqlite_temp_store);
+    let sqlite_page_size_bytes = args
+        .sqlite_page_size_bytes
+        .unwrap_or(config.build.sqlite_page_size_bytes);
+    let sqlite_cache_size_kib = args
+        .sqlite_cache_size_kib
+        .unwrap_or(config.build.sqlite_cache_size_kib);
+    let sqlite_worker_threads = args
+        .sqlite_worker_threads
+        .unwrap_or(config.build.sqlite_worker_threads);
+    let sqlite_analyze_enabled = config.build.sqlite_analyze_enabled && !args.skip_analyze;
     let compute_pool = rayon::ThreadPoolBuilder::new()
         .num_threads(parallelism)
         .build()
         .context("failed to build seeder rayon thread pool")?;
-    let region_plans = build_region_seed_plans(&input);
+    let station_seed_chunks = build_station_seed_chunks(
+        &input.stations,
+        input.item_types.len(),
+        seed_insert_target_rows,
+    );
     spinner.finish_with_message(format!(
         "Loaded {} using {}: {} stations, {} systems, {} regions, {} market types ({} seed rows)",
         input.selection_mode,
@@ -288,6 +356,19 @@ fn build_database(config: &MarketSeedConfig, args: BuildArgs) -> Result<()> {
     ));
 
     let database_path = &config.output.database_path;
+    print_build_overview(
+        config,
+        &input,
+        database_path,
+        seed_row_count,
+        station_seed_chunks.len(),
+        seed_insert_target_rows,
+        sqlite_temp_store,
+        sqlite_page_size_bytes,
+        sqlite_cache_size_kib,
+        sqlite_worker_threads,
+        sqlite_analyze_enabled,
+    );
     if database_path.exists() {
         if !args.force {
             bail!(
@@ -295,26 +376,24 @@ fn build_database(config: &MarketSeedConfig, args: BuildArgs) -> Result<()> {
                 database_path.to_string_lossy()
             );
         }
-        fs::remove_file(database_path).with_context(|| {
-            format!(
-                "failed to remove existing market database at {}",
-                database_path.to_string_lossy()
-            )
-        })?;
     }
+    remove_sqlite_database_family(database_path)?;
 
     if let Some(parent) = database_path.parent() {
         fs::create_dir_all(parent)?;
     }
 
+    let phase_started = Instant::now();
     let mut connection = open_build_connection(
         database_path,
-        config.build.sqlite_cache_size_kib,
-        config.build.sqlite_page_size_bytes,
-        config.build.sqlite_worker_threads,
+        sqlite_cache_size_kib,
+        sqlite_page_size_bytes,
+        sqlite_worker_threads,
+        sqlite_temp_store,
     )?;
-    connection.execute_batch(SCHEMA_SQL)?;
+    record_phase(&mut phase_timings, "open_database", phase_started);
 
+    let phase_started = Instant::now();
     let static_bar = new_stage_bar(
         "Static tables",
         (input.regions.len()
@@ -330,12 +409,37 @@ fn build_database(config: &MarketSeedConfig, args: BuildArgs) -> Result<()> {
         input.stations.len(),
         input.item_types.len()
     ));
+    record_phase(&mut phase_timings, "write_static_tables", phase_started);
 
+
+    let phase_started = Instant::now();
+    let topology_rows = input.topology_regions.len()
+        + input.topology_solar_systems.len()
+        + input.topology_stations.len();
+    let topology_bar = new_stage_bar("Station topology", topology_rows as u64);
+    append_static_topology(&mut connection, &input, &topology_bar)?;
+    topology_bar.finish_with_message(format!(
+        "Station topology 100% | {} reg | {} sys | {} stn",
+        input.topology_regions.len(),
+        input.topology_solar_systems.len(),
+        input.topology_stations.len()
+    ));
+    record_phase(&mut phase_timings, "append_static_topology", phase_started);
+
+    let phase_started = Instant::now();
+    prepare_seed_pricing_types(&connection, config)?;
+    record_phase(
+        &mut phase_timings,
+        "prepare_seed_pricing_types",
+        phase_started,
+    );
+
+    let phase_started = Instant::now();
     let seed_stock_bar = new_stage_bar("Seed stock", seed_row_count);
     materialize_seed_stock(
         &mut connection,
         config,
-        &region_plans,
+        &station_seed_chunks,
         input.item_types.len(),
         &seed_stock_bar,
     )?;
@@ -343,13 +447,15 @@ fn build_database(config: &MarketSeedConfig, args: BuildArgs) -> Result<()> {
         "Seed stock 100% | {} rows",
         format_count(seed_row_count)
     ));
+    record_phase(&mut phase_timings, "materialize_seed_stock", phase_started);
 
     if config.seed.seed_buy_orders_enabled {
+        let phase_started = Instant::now();
         let buy_bar = new_stage_bar("Seed buys", seed_row_count);
         materialize_seed_buy_orders(
             &mut connection,
             config,
-            &region_plans,
+            &station_seed_chunks,
             input.item_types.len(),
             &buy_bar,
         )?;
@@ -357,8 +463,10 @@ fn build_database(config: &MarketSeedConfig, args: BuildArgs) -> Result<()> {
             "Seed buys 100% | {} rows",
             format_count(seed_row_count)
         ));
+        record_phase(&mut phase_timings, "materialize_seed_buys", phase_started);
     }
 
+    let phase_started = Instant::now();
     let summary_total_rows = input.regions.len() as u64 * input.item_types.len() as u64;
     let summary_compute_bar = new_stage_bar("Seed summaries", summary_total_rows);
     let computed_summaries = compute_pool
@@ -367,14 +475,22 @@ fn build_database(config: &MarketSeedConfig, args: BuildArgs) -> Result<()> {
         "Seed summaries 100% | {} rows",
         format_count(computed_summaries.len())
     ));
+    record_phase(
+        &mut phase_timings,
+        "compute_region_summaries",
+        phase_started,
+    );
 
+    let phase_started = Instant::now();
     let summary_write_bar = new_stage_bar("Write summaries", computed_summaries.len() as u64);
     write_seed_region_summaries(&mut connection, &computed_summaries, &summary_write_bar)?;
     summary_write_bar.finish_with_message(format!(
         "Write summaries 100% | {} rows",
         format_count(computed_summaries.len())
     ));
+    record_phase(&mut phase_timings, "write_region_summaries", phase_started);
 
+    let phase_started = Instant::now();
     let system_seed_summary_rows = input.solar_systems.len() as u64 * input.item_types.len() as u64;
     let system_summary_bar = new_stage_bar("System summaries", system_seed_summary_rows);
     compute_pool.install(|| {
@@ -390,21 +506,9 @@ fn build_database(config: &MarketSeedConfig, args: BuildArgs) -> Result<()> {
         "System summaries 100% | {} rows",
         format_count(system_seed_summary_rows)
     ));
+    record_phase(&mut phase_timings, "build_system_summaries", phase_started);
 
-    let topology_bar = new_stage_bar(
-        "Station topology",
-        (input.topology_regions.len()
-            + input.topology_solar_systems.len()
-            + input.topology_stations.len()) as u64,
-    );
-    append_static_topology(&mut connection, &input, &topology_bar)?;
-    topology_bar.finish_with_message(format!(
-        "Station topology 100% | {} reg | {} sys | {} stn",
-        input.topology_regions.len(),
-        input.topology_solar_systems.len(),
-        input.topology_stations.len()
-    ));
-
+    let phase_started = Instant::now();
     let history_total_rows =
         input.item_types.len() as u64 * u64::from(config.seed.history_days_seeded);
     let history_compute_bar = new_stage_bar("History build", history_total_rows);
@@ -419,14 +523,18 @@ fn build_database(config: &MarketSeedConfig, args: BuildArgs) -> Result<()> {
         "History build 100% | {} rows",
         format_count(history_rows.len())
     ));
+    record_phase(&mut phase_timings, "build_price_history", phase_started);
 
+    let phase_started = Instant::now();
     let history_write_bar = new_stage_bar("History write", history_rows.len() as u64);
     write_price_history_rows(&mut connection, &history_rows, &history_write_bar)?;
     history_write_bar.finish_with_message(format!(
         "History write 100% | {} rows",
         format_count(history_rows.len())
     ));
+    record_phase(&mut phase_timings, "write_price_history", phase_started);
 
+    let phase_started = Instant::now();
     let manifest = MarketManifest {
         schema_version: MARKET_SCHEMA_VERSION,
         generated_at: now_rfc3339(),
@@ -449,20 +557,25 @@ fn build_database(config: &MarketSeedConfig, args: BuildArgs) -> Result<()> {
         region_jitter_percent: config.seed.region_jitter_percent,
     };
     write_manifest(&connection, &manifest)?;
+    record_phase(&mut phase_timings, "write_manifest", phase_started);
 
+    let phase_started = Instant::now();
     let index_bar = new_stage_bar("Runtime indexes", runtime_index_statements().len() as u64);
-    build_runtime_indexes(&connection, &index_bar)?;
+    let index_timings = build_runtime_indexes(&mut connection, &index_bar)?;
     index_bar.finish_with_message(format!(
         "Runtime indexes 100% | {} indexes",
         runtime_index_statements().len()
     ));
+    record_phase(&mut phase_timings, "build_runtime_indexes", phase_started);
 
-    let finalize_bar = new_stage_bar("Finalize", 3);
-    finalize_database(&connection, &finalize_bar)?;
+    let phase_started = Instant::now();
+    let finalize_bar = new_stage_bar("Finalize", if sqlite_analyze_enabled { 3 } else { 2 });
+    finalize_database(&connection, &finalize_bar, sqlite_analyze_enabled)?;
     finalize_bar.finish_with_message(format!(
         "Market database ready at {}",
         database_path.to_string_lossy()
     ));
+    record_phase(&mut phase_timings, "finalize_database", phase_started);
 
     println!(
         "{}",
@@ -473,18 +586,117 @@ fn build_database(config: &MarketSeedConfig, args: BuildArgs) -> Result<()> {
           "selectionLabel": input.selection_label,
           "selectedSolarSystemIds": input.selected_solar_system_ids,
           "selectedSolarSystemNames": input.selected_solar_system_names,
-          "seedStations": input.stations.len(),
-          "topologyStations": input.topology_stations.len(),
+          "stations": input.stations.len(),
           "marketTypes": input.item_types.len(),
           "seedRows": seed_row_count,
           "regionSummaryRows": computed_summaries.len(),
           "systemSeedSummaryRows": system_seed_summary_rows,
           "seedBuyOrdersEnabled": config.seed.seed_buy_orders_enabled,
-          "historyDays": config.seed.history_days_seeded
+          "historyDays": config.seed.history_days_seeded,
+          "buildSettings": {
+            "sqliteCacheSizeKib": sqlite_cache_size_kib,
+            "sqlitePageSizeBytes": sqlite_page_size_bytes,
+            "sqliteWorkerThreads": sqlite_worker_threads,
+            "parallelism": parallelism,
+            "seedInsertTargetRows": seed_insert_target_rows,
+            "seedInsertChunks": station_seed_chunks.len(),
+            "sqliteTempStore": sqlite_temp_store,
+            "sqliteCacheSpill": SQLITE_BUILD_CACHE_SPILL,
+            "sqliteAnalyzeEnabled": sqlite_analyze_enabled
+          },
+          "timings": build_timing_json(&phase_timings, build_started),
+          "indexTimings": build_index_timing_json(&index_timings)
         }))?
     );
 
     Ok(())
+}
+
+fn print_build_overview(
+    config: &MarketSeedConfig,
+    input: &SeedInputData,
+    database_path: &Path,
+    seed_row_count: u64,
+    seed_insert_chunks: usize,
+    seed_insert_target_rows: usize,
+    sqlite_temp_store: &str,
+    sqlite_page_size_bytes: u32,
+    sqlite_cache_size_kib: i32,
+    sqlite_worker_threads: usize,
+    sqlite_analyze_enabled: bool,
+) {
+    let buy_rows = if config.seed.seed_buy_orders_enabled {
+        seed_row_count
+    } else {
+        0
+    };
+    println!();
+    println!("============================================================");
+    println!("  Eve.JS Elysian Market Seeder (by Elysian)");
+    println!("============================================================");
+    println!(
+        "  Selection : {} ({})",
+        input.selection_label, input.selection_mode
+    );
+    println!("  Target    : {}", database_path.to_string_lossy());
+    println!(
+        "  Static    : {} regions | {} systems | {} stations | {} market types",
+        format_count(input.regions.len()),
+        format_count(input.solar_systems.len()),
+        format_count(input.stations.len()),
+        format_count(input.item_types.len())
+    );
+    println!(
+        "  Rows      : {} sell seed | {} buy seed | {} total seed rows",
+        format_count(seed_row_count),
+        format_count(buy_rows),
+        format_count(seed_row_count + buy_rows)
+    );
+    println!(
+        "  Build     : {} chunks | target {} rows/chunk | {} workers | SQLite temp={} analyze={}",
+        format_count(seed_insert_chunks),
+        format_count(seed_insert_target_rows),
+        format_count(config.build.parallelism.max(1)),
+        sqlite_temp_store,
+        sqlite_analyze_enabled
+    );
+    println!(
+        "  SQLite    : page {} bytes | cache {} KiB | spill {} | index workers {}",
+        format_count(sqlite_page_size_bytes),
+        format_count(sqlite_cache_size_kib),
+        SQLITE_BUILD_CACHE_SPILL,
+        format_count(sqlite_worker_threads)
+    );
+    println!("============================================================");
+    println!();
+}
+
+fn remove_sqlite_database_family(path: &Path) -> Result<()> {
+    for candidate in sqlite_database_family_paths(path) {
+        if candidate.exists() {
+            fs::remove_file(&candidate).with_context(|| {
+                format!(
+                    "failed to remove existing SQLite file at {}",
+                    candidate.to_string_lossy()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn sqlite_database_family_paths(path: &Path) -> [PathBuf; 3] {
+    [
+        path.to_path_buf(),
+        sqlite_sidecar_path(path, "-wal"),
+        sqlite_sidecar_path(path, "-shm"),
+    ]
+}
+
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
 }
 
 fn rebuild_summaries_only(config: &MarketSeedConfig, region_id: Option<u32>) -> Result<()> {
@@ -554,40 +766,55 @@ fn load_seed_input(config: &MarketSeedConfig, args: &BuildArgs) -> Result<SeedIn
     let solar_systems_path = static_dir.join("solarSystems").join("data.json");
     let item_types_path = static_dir.join("itemTypes").join("data.json");
 
-    let stations_raw = fs::read_to_string(&stations_path).with_context(|| {
-        format!(
-            "failed to read market seed stations data at {}. Run tools\\DatabaseCreator\\CreateDatabase.bat if local static data has not been generated.",
-            stations_path.to_string_lossy()
-        )
-    })?;
-    let solar_systems_raw = fs::read_to_string(&solar_systems_path).with_context(|| {
-        format!(
-            "failed to read market seed solar systems data at {}. Run tools\\DatabaseCreator\\CreateDatabase.bat if local static data has not been generated.",
-            solar_systems_path.to_string_lossy()
-        )
-    })?;
-    let item_types_raw = fs::read_to_string(&item_types_path).with_context(|| {
-        format!(
-            "failed to read market seed item types data at {}. Run tools\\DatabaseCreator\\CreateDatabase.bat if local static data has not been generated.",
-            item_types_path.to_string_lossy()
-        )
-    })?;
+    let stations_raw = fs::read_to_string(&stations_path)?;
+    let solar_systems_raw = fs::read_to_string(&solar_systems_path)?;
+    let item_types_raw = fs::read_to_string(&item_types_path)?;
 
-    let mut topology_stations = serde_json::from_str::<StationsFile>(&stations_raw)?.stations;
-    let mut topology_solar_systems =
-        serde_json::from_str::<SolarSystemsFile>(&solar_systems_raw)?.solar_systems;
+    let mut stations = serde_json::from_str::<StationsFile>(&stations_raw)?.stations;
+    let solar_systems = serde_json::from_str::<SolarSystemsFile>(&solar_systems_raw)?.solar_systems;
     let mut item_types = serde_json::from_str::<ItemTypesFile>(&item_types_raw)?.item_types;
-
+    let mut topology_stations = stations.clone();
     topology_stations.sort_by_key(|station| station.station_id);
+    let mut topology_solar_systems = solar_systems.clone();
     topology_solar_systems.sort_by_key(|system| system.solar_system_id);
+    let topology_system_ids = topology_stations
+        .iter()
+        .map(|station| station.solar_system_id)
+        .collect::<BTreeSet<_>>();
+    topology_solar_systems
+        .retain(|system| topology_system_ids.contains(&system.solar_system_id));
+    let mut topology_region_map = BTreeMap::<u32, String>::new();
+    for station in &topology_stations {
+        topology_region_map
+            .entry(station.region_id)
+            .or_insert_with(|| station.region_name.clone());
+    }
+    let topology_regions = topology_region_map
+        .into_iter()
+        .map(|(region_id, region_name)| RegionRow {
+            region_id,
+            region_name,
+        })
+        .collect::<Vec<_>>();
+
+    let unnamed_type_count = item_types
+        .iter()
+        .filter(|item| item.name.trim().is_empty())
+        .count();
+    if unnamed_type_count > 0 {
+        eprintln!(
+            "Warning: {unnamed_type_count} item type(s) have no static English name; using deterministic `Type <typeID>` market labels."
+        );
+    }
+
+    stations.sort_by_key(|station| station.station_id);
     let selection = resolve_seed_selection(
         args.preset.as_deref(),
         &args.solar_system_ids,
         &args.solar_system_names,
-        &topology_solar_systems,
+        &solar_systems,
     )?;
 
-    let mut stations = topology_stations.clone();
     if !selection.solar_system_ids.is_empty() {
         let allowed_ids = selection
             .solar_system_ids
@@ -596,6 +823,13 @@ fn load_seed_input(config: &MarketSeedConfig, args: &BuildArgs) -> Result<SeedIn
             .collect::<BTreeSet<_>>();
         stations.retain(|station| allowed_ids.contains(&station.solar_system_id));
     }
+
+    apply_region_filters(
+        &mut stations,
+        &args.region_ids,
+        &args.region_names,
+        &selection.label,
+    )?;
 
     if let Some(limit) = args.station_limit {
         stations.truncate(limit);
@@ -610,10 +844,9 @@ fn load_seed_input(config: &MarketSeedConfig, args: &BuildArgs) -> Result<SeedIn
         .iter()
         .map(|station| station.solar_system_id)
         .collect::<BTreeSet<_>>();
-    let mut filtered_systems = topology_solar_systems
-        .iter()
+    let mut filtered_systems = solar_systems
+        .into_iter()
         .filter(|system| allowed_systems.contains(&system.solar_system_id))
-        .cloned()
         .collect::<Vec<_>>();
     filtered_systems.sort_by_key(|system| system.solar_system_id);
     if filtered_systems.is_empty() {
@@ -642,25 +875,18 @@ fn load_seed_input(config: &MarketSeedConfig, args: &BuildArgs) -> Result<SeedIn
             region_name,
         })
         .collect::<Vec<_>>();
-
-    let topology_system_ids = topology_stations
-        .iter()
-        .map(|station| station.solar_system_id)
-        .collect::<BTreeSet<_>>();
-    topology_solar_systems.retain(|system| topology_system_ids.contains(&system.solar_system_id));
-    let mut topology_region_map = BTreeMap::<u32, String>::new();
-    for station in &topology_stations {
-        topology_region_map
-            .entry(station.region_id)
-            .or_insert_with(|| station.region_name.clone());
-    }
-    let topology_regions = topology_region_map
-        .into_iter()
-        .map(|(region_id, region_name)| RegionRow {
-            region_id,
-            region_name,
-        })
-        .collect::<Vec<_>>();
+    let selection_label = build_selection_label(
+        &selection.label,
+        !args.region_ids.is_empty() || !args.region_names.is_empty(),
+        &regions,
+    );
+    let selection_mode = if args.region_ids.is_empty() && args.region_names.is_empty() {
+        selection.mode
+    } else if selection.solar_system_ids.is_empty() {
+        "region_selection".to_string()
+    } else {
+        "system_and_region_selection".to_string()
+    };
 
     let selected_solar_system_ids = if selection.solar_system_ids.is_empty() {
         Vec::new()
@@ -680,8 +906,8 @@ fn load_seed_input(config: &MarketSeedConfig, args: &BuildArgs) -> Result<SeedIn
     };
 
     Ok(SeedInputData {
-        selection_mode: selection.mode,
-        selection_label: selection.label,
+        selection_mode,
+        selection_label,
         selected_solar_system_ids,
         selected_solar_system_names,
         topology_regions,
@@ -745,6 +971,74 @@ fn has_required_static_tables(dir: &Path) -> bool {
     dir.join("stations").join("data.json").exists()
         && dir.join("solarSystems").join("data.json").exists()
         && dir.join("itemTypes").join("data.json").exists()
+}
+
+fn apply_region_filters(
+    stations: &mut Vec<StationRecord>,
+    region_ids: &[u32],
+    region_names: &[String],
+    base_label: &str,
+) -> Result<()> {
+    if region_ids.is_empty() && region_names.is_empty() {
+        return Ok(());
+    }
+
+    let requested_names = region_names
+        .iter()
+        .map(|name| normalize_lookup_name(name))
+        .collect::<BTreeSet<_>>();
+    let mut allowed_ids = region_ids.iter().copied().collect::<BTreeSet<_>>();
+    if !requested_names.is_empty() {
+        for station in stations.iter() {
+            if requested_names.contains(&normalize_lookup_name(&station.region_name)) {
+                allowed_ids.insert(station.region_id);
+            }
+        }
+    }
+
+    if allowed_ids.is_empty() {
+        bail!(
+            "no regions matched {:?} while applying region filters to {}",
+            region_names,
+            base_label
+        );
+    }
+
+    stations.retain(|station| allowed_ids.contains(&station.region_id));
+    if stations.is_empty() {
+        bail!(
+            "region filters left no stations for {}. Region IDs: {:?}, region names: {:?}",
+            base_label,
+            region_ids,
+            region_names
+        );
+    }
+    Ok(())
+}
+
+fn build_selection_label(
+    base_label: &str,
+    region_filter_active: bool,
+    regions: &[RegionRow],
+) -> String {
+    if !region_filter_active {
+        return base_label.to_string();
+    }
+
+    let region_label = regions
+        .iter()
+        .map(|region| format!("{} ({})", region.region_name, region.region_id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if region_label.is_empty() {
+        base_label.to_string()
+    } else {
+        format!("{} | regions: {}", base_label, region_label)
+    }
+}
+
+fn normalize_lookup_name(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
 }
 
 fn resolve_seed_selection(
@@ -959,7 +1253,7 @@ fn write_static_tables(
                 item_type.group_id.unwrap_or(0),
                 item_type.category_id.unwrap_or(0),
                 item_type.market_group_id.unwrap_or(0),
-                item_type.name,
+                item_type.display_name(),
                 item_type
                     .group_name
                     .clone()
@@ -1033,13 +1327,13 @@ fn append_static_topology(
 fn materialize_seed_stock(
     connection: &mut Connection,
     config: &MarketSeedConfig,
-    region_plans: &[RegionSeedPlan],
+    station_chunks: &[StationSeedChunk],
     market_type_count: usize,
     progress: &ProgressBar,
 ) -> Result<()> {
     let seeded_at = now_rfc3339();
     let transaction = connection.transaction()?;
-    for region_plan in region_plans {
+    for station_chunk in station_chunks {
         transaction.execute(
             "INSERT INTO seed_stock (
                station_id, solar_system_id, constellation_id, region_id, type_id, price, quantity, initial_quantity, updated_at
@@ -1051,45 +1345,42 @@ fn materialize_seed_stock(
                s.region_id,
                t.type_id,
                MAX(
-                 ?10,
+                 ?8,
                  ROUND(
                    (
-                     CASE
-                       WHEN t.base_price IS NOT NULL AND t.base_price > 0 THEN t.base_price
-                       ELSE (?1 + ((t.type_id % ?2) * ?3))
-                     END
+                     t.effective_base_price
                    ) * (
-                     1.0 + (?4 / 100.0)
-                     + ((((ABS((s.station_id * 31) + (t.type_id * 17)) % 2001) - 1000) / 1000.0) * (?5 / 100.0))
-                     + ((((ABS((s.region_id * 13) + (t.type_id * 7)) % 2001) - 1000) / 1000.0) * (?6 / 100.0))
+                     1.0 + (?1 / 100.0)
+                     + ((((((s.station_id * 31) + (t.type_id * 17)) % 2001) - 1000) / 1000.0) * (?2 / 100.0))
+                     + ((((((s.region_id * 13) + (t.type_id * 7)) % 2001) - 1000) / 1000.0) * (?3 / 100.0))
                    ),
                    2
                  )
                ),
-               ?7,
-               ?7,
-               ?8
+               ?4,
+               ?4,
+               ?5
              FROM stations AS s
-             CROSS JOIN market_types AS t
-             WHERE s.region_id = ?9",
+             CROSS JOIN seed_pricing_types AS t
+             WHERE s.station_id >= ?6
+               AND s.station_id <= ?7",
             params![
-                config.seed.fallback_base_price,
-                config.seed.fallback_type_modulus,
-                config.seed.fallback_type_step,
                 config.seed.seed_markup_percent,
                 config.seed.station_jitter_percent,
                 config.seed.region_jitter_percent,
                 config.seed.default_quantity_per_station_type,
                 &seeded_at,
-                region_plan.region_id,
-                config.seed.price_floor,
+                station_chunk.first_station_id,
+                station_chunk.last_station_id,
+                config.seed.price_floor
             ],
         )?;
-        progress.inc((region_plan.station_count * market_type_count) as u64);
+        progress.inc((station_chunk.station_count * market_type_count) as u64);
         progress.set_message(format!(
-            "Seed stock {:>3}% | reg {} | rows {}",
+            "Seed stock {:>3}% | stn {}-{} | rows {}",
             progress.position().saturating_mul(100) / progress.length().unwrap_or(1),
-            region_plan.region_id,
+            station_chunk.first_station_id,
+            station_chunk.last_station_id,
             format_count(progress.position())
         ));
     }
@@ -1100,13 +1391,13 @@ fn materialize_seed_stock(
 fn materialize_seed_buy_orders(
     connection: &mut Connection,
     config: &MarketSeedConfig,
-    region_plans: &[RegionSeedPlan],
+    station_chunks: &[StationSeedChunk],
     market_type_count: usize,
     progress: &ProgressBar,
 ) -> Result<()> {
     let seeded_at = now_rfc3339();
     let transaction = connection.transaction()?;
-    for region_plan in region_plans {
+    for station_chunk in station_chunks {
         transaction.execute(
             "INSERT INTO seed_buy_orders (
                station_id, solar_system_id, constellation_id, region_id,
@@ -1119,49 +1410,71 @@ fn materialize_seed_buy_orders(
                s.region_id,
                t.type_id,
                MAX(
-                 ?10,
+                 ?8,
                  ROUND(
                    (
-                     CASE
-                       WHEN t.base_price IS NOT NULL AND t.base_price > 0 THEN t.base_price
-                       ELSE (?1 + ((t.type_id % ?2) * ?3))
-                     END
+                     t.effective_base_price
                    ) * (
-                     1.0 - (?4 / 100.0)
-                     - ((((ABS((s.station_id * 19) + (t.type_id * 29)) % 2001) - 1000) / 1000.0) * (?5 / 100.0))
-                     - ((((ABS((s.region_id * 11) + (t.type_id * 5)) % 2001) - 1000) / 1000.0) * (?6 / 100.0))
+                     1.0 - (?1 / 100.0)
+                     - ((((((s.station_id * 19) + (t.type_id * 29)) % 2001) - 1000) / 1000.0) * (?2 / 100.0))
+                     - ((((((s.region_id * 11) + (t.type_id * 5)) % 2001) - 1000) / 1000.0) * (?3 / 100.0))
                    ),
                    2
                  )
                ),
-               ?7,
-               ?7,
-               ?8
+               ?4,
+               ?4,
+               ?5
              FROM stations AS s
-             CROSS JOIN market_types AS t
-             WHERE s.region_id = ?9",
+             CROSS JOIN seed_pricing_types AS t
+             WHERE s.station_id >= ?6
+               AND s.station_id <= ?7",
             params![
-                config.seed.fallback_base_price,
-                config.seed.fallback_type_modulus,
-                config.seed.fallback_type_step,
                 config.seed.seed_buy_discount_percent,
                 config.seed.station_jitter_percent,
                 config.seed.region_jitter_percent,
                 config.seed.default_quantity_per_station_type,
                 &seeded_at,
-                region_plan.region_id,
-                config.seed.price_floor * 0.5,
+                station_chunk.first_station_id,
+                station_chunk.last_station_id,
+                config.seed.price_floor * 0.5
             ],
         )?;
-        progress.inc((region_plan.station_count * market_type_count) as u64);
+        progress.inc((station_chunk.station_count * market_type_count) as u64);
         progress.set_message(format!(
-            "Seed buys {:>3}% | reg {} | rows {}",
+            "Seed buys {:>3}% | stn {}-{} | rows {}",
             progress.position().saturating_mul(100) / progress.length().unwrap_or(1),
-            region_plan.region_id,
+            station_chunk.first_station_id,
+            station_chunk.last_station_id,
             format_count(progress.position())
         ));
     }
     transaction.commit()?;
+    Ok(())
+}
+
+fn prepare_seed_pricing_types(connection: &Connection, config: &MarketSeedConfig) -> Result<()> {
+    connection.execute_batch(
+        "CREATE TEMP TABLE seed_pricing_types (
+           type_id INTEGER PRIMARY KEY,
+           effective_base_price REAL NOT NULL
+         ) WITHOUT ROWID;",
+    )?;
+    connection.execute(
+        "INSERT INTO seed_pricing_types (type_id, effective_base_price)
+         SELECT type_id,
+                CASE
+                  WHEN base_price IS NOT NULL AND base_price > 0 THEN base_price
+                  ELSE (?1 + ((type_id % ?2) * ?3))
+                END
+         FROM market_types
+         ORDER BY type_id",
+        params![
+            config.seed.fallback_base_price,
+            config.seed.fallback_type_modulus,
+            config.seed.fallback_type_step,
+        ],
+    )?;
     Ok(())
 }
 
@@ -1467,8 +1780,8 @@ fn build_price_history_rows(
                     volume: 100 + u64::from(item_type.type_id % 500) + u64::from(day_offset * 3),
                     order_count: 10 + (item_type.type_id % 20),
                 });
-                counter.fetch_add(1, Ordering::Relaxed);
             }
+            counter.fetch_add(item_rows.len() as u64, Ordering::Relaxed);
 
             Ok::<Vec<HistorySeedRow>, anyhow::Error>(item_rows)
         })
@@ -1496,6 +1809,7 @@ fn write_price_history_rows(
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
     )?;
 
+    let mut pending_progress = 0u64;
     for row in rows {
         statement.execute(params![
             row.type_id,
@@ -1506,7 +1820,14 @@ fn write_price_history_rows(
             row.volume,
             row.order_count
         ])?;
-        progress.inc(1);
+        pending_progress += 1;
+        if pending_progress >= 1024 {
+            progress.inc(pending_progress);
+            pending_progress = 0;
+        }
+    }
+    if pending_progress > 0 {
+        progress.inc(pending_progress);
     }
 
     drop(statement);
@@ -1538,6 +1859,7 @@ fn open_build_connection(
     cache_size_kib: i32,
     page_size_bytes: u32,
     worker_threads: usize,
+    temp_store: &str,
 ) -> Result<Connection> {
     let connection = Connection::open(path).with_context(|| {
         format!(
@@ -1548,143 +1870,38 @@ fn open_build_connection(
     connection.pragma_update(None, "page_size", page_size_bytes)?;
     connection.pragma_update(None, "journal_mode", "OFF")?;
     connection.pragma_update(None, "synchronous", "OFF")?;
-    connection.pragma_update(None, "temp_store", "MEMORY")?;
+    connection.pragma_update(None, "temp_store", temp_store)?;
     connection.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
     connection.pragma_update(None, "cache_size", -cache_size_kib)?;
     connection.pragma_update(None, "threads", worker_threads.max(1))?;
     connection.pragma_update(None, "foreign_keys", "OFF")?;
-    connection.pragma_update(None, "cache_spill", "OFF")?;
+    connection.pragma_update(None, "cache_spill", SQLITE_BUILD_CACHE_SPILL)?;
     connection.execute_batch(SCHEMA_SQL)?;
     connection.execute_batch(RUNTIME_INDEX_DROP_SQL)?;
     Ok(connection)
 }
 
-fn build_runtime_indexes(connection: &Connection, progress: &ProgressBar) -> Result<()> {
+fn build_runtime_indexes(
+    connection: &mut Connection,
+    progress: &ProgressBar,
+) -> Result<Vec<(&'static str, f64)>> {
+    let transaction = connection.transaction()?;
+    let mut timings = Vec::new();
     for statement in runtime_index_statements() {
-        connection.execute_batch(statement)?;
+        let index_name = runtime_index_name(statement);
+        progress.set_message(format!("Runtime index {}", index_name));
+        let started = Instant::now();
+        transaction.execute_batch(statement)?;
+        let seconds = started.elapsed().as_secs_f64();
+        timings.push((index_name, seconds));
         progress.inc(1);
+        progress.set_message(format!(
+            "Runtime index {} done in {:.3}s",
+            index_name, seconds
+        ));
     }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn station(
-        station_id: u64,
-        solar_system_id: u32,
-        constellation_id: u32,
-        region_id: u32,
-        name: &str,
-    ) -> StationRecord {
-        StationRecord {
-            station_id,
-            solar_system_id,
-            constellation_id,
-            region_id,
-            region_name: format!("Region {region_id}"),
-            station_name: name.to_string(),
-            security: 0.8,
-        }
-    }
-
-    fn solar_system(
-        solar_system_id: u32,
-        constellation_id: u32,
-        region_id: u32,
-    ) -> SolarSystemRecord {
-        SolarSystemRecord {
-            solar_system_id,
-            region_id,
-            constellation_id,
-            solar_system_name: format!("System {solar_system_id}"),
-            security: 0.8,
-        }
-    }
-
-    #[test]
-    fn scoped_seed_keeps_unselected_station_topology_without_stocking_it() {
-        let selected_station = station(60_000_001, 30_000_001, 20_000_001, 10_000_001, "Selected");
-        let regional_station = station(60_000_002, 30_000_002, 20_000_002, 10_000_002, "Regional");
-        let input = SeedInputData {
-            selection_mode: "preset".to_string(),
-            selection_label: "Selected only".to_string(),
-            selected_solar_system_ids: vec![selected_station.solar_system_id],
-            selected_solar_system_names: vec!["Selected".to_string()],
-            topology_regions: vec![
-                RegionRow {
-                    region_id: selected_station.region_id,
-                    region_name: selected_station.region_name.clone(),
-                },
-                RegionRow {
-                    region_id: regional_station.region_id,
-                    region_name: regional_station.region_name.clone(),
-                },
-            ],
-            topology_solar_systems: vec![
-                solar_system(30_000_001, 20_000_001, 10_000_001),
-                solar_system(30_000_002, 20_000_002, 10_000_002),
-            ],
-            topology_stations: vec![selected_station.clone(), regional_station.clone()],
-            regions: vec![RegionRow {
-                region_id: selected_station.region_id,
-                region_name: selected_station.region_name.clone(),
-            }],
-            solar_systems: vec![solar_system(30_000_001, 20_000_001, 10_000_001)],
-            stations: vec![selected_station.clone()],
-            item_types: vec![ItemTypeRecord {
-                type_id: 34,
-                group_id: Some(18),
-                category_id: Some(4),
-                group_name: Some("Mineral".to_string()),
-                name: "Tritanium".to_string(),
-                base_price: Some(4.0),
-                market_group_id: Some(1857),
-                volume: Some(0.01),
-                portion_size: Some(1),
-                published: true,
-            }],
-        };
-        let mut connection = Connection::open_in_memory().expect("open test database");
-        connection
-            .execute_batch(SCHEMA_SQL)
-            .expect("create market schema");
-        write_static_tables(&mut connection, &input, &ProgressBar::hidden())
-            .expect("write selected market scope");
-        materialize_seed_stock(
-            &mut connection,
-            &MarketSeedConfig::default(),
-            &build_region_seed_plans(&input),
-            input.item_types.len(),
-            &ProgressBar::hidden(),
-        )
-        .expect("materialize selected seed scope");
-        append_static_topology(&mut connection, &input, &ProgressBar::hidden())
-            .expect("append full station topology");
-
-        let station_count: u64 = connection
-            .query_row("SELECT COUNT(*) FROM stations", [], |row| row.get(0))
-            .expect("count stations");
-        let selected_seed_rows: u64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM seed_stock WHERE station_id = ?1",
-                params![selected_station.station_id],
-                |row| row.get(0),
-            )
-            .expect("count selected stock");
-        let regional_seed_rows: u64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM seed_stock WHERE station_id = ?1",
-                params![regional_station.station_id],
-                |row| row.get(0),
-            )
-            .expect("count unselected stock");
-
-        assert_eq!(station_count, 2);
-        assert_eq!(selected_seed_rows, 1);
-        assert_eq!(regional_seed_rows, 0);
-    }
+    transaction.commit()?;
+    Ok(timings)
 }
 
 fn open_runtime_connection(path: &Path) -> Result<Connection> {
@@ -1698,7 +1915,7 @@ fn new_spinner(message: &str) -> ProgressBar {
     let spinner = ProgressBar::new_spinner();
     spinner.enable_steady_tick(std::time::Duration::from_millis(120));
     spinner.set_style(
-        ProgressStyle::with_template("{spinner:.green} {msg}")
+        ProgressStyle::with_template("{spinner:.green} {msg} | t {elapsed_precise}")
             .unwrap_or_else(|_| ProgressStyle::default_spinner()),
     );
     spinner.set_message(message.to_string());
@@ -1709,7 +1926,7 @@ fn new_stage_bar(message: &str, total: u64) -> ProgressBar {
     let bar = ProgressBar::new(total.max(1));
     bar.set_style(
         ProgressStyle::with_template(
-            "  [{bar:32.cyan/blue}] {percent:>3}% | {msg} | {pos}/{len} | eta {eta_precise}",
+            "  [{bar:36.cyan/blue}] {percent:>3}% | {msg} | {pos}/{len} | {per_sec} | eta {eta_precise} | t {elapsed_precise}",
         )
         .unwrap_or_else(|_| ProgressStyle::default_bar())
         .progress_chars("=> "),
@@ -1718,20 +1935,31 @@ fn new_stage_bar(message: &str, total: u64) -> ProgressBar {
     bar
 }
 
-fn build_region_seed_plans(input: &SeedInputData) -> Vec<RegionSeedPlan> {
-    let mut station_counts = BTreeMap::<u32, usize>::new();
-    for station in &input.stations {
-        *station_counts.entry(station.region_id).or_default() += 1;
-    }
-
-    input
-        .regions
-        .iter()
-        .map(|region| RegionSeedPlan {
-            region_id: region.region_id,
-            station_count: station_counts.get(&region.region_id).copied().unwrap_or(0),
+fn build_station_seed_chunks(
+    stations: &[StationRecord],
+    market_type_count: usize,
+    target_rows_per_insert: usize,
+) -> Vec<StationSeedChunk> {
+    let chunk_size = station_seed_chunk_size(market_type_count, target_rows_per_insert);
+    stations
+        .chunks(chunk_size)
+        .filter_map(|chunk| {
+            let first_station_id = chunk.first()?.station_id;
+            let last_station_id = chunk.last()?.station_id;
+            Some(StationSeedChunk {
+                first_station_id,
+                last_station_id,
+                station_count: chunk.len(),
+            })
         })
         .collect()
+}
+
+fn station_seed_chunk_size(market_type_count: usize, target_rows_per_insert: usize) -> usize {
+    target_rows_per_insert
+        .checked_div(market_type_count.max(1))
+        .unwrap_or(1)
+        .max(1)
 }
 
 fn compute_seed_region_summaries(
@@ -1776,8 +2004,8 @@ fn compute_seed_region_summaries(
                     region_id: region.region_id,
                     row,
                 });
-                counter.fetch_add(1, Ordering::Relaxed);
             }
+            counter.fetch_add(region_rows.len() as u64, Ordering::Relaxed);
             region_rows
         })
         .collect::<Vec<_>>()
@@ -1821,14 +2049,11 @@ fn build_and_write_seed_system_summaries(
     let transaction = connection.transaction()?;
     transaction.execute("DELETE FROM system_seed_summaries", [])?;
     let updated_at = now_rfc3339();
-    let mut statement = transaction.prepare(
-        "INSERT INTO system_seed_summaries (
-           solar_system_id, type_id, best_ask_price, total_ask_quantity, best_ask_station_id,
-           best_bid_price, total_bid_quantity, best_bid_station_id, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-    )?;
+    let full_batch_sql = system_summary_insert_sql(SYSTEM_SUMMARY_INSERT_BATCH_ROWS);
+    let mut full_batch_statement = transaction.prepare(&full_batch_sql)?;
 
     let chunk_size = system_summary_chunk_size(parallelism, input.solar_systems.len());
+    let mut pending_progress = 0u64;
     for systems_chunk in input.solar_systems.chunks(chunk_size) {
         let chunk_rows = systems_chunk
             .par_iter()
@@ -1853,29 +2078,72 @@ fn build_and_write_seed_system_summaries(
             })
             .collect::<Vec<_>>();
 
-        for rows in chunk_rows {
+        let mut pending_rows = Vec::with_capacity(SYSTEM_SUMMARY_INSERT_BATCH_ROWS);
+        for rows in &chunk_rows {
             for row in rows {
-                statement.execute(params![
-                    row.solar_system_id,
-                    row.row.type_id,
-                    row.row.best_ask_price,
-                    row.row.total_ask_quantity,
-                    row.row.best_ask_station_id,
-                    row.row.best_bid_price,
-                    row.row.total_bid_quantity,
-                    row.row.best_bid_station_id,
-                    &updated_at,
-                ])?;
-                counter.fetch_add(1, Ordering::Relaxed);
+                pending_rows.push(row);
+                if pending_rows.len() == SYSTEM_SUMMARY_INSERT_BATCH_ROWS {
+                    execute_system_summary_insert_batch(
+                        &mut full_batch_statement,
+                        &pending_rows,
+                        &updated_at,
+                    )?;
+                    pending_progress += pending_rows.len() as u64;
+                    counter.fetch_add(pending_progress, Ordering::Relaxed);
+                    pending_progress = 0;
+                    pending_rows.clear();
+                }
             }
         }
+        if !pending_rows.is_empty() {
+            let tail_sql = system_summary_insert_sql(pending_rows.len());
+            let mut tail_statement = transaction.prepare(&tail_sql)?;
+            execute_system_summary_insert_batch(&mut tail_statement, &pending_rows, &updated_at)?;
+            pending_progress += pending_rows.len() as u64;
+        }
+    }
+    if pending_progress > 0 {
+        counter.fetch_add(pending_progress, Ordering::Relaxed);
     }
 
-    drop(statement);
+    drop(full_batch_statement);
     transaction.commit()?;
     counter.store(total_rows, Ordering::Relaxed);
     stop_progress_reporter(reporter)?;
     progress.set_position(total_rows);
+    Ok(())
+}
+
+fn system_summary_insert_sql(row_count: usize) -> String {
+    let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?, ?)", row_count)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "INSERT INTO system_seed_summaries (
+           solar_system_id, type_id, best_ask_price, total_ask_quantity, best_ask_station_id,
+           best_bid_price, total_bid_quantity, best_bid_station_id, updated_at
+         ) VALUES {values}"
+    )
+}
+
+fn execute_system_summary_insert_batch(
+    statement: &mut rusqlite::Statement<'_>,
+    rows: &[&SystemSummaryInsertRow],
+    updated_at: &str,
+) -> Result<()> {
+    for (row_index, row) in rows.iter().enumerate() {
+        let parameter = row_index * 9;
+        statement.raw_bind_parameter(parameter + 1, row.solar_system_id)?;
+        statement.raw_bind_parameter(parameter + 2, row.row.type_id)?;
+        statement.raw_bind_parameter(parameter + 3, row.row.best_ask_price)?;
+        statement.raw_bind_parameter(parameter + 4, row.row.total_ask_quantity)?;
+        statement.raw_bind_parameter(parameter + 5, row.row.best_ask_station_id)?;
+        statement.raw_bind_parameter(parameter + 6, row.row.best_bid_price)?;
+        statement.raw_bind_parameter(parameter + 7, row.row.total_bid_quantity)?;
+        statement.raw_bind_parameter(parameter + 8, row.row.best_bid_station_id)?;
+        statement.raw_bind_parameter(parameter + 9, updated_at)?;
+    }
+    statement.raw_execute()?;
     Ok(())
 }
 
@@ -1993,6 +2261,7 @@ fn write_seed_region_summaries(
            best_bid_price, total_bid_quantity, best_bid_station_id, updated_at
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
     )?;
+    let mut pending_progress = 0u64;
     for row in rows {
         statement.execute(params![
             row.region_id,
@@ -2005,18 +2274,35 @@ fn write_seed_region_summaries(
             row.row.best_bid_station_id,
             &updated_at,
         ])?;
-        progress.inc(1);
+        pending_progress += 1;
+        if pending_progress >= 1024 {
+            progress.inc(pending_progress);
+            pending_progress = 0;
+        }
+    }
+    if pending_progress > 0 {
+        progress.inc(pending_progress);
     }
     drop(statement);
     transaction.commit()?;
     Ok(())
 }
 
-fn finalize_database(connection: &Connection, progress: &ProgressBar) -> Result<()> {
-    connection.execute_batch("ANALYZE;")?;
-    progress.inc(1);
+fn finalize_database(
+    connection: &Connection,
+    progress: &ProgressBar,
+    analyze_enabled: bool,
+) -> Result<()> {
+    if analyze_enabled {
+        progress.set_message("Finalize ANALYZE");
+        connection.pragma_update(None, "analysis_limit", 10_000)?;
+        connection.execute_batch("ANALYZE;")?;
+        progress.inc(1);
+    }
+    progress.set_message("Finalize WAL");
     connection.pragma_update(None, "journal_mode", "WAL")?;
     progress.inc(1);
+    progress.set_message("Finalize synchronous=NORMAL");
     connection.pragma_update(None, "synchronous", "NORMAL")?;
     progress.inc(1);
     Ok(())
@@ -2057,6 +2343,40 @@ fn stop_progress_reporter(handle: thread::JoinHandle<()>) -> Result<()> {
     Ok(())
 }
 
+fn record_phase(timings: &mut Vec<(&'static str, f64)>, phase: &'static str, started: Instant) {
+    timings.push((phase, started.elapsed().as_secs_f64()));
+}
+
+fn build_timing_json(timings: &[(&'static str, f64)], build_started: Instant) -> serde_json::Value {
+    json!({
+        "totalSeconds": round_seconds(build_started.elapsed().as_secs_f64()),
+        "phases": timings.iter().map(|(phase, seconds)| {
+            json!({
+                "phase": phase,
+                "seconds": round_seconds(*seconds),
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
+fn build_index_timing_json(timings: &[(&'static str, f64)]) -> serde_json::Value {
+    json!(
+        timings
+            .iter()
+            .map(|(index, seconds)| {
+                json!({
+                    "index": index,
+                    "seconds": round_seconds(*seconds),
+                })
+            })
+            .collect::<Vec<_>>()
+    )
+}
+
+fn round_seconds(seconds: f64) -> f64 {
+    (seconds * 1000.0).round() / 1000.0
+}
+
 fn price_jitter(seed: i128, percent: f64) -> f64 {
     let jitter = (((seed.abs() % 2001) as i64) - 1000) as f64 / 1000.0;
     jitter * (percent / 100.0)
@@ -2077,10 +2397,8 @@ fn runtime_index_statements() -> &'static [&'static str] {
     &[
         "CREATE INDEX IF NOT EXISTS idx_seed_stock_region_type_price ON seed_stock (region_id, type_id, price, station_id);",
         "CREATE INDEX IF NOT EXISTS idx_seed_stock_system_type_price ON seed_stock (solar_system_id, type_id, price, station_id);",
-        "CREATE INDEX IF NOT EXISTS idx_seed_stock_station_type_price ON seed_stock (station_id, type_id, price);",
         "CREATE INDEX IF NOT EXISTS idx_seed_buy_orders_region_type_price ON seed_buy_orders (region_id, type_id, price DESC, station_id);",
         "CREATE INDEX IF NOT EXISTS idx_seed_buy_orders_system_type_price ON seed_buy_orders (solar_system_id, type_id, price DESC, station_id);",
-        "CREATE INDEX IF NOT EXISTS idx_seed_buy_orders_station_type_price ON seed_buy_orders (station_id, type_id, price DESC);",
         "CREATE INDEX IF NOT EXISTS idx_market_orders_region_type_bid_state_price ON market_orders (region_id, type_id, bid, state, price, station_id);",
         "CREATE INDEX IF NOT EXISTS idx_market_orders_system_type_bid_state_price ON market_orders (solar_system_id, type_id, bid, state, price, station_id);",
         "CREATE INDEX IF NOT EXISTS idx_market_orders_station_type_bid_state_price ON market_orders (station_id, type_id, bid, state, price);",
@@ -2089,6 +2407,10 @@ fn runtime_index_statements() -> &'static [&'static str] {
         "CREATE INDEX IF NOT EXISTS idx_market_orders_player_expiry ON market_orders (state, issued_at, duration_days, order_id) WHERE source = 'player';",
         "CREATE INDEX IF NOT EXISTS idx_market_order_events_type_id ON market_order_events (event_type, event_id);",
     ]
+}
+
+fn runtime_index_name(statement: &'static str) -> &'static str {
+    statement.split_whitespace().nth(5).unwrap_or("unknown")
 }
 
 fn format_count<T>(value: T) -> String
@@ -2106,3 +2428,127 @@ where
     parts.reverse();
     parts.join(",")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn station(
+        station_id: u64,
+        solar_system_id: u32,
+        constellation_id: u32,
+        region_id: u32,
+        name: &str,
+    ) -> StationRecord {
+        StationRecord {
+            station_id,
+            solar_system_id,
+            constellation_id,
+            region_id,
+            region_name: format!("Region {region_id}"),
+            station_name: name.to_string(),
+            security: 0.8,
+        }
+    }
+
+    fn solar_system(
+        solar_system_id: u32,
+        constellation_id: u32,
+        region_id: u32,
+    ) -> SolarSystemRecord {
+        SolarSystemRecord {
+            solar_system_id,
+            region_id,
+            constellation_id,
+            solar_system_name: format!("System {solar_system_id}"),
+            security: 0.8,
+        }
+    }
+
+    #[test]
+    fn scoped_seed_keeps_unselected_station_topology_without_stocking_it() {
+        let selected_station = station(60_000_001, 30_000_001, 20_000_001, 10_000_001, "Selected");
+        let regional_station = station(60_000_002, 30_000_002, 20_000_002, 10_000_002, "Regional");
+        let input = SeedInputData {
+            selection_mode: "preset".to_string(),
+            selection_label: "Selected only".to_string(),
+            selected_solar_system_ids: vec![selected_station.solar_system_id],
+            selected_solar_system_names: vec!["Selected".to_string()],
+            topology_regions: vec![
+                RegionRow {
+                    region_id: selected_station.region_id,
+                    region_name: selected_station.region_name.clone(),
+                },
+                RegionRow {
+                    region_id: regional_station.region_id,
+                    region_name: regional_station.region_name.clone(),
+                },
+            ],
+            topology_solar_systems: vec![
+                solar_system(30_000_001, 20_000_001, 10_000_001),
+                solar_system(30_000_002, 20_000_002, 10_000_002),
+            ],
+            topology_stations: vec![selected_station.clone(), regional_station.clone()],
+            regions: vec![RegionRow {
+                region_id: selected_station.region_id,
+                region_name: selected_station.region_name.clone(),
+            }],
+            solar_systems: vec![solar_system(30_000_001, 20_000_001, 10_000_001)],
+            stations: vec![selected_station.clone()],
+            item_types: vec![ItemTypeRecord {
+                type_id: 34,
+                group_id: Some(18),
+                category_id: Some(4),
+                group_name: Some("Mineral".to_string()),
+                name: "Tritanium".to_string(),
+                base_price: Some(4.0),
+                market_group_id: Some(1857),
+                volume: Some(0.01),
+                portion_size: Some(1),
+                published: true,
+            }],
+        };
+        let mut connection = Connection::open_in_memory().expect("open test database");
+        connection
+            .execute_batch(SCHEMA_SQL)
+            .expect("create market schema");
+        write_static_tables(&mut connection, &input, &ProgressBar::hidden())
+            .expect("write selected market scope");
+        let seed_config = MarketSeedConfig::default();
+        let station_chunks =
+            build_station_seed_chunks(&input.stations, input.item_types.len(), 1024);
+        materialize_seed_stock(
+            &mut connection,
+            &seed_config,
+            &station_chunks,
+            input.item_types.len(),
+            &ProgressBar::hidden(),
+        )
+        .expect("materialize selected seed scope");
+        append_static_topology(&mut connection, &input, &ProgressBar::hidden())
+            .expect("append full station topology");
+
+        let station_count: u64 = connection
+            .query_row("SELECT COUNT(*) FROM stations", [], |row| row.get(0))
+            .expect("count stations");
+        let selected_seed_rows: u64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM seed_stock WHERE station_id = ?1",
+                params![selected_station.station_id],
+                |row| row.get(0),
+            )
+            .expect("count selected stock");
+        let regional_seed_rows: u64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM seed_stock WHERE station_id = ?1",
+                params![regional_station.station_id],
+                |row| row.get(0),
+            )
+            .expect("count unselected stock");
+
+        assert_eq!(station_count, 2);
+        assert_eq!(selected_seed_rows, 1);
+        assert_eq!(regional_seed_rows, 0);
+    }
+}
+

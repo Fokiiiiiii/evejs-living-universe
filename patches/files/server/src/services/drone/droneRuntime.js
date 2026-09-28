@@ -1,3 +1,10 @@
+"use strict";
+
+const {
+  toInt,
+  toNumber,
+} = require("../../common/numbers");
+
 const path = require("path");
 
 // Memoized resolver for lazy (circular-dependency-safe) requires that run on the
@@ -21,22 +28,29 @@ const {
 } = require(path.join(__dirname, "../chat/sessionRegistry"));
 const {
   ITEM_FLAGS,
-  findItemById,
+  createSpaceItemForCharacter,
   grantItemToCharacterLocation,
-  listContainerItems,
-  moveItemToLocation,
+  normalizeShipConditionState,
+  removeInventoryItem,
   updateInventoryItem,
 } = require(path.join(__dirname, "../inventory/itemStore"));
+const {
+  findItemById,
+  listContainerItems,
+} = require(path.join(__dirname, "../inventory/simulationInventoryProjection"));
+const itemCustody = require(path.join(__dirname, "../inventory/itemCustody"));
 const {
   buildEffectiveItemAttributeMap,
   buildShipResourceState,
   getAttributeIDByNames,
+  getDynamicItemAttributeOverrides,
   getTypeAttributeValue,
 } = require(path.join(__dirname, "../fitting/liveFittingState"));
 const {
   getShipFittingSnapshot,
 } = require(path.join(__dirname, "../../_secondary/fitting/fittingRuntime"));
 const {
+  resolveItemByName,
   resolveItemByTypeID,
 } = require(path.join(__dirname, "../inventory/itemTypeRegistry"));
 const {
@@ -47,6 +61,9 @@ const {
   beginDogmaTick,
   endDogmaTick,
   resolveDroneOperationalAttributes,
+  resolveDroneTooltipAttributes,
+  buildDroneTooltipAttributeStamp,
+  setControllerDogmaCacheRebuiltHandler,
   resolveDroneCombatSnapshot,
   resolveDroneMiningSnapshot,
   resolveDroneSalvageSnapshot,
@@ -87,8 +104,29 @@ const {
   toJSONSafeEntityID,
 } = require(path.join(__dirname, "../../space/destiny/identity/entityID"));
 const {
+  buildChildEntityScopeMetadata,
+  isSharedPveTarget,
+} = require(path.join(
+  __dirname,
+  "../../space/destiny/identity/interactionScope",
+));
+const {
   createDroneOperationalMotionCommand,
 } = require(path.join(__dirname, "../../space/destiny/commands/drone.js"));
+const {
+  buildDroneStateChangePresentation,
+  canPresentDroneStateOnDestiny,
+} = require(path.join(__dirname, "../../space/destiny/commands/droneState.js"));
+const {
+  resolveAbyssalPlayerLaunchScope,
+  sessionClaimsAbyssalScene,
+} = require(path.join(__dirname, "../_shared/abyssalPlayerLaunchScope"));
+const {
+  getSceneSurfaceDistance,
+} = require(path.join(
+  __dirname,
+  "../../space/destiny/authority/sceneRangeDecision",
+));
 
 const STATE_IDLE = 0;
 const STATE_COMBAT = 1;
@@ -115,6 +153,20 @@ const DRONE_COMMAND_RETURN_HOME = "RETURN_HOME";
 const DRONE_COMMAND_ENGAGE = "ENGAGE";
 const DRONE_COMMAND_MINE = "MINE";
 const DRONE_COMMAND_SALVAGE = "SALVAGE";
+// Pilot assignments are NOT one of the DRONE_COMMAND_* task states above.
+// Retail models them as an ACTIVITY that rides alongside whatever the drone is doing:
+// the client's drone entry reads it out of OnDroneActivityChange and renders
+// UI/Inflight/Drone/Assisting with cfg.eveowners.Get(activityID).name, so the
+// wire pair has to be exactly ("assist"|"guard", <assigned characterID>). See
+// eve/client/script/ui/inflight/drones/droneEntry.py GetDroneActivityDescription.
+const DRONE_ACTIVITY_ASSIST = "assist";
+const DRONE_ACTIVITY_GUARD = "guard";
+// appConst.maxDroneAssist (V24.01): retail caps how many drones may assist one
+// character at once, across every ship that pointed drones at them.
+const MAX_DRONE_ASSIST = 20;
+// A pod is a ship by category but never a valid assist subject — the client
+// refuses it with DroneCommandRequiresShipButNotCapsule.
+const GROUP_CAPSULE_ID = 29;
 const ATTRIBUTE_DRONE_IS_AGGRESSIVE =
   getAttributeIDByNames("droneIsAggressive", "droneIsAgressive") || 1275;
 const ATTRIBUTE_DRONE_FOCUS_FIRE =
@@ -127,25 +179,178 @@ const ATTRIBUTE_SHIELD_RECHARGE_RATE =
 const ATTRIBUTE_SHIELD_CAPACITY = getAttributeIDByNames("shieldCapacity") || 263;
 const ATTRIBUTE_ARMOR_HP = getAttributeIDByNames("armorHP") || 265;
 const ATTRIBUTE_AGILITY = getAttributeIDByNames("agility") || 70;
+const ATTRIBUTE_ENTITY_FLY_RANGE =
+  getAttributeIDByNames("entityFlyRange") || 416;
+const ATTRIBUTE_ENTITY_CRUISE_SPEED =
+  getAttributeIDByNames("entityCruiseSpeed") || 508;
+const ATTRIBUTE_ENTITY_CHASE_MAX_DISTANCE =
+  getAttributeIDByNames("entityChaseMaxDistance") || 665;
 const ATTRIBUTE_ORBIT_RANGE = getAttributeIDByNames("orbitRange") || 157;
+const ATTRIBUTE_DRONE_CONTROL_DISTANCE =
+  getAttributeIDByNames("droneControlDistance") || 458;
 
 const DRONE_BAY_SCOOP_DISTANCE_METERS = 2500;
+// Same container and two-hour life as a pilot's own jetcan (jettisonRuntime).
+const DRONE_SALVAGE_JETTISON_CONTAINER_NAME = "Cargo Container";
+const DRONE_SALVAGE_JETTISON_LIFETIME_MS = 2 * 60 * 60 * 1000;
 const DRONE_BAY_RETURN_APPROACH_DISTANCE_METERS = 0;
 const DEFAULT_DRONE_LAUNCH_OFFSET_METERS = 75;
 const MIN_ORBIT_DISTANCE_METERS = 500;
 const MAX_ORBIT_DISTANCE_METERS = 5000;
+// Drone control range base: a pilot with no control-range bonus has 20 km, and
+// the derived droneControlDistance (458) only appears in the ship snapshot once
+// a bonus introduces it, so an absent value falls back to this base.
+const DEFAULT_DRONE_CONTROL_DISTANCE_METERS = 20000;
+const MIN_DRONE_MAX_VELOCITY = 0.00001;
 const ONE_METER = 1;
+const DRONE_FAST_PROPULSION_DEAD_BAND_FRACTION = 0.5;
+const DRONE_SPEED_FRACTION_EPSILON = 0.000001;
 const DEFAULT_DRONE_IS_AGGRESSIVE = true;
 const DEFAULT_DRONE_FOCUS_FIRE = false;
 const DRONE_AGGRESSION_THREAT_RETENTION_MS = 30_000;
+const DRONE_WINDOW_SETTLE_DELAY_MS = 350;
+// Module-private capability: only commandEngage's synchronous planning pass
+// can certify that the exact entity references below were already validated.
+// RPC input can never manufacture a Symbol value.
+const MANUAL_ENGAGE_PREFLIGHT = Symbol("manual-drone-engage-preflight");
 
 const PLAYER_COMPANION_AIR_SCOPE_ID_FIELDS = Object.freeze([
   "airNpeOwnerCharacterID",
   "airNpeOperationID",
   "airNpeInstanceID",
 ]);
+const PLAYER_COMPANION_ABYSSAL_SCOPE_ID_FIELDS = Object.freeze([
+  "abyssalRunID",
+  "evejsAbyssalInstanceID",
+  "evejsAbyssalPocketInstanceID",
+]);
+const PLAYER_COMPANION_ABYSSAL_ROOM_INDEX_FIELDS = Object.freeze([
+  "abyssalRoomIndex",
+  "evejsAbyssalRoomIndex",
+]);
+const ABYSSAL_PLAYER_COMPANION_CUSTOM_INFO_KEY =
+  "evejsAbyssalPlayerCompanion";
 const PLAYER_COMPANION_INVALID_SCOPE_SENTINEL =
   "invalid-player-companion-scope";
+
+function resolveAbyssalPlayerCompanionInstanceID(source = null) {
+  let resolvedInstanceID = null;
+  for (const key of PLAYER_COMPANION_ABYSSAL_SCOPE_ID_FIELDS) {
+    const rawValue = source && source[key];
+    if (rawValue === undefined || rawValue === null) {
+      continue;
+    }
+    const value = normalizePersistentEntityID(rawValue);
+    if (
+      value === null ||
+      (resolvedInstanceID !== null && !entityIDsEqual(resolvedInstanceID, value))
+    ) {
+      return null;
+    }
+    resolvedInstanceID = value;
+  }
+  return resolvedInstanceID;
+}
+
+function resolveAbyssalPlayerCompanionRoomIndex(source = null) {
+  let resolvedRoomIndex = null;
+  for (const key of PLAYER_COMPANION_ABYSSAL_ROOM_INDEX_FIELDS) {
+    const rawValue = source && source[key];
+    if (rawValue === undefined || rawValue === null) {
+      continue;
+    }
+    const value = toInt(rawValue, 0);
+    if (
+      value <= 0 ||
+      (resolvedRoomIndex !== null && resolvedRoomIndex !== value)
+    ) {
+      return null;
+    }
+    resolvedRoomIndex = value;
+  }
+  return resolvedRoomIndex;
+}
+
+function buildDroneAbyssalOwnershipCustomInfo(currentItem, source = null) {
+  const rawCustomInfo = String(currentItem && currentItem.customInfo || "").trim();
+  let parsedCustomInfo = null;
+  if (rawCustomInfo) {
+    try {
+      const parsed = JSON.parse(rawCustomInfo);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        parsedCustomInfo = { ...parsed };
+      }
+    } catch (_) {
+      // ignored: preserve an opaque legacy value when adding an Abyssal ownership tag.
+    }
+  }
+
+  const hasAbyssalScope = PLAYER_COMPANION_ABYSSAL_SCOPE_ID_FIELDS.some(
+    (key) =>
+      source &&
+      source[key] !== undefined &&
+      source[key] !== null,
+  );
+  const instanceID = resolveAbyssalPlayerCompanionInstanceID(source);
+  const hasAbyssalRoomScope = PLAYER_COMPANION_ABYSSAL_ROOM_INDEX_FIELDS.some(
+    (key) =>
+      source &&
+      source[key] !== undefined &&
+      source[key] !== null,
+  );
+  const roomIndex = resolveAbyssalPlayerCompanionRoomIndex(source);
+  if (!hasAbyssalScope) {
+    if (
+      parsedCustomInfo &&
+      Object.prototype.hasOwnProperty.call(
+        parsedCustomInfo,
+        ABYSSAL_PLAYER_COMPANION_CUSTOM_INFO_KEY,
+      )
+    ) {
+      delete parsedCustomInfo[ABYSSAL_PLAYER_COMPANION_CUSTOM_INFO_KEY];
+      const remainingKeys = Object.keys(parsedCustomInfo);
+      if (
+        remainingKeys.length === 1 &&
+        remainingKeys[0] === "evejsLegacyDroneCustomInfo" &&
+        typeof parsedCustomInfo.evejsLegacyDroneCustomInfo === "string"
+      ) {
+        return parsedCustomInfo.evejsLegacyDroneCustomInfo;
+      }
+      return Object.keys(parsedCustomInfo).length > 0
+        ? JSON.stringify(parsedCustomInfo)
+        : "";
+    }
+    return rawCustomInfo;
+  }
+
+  const nextCustomInfo = parsedCustomInfo || (
+    rawCustomInfo
+      ? { evejsLegacyDroneCustomInfo: rawCustomInfo }
+      : {}
+  );
+  if (
+    instanceID === null ||
+    (hasAbyssalRoomScope && roomIndex === null)
+  ) {
+    nextCustomInfo[ABYSSAL_PLAYER_COMPANION_CUSTOM_INFO_KEY] = {
+      instanceID: 0,
+      companionKind: "drone",
+      invalid: true,
+    };
+    return JSON.stringify(nextCustomInfo);
+  }
+  nextCustomInfo[ABYSSAL_PLAYER_COMPANION_CUSTOM_INFO_KEY] = {
+    instanceID: toJSONSafeEntityID(instanceID),
+    ...(roomIndex !== null ? { roomIndex } : {}),
+    companionKind: "drone",
+    controllerID: toJSONSafeEntityID(
+      normalizePersistentEntityID(
+        source && (source.controllerID ?? source.launcherID),
+      ),
+    ),
+  };
+  return JSON.stringify(nextCustomInfo);
+}
 
 function buildPlayerCompanionScopeMetadata(controllerEntity = null) {
   if (!controllerEntity || typeof controllerEntity !== "object") {
@@ -164,6 +369,29 @@ function buildPlayerCompanionScopeMetadata(controllerEntity = null) {
     } else {
       metadata[key] = PLAYER_COMPANION_INVALID_SCOPE_SENTINEL;
     }
+  }
+
+  for (const key of PLAYER_COMPANION_ABYSSAL_SCOPE_ID_FIELDS) {
+    const rawValue = controllerEntity[key];
+    if (rawValue === undefined || rawValue === null) {
+      continue;
+    }
+    const value = normalizePersistentEntityID(rawValue);
+    if (value !== null) {
+      metadata[key] = toJSONSafeEntityID(value);
+    } else {
+      metadata[key] = PLAYER_COMPANION_INVALID_SCOPE_SENTINEL;
+    }
+  }
+  for (const key of PLAYER_COMPANION_ABYSSAL_ROOM_INDEX_FIELDS) {
+    const rawValue = controllerEntity[key];
+    if (rawValue === undefined || rawValue === null) {
+      continue;
+    }
+    const value = toInt(rawValue, 0);
+    metadata[key] = value > 0
+      ? value
+      : PLAYER_COMPANION_INVALID_SCOPE_SENTINEL;
   }
 
   // The player ship's accepted dungeon tracker is the sole room/site truth.
@@ -194,6 +422,8 @@ function applyPlayerCompanionScopeMetadata(entity, source = null) {
   }
   for (const key of [
     ...PLAYER_COMPANION_AIR_SCOPE_ID_FIELDS,
+    ...PLAYER_COMPANION_ABYSSAL_SCOPE_ID_FIELDS,
+    ...PLAYER_COMPANION_ABYSSAL_ROOM_INDEX_FIELDS,
     "dungeonSiteInstanceID",
   ]) {
     const rawValue = source[key];
@@ -235,6 +465,8 @@ function serializePlayerCompanionScopeMetadata(entity = null) {
   const metadata = {};
   for (const key of [
     ...PLAYER_COMPANION_AIR_SCOPE_ID_FIELDS,
+    ...PLAYER_COMPANION_ABYSSAL_SCOPE_ID_FIELDS,
+    ...PLAYER_COMPANION_ABYSSAL_ROOM_INDEX_FIELDS,
     "dungeonSiteInstanceID",
   ]) {
     const rawValue = entity[key];
@@ -267,6 +499,42 @@ function getPlayerCompanionSecurityScope(entity = null, options = {}) {
   const rawCurrentSiteID = entity && entity.dungeonCurrentSiteID;
   const siteInstanceID = normalizePersistentEntityID(rawSiteInstanceID);
   const currentInstanceID = normalizePersistentEntityID(rawCurrentInstanceID);
+  let abyssalInstanceID = null;
+  let abyssalInstancePresent = false;
+  for (const key of PLAYER_COMPANION_ABYSSAL_SCOPE_ID_FIELDS) {
+    const rawValue = entity && entity[key];
+    if (rawValue === undefined || rawValue === null) {
+      continue;
+    }
+    abyssalInstancePresent = true;
+    const value = normalizePersistentEntityID(rawValue);
+    if (
+      value === null ||
+      (abyssalInstanceID !== null && !entityIDsEqual(abyssalInstanceID, value))
+    ) {
+      scope.invalid = true;
+      continue;
+    }
+    abyssalInstanceID = value;
+  }
+  let abyssalRoomIndex = null;
+  let abyssalRoomPresent = false;
+  for (const key of PLAYER_COMPANION_ABYSSAL_ROOM_INDEX_FIELDS) {
+    const rawValue = entity && entity[key];
+    if (rawValue === undefined || rawValue === null) {
+      continue;
+    }
+    abyssalRoomPresent = true;
+    const value = toInt(rawValue, 0);
+    if (
+      value <= 0 ||
+      (abyssalRoomIndex !== null && abyssalRoomIndex !== value)
+    ) {
+      scope.invalid = true;
+      continue;
+    }
+    abyssalRoomIndex = value;
+  }
   const hasDungeonSiteID = Boolean(
     entity &&
     Object.hasOwn(entity, "dungeonSiteID") &&
@@ -325,13 +593,25 @@ function getPlayerCompanionSecurityScope(entity = null, options = {}) {
   ) {
     scope.invalid = true;
   }
-  scope.dungeonSiteInstanceID = isPlayerShipController
+  const dungeonInstanceID = isPlayerShipController
     ? currentInstanceID
     : siteInstanceID !== null
       ? siteInstanceID
       : entity && entity.kind === "ship"
         ? currentInstanceID
         : null;
+  if (
+    dungeonInstanceID !== null &&
+    abyssalInstanceID !== null &&
+    !entityIDsEqual(dungeonInstanceID, abyssalInstanceID)
+  ) {
+    scope.invalid = true;
+  }
+  scope.dungeonSiteInstanceID = dungeonInstanceID !== null
+    ? dungeonInstanceID
+    : abyssalInstanceID;
+  scope.abyssalInstanceID = abyssalInstanceID;
+  scope.abyssalRoomIndex = abyssalRoomIndex;
   if (
     hasDungeonSiteID &&
     (
@@ -391,6 +671,11 @@ function getPlayerCompanionSecurityScope(entity = null, options = {}) {
   );
   if (
     (hasDungeonScopeMarker && scope.dungeonSiteInstanceID === null) ||
+    (abyssalInstancePresent && abyssalInstanceID === null) ||
+    (abyssalRoomPresent && (
+      abyssalRoomIndex === null ||
+      abyssalInstanceID === null
+    )) ||
     (
       hasAirScopeMarker &&
       scope.airNpeInstanceID === null &&
@@ -450,12 +735,66 @@ function resolveExactCompanionActorCharacterID(entity = null, session = null) {
   return { invalid, value: resolvedCharacterID };
 }
 
+function dungeonInstanceScopesAreCompatible(
+  scene,
+  visibilitySession,
+  companionScope,
+  targetScope,
+) {
+  const companionDungeonInstanceID = companionScope.effectiveInstanceID;
+  const targetDungeonInstanceID = targetScope.effectiveInstanceID;
+  if (
+    companionDungeonInstanceID === null &&
+    targetDungeonInstanceID === null
+  ) {
+    return true;
+  }
+  if (
+    companionDungeonInstanceID !== null &&
+    targetDungeonInstanceID !== null
+  ) {
+    return entityIDsEqual(
+      companionDungeonInstanceID,
+      targetDungeonInstanceID,
+    );
+  }
+
+  const scopedScope = companionDungeonInstanceID !== null
+    ? companionScope
+    : targetScope;
+  const scopedInstanceID = companionDungeonInstanceID !== null
+    ? companionDungeonInstanceID
+    : targetDungeonInstanceID;
+  if (
+    scopedScope.dungeonSiteInstanceID === null ||
+    !entityIDsEqual(scopedScope.dungeonSiteInstanceID, scopedInstanceID) ||
+    !scene ||
+    !visibilitySession ||
+    typeof scene.resolveDungeonInstanceVisibilityForSession !== "function"
+  ) {
+    return false;
+  }
+
+  try {
+    const resolution = scene.resolveDungeonInstanceVisibilityForSession(
+      visibilitySession,
+      scopedInstanceID,
+    );
+    return Boolean(resolution && resolution.isPrivate === false);
+  } catch (_error) {
+    // ignored: an unreadable dungeon visibility is not public, so the scopes are not compatible (fail closed)
+    return false;
+  }
+}
+
 function playerCompanionTargetScopeIsCompatible(
   companionScope,
   targetScope,
   controllerEntity,
   targetEntity,
   session,
+  scene,
+  visibilitySession,
 ) {
   if (
     !companionScope ||
@@ -466,16 +805,27 @@ function playerCompanionTargetScopeIsCompatible(
     return false;
   }
 
-  const companionDungeonInstanceID = companionScope.effectiveInstanceID;
-  const targetDungeonInstanceID = targetScope.effectiveInstanceID;
-  if (
-    (companionDungeonInstanceID !== null || targetDungeonInstanceID !== null) &&
-    (
-      companionDungeonInstanceID === null ||
-      targetDungeonInstanceID === null ||
-      !entityIDsEqual(companionDungeonInstanceID, targetDungeonInstanceID)
-    )
-  ) {
+  if (!abyssalRunRoomScopesExactlyMatch(companionScope, targetScope)) {
+    return false;
+  }
+
+  // A mission/site controller has no player ownership claim over its rats or
+  // mineable rocks.  Let a companion act on these shared targets even when its
+  // controller did not enter through that site's private access list.  AIR and
+  // Abyssal are real isolated lanes and remain subject to their exact scopes.
+  const sharedPveTarget = isSharedPveTarget(targetEntity) &&
+    companionScope.airNpeOperationID === null &&
+    companionScope.airNpeInstanceID === null &&
+    companionScope.airNpeOwnerCharacterID === null &&
+    targetScope.airNpeOperationID === null &&
+    targetScope.airNpeInstanceID === null &&
+    targetScope.airNpeOwnerCharacterID === null;
+  if (!sharedPveTarget && !dungeonInstanceScopesAreCompatible(
+    scene,
+    visibilitySession,
+    companionScope,
+    targetScope,
+  )) {
     return false;
   }
 
@@ -539,6 +889,34 @@ function playerCompanionTargetScopeIsCompatible(
   return true;
 }
 
+function abyssalRunRoomScopesExactlyMatch(leftScope, rightScope) {
+  const leftRunID = leftScope && leftScope.abyssalInstanceID != null
+    ? leftScope.abyssalInstanceID
+    : null;
+  const rightRunID = rightScope && rightScope.abyssalInstanceID != null
+    ? rightScope.abyssalInstanceID
+    : null;
+  const leftRoomIndex = toInt(leftScope && leftScope.abyssalRoomIndex, 0);
+  const rightRoomIndex = toInt(rightScope && rightScope.abyssalRoomIndex, 0);
+  const hasAbyssalScope = Boolean(
+    leftRunID !== null ||
+    rightRunID !== null ||
+    leftRoomIndex > 0 ||
+    rightRoomIndex > 0
+  );
+  if (!hasAbyssalScope) {
+    return true;
+  }
+  return Boolean(
+    leftRunID !== null &&
+    rightRunID !== null &&
+    entityIDsEqual(leftRunID, rightRunID) &&
+    leftRoomIndex > 0 &&
+    rightRoomIndex > 0 &&
+    leftRoomIndex === rightRoomIndex
+  );
+}
+
 function securityScopesExactlyMatch(leftScope, rightScope) {
   if (
     !leftScope ||
@@ -546,6 +924,9 @@ function securityScopesExactlyMatch(leftScope, rightScope) {
     leftScope.invalid === true ||
     rightScope.invalid === true
   ) {
+    return false;
+  }
+  if (!abyssalRunRoomScopesExactlyMatch(leftScope, rightScope)) {
     return false;
   }
   for (const key of [
@@ -592,6 +973,13 @@ function canPlayerCompanionActOnTarget(
     controller: true,
   });
   const targetScope = getPlayerCompanionSecurityScope(targetEntity);
+  const isPlayerShipController = Boolean(
+    controllerEntity.kind === "ship",
+  );
+  const controllerSession =
+    session || resolveDroneControllerSession(companionEntity, controllerEntity);
+  const effectiveSession =
+    controllerSession || (!isPlayerShipController && targetEntity.session) || null;
   if (
     !securityScopesExactlyMatch(companionScope, controllerScope) ||
     !playerCompanionTargetScopeIsCompatible(
@@ -600,6 +988,8 @@ function canPlayerCompanionActOnTarget(
       controllerEntity,
       targetEntity,
       session,
+      scene,
+      effectiveSession,
     )
   ) {
     return false;
@@ -614,13 +1004,6 @@ function canPlayerCompanionActOnTarget(
     ].some(hasPlayerCompanionSecurityScope);
   }
 
-  const isPlayerShipController = Boolean(
-    controllerEntity.kind === "ship",
-  );
-  const controllerSession =
-    session || resolveDroneControllerSession(companionEntity, controllerEntity);
-  const effectiveSession =
-    controllerSession || (!isPlayerShipController && targetEntity.session) || null;
   if (!effectiveSession) {
     return (
       !isPlayerShipController &&
@@ -633,12 +1016,25 @@ function canPlayerCompanionActOnTarget(
       visibilityGate.call(scene, effectiveSession, targetEntity) === true
     );
   } catch (_error) {
+    // ignored: a visibility check that throws does not let the drone act on the target (fail closed)
     return false;
   }
 }
 
 function getCharacterStateService() {
   return lazyRequire("../character/characterState");
+}
+
+// Lazy for the same reason as every other resolver on this path: fleetHelpers
+// pulls in fleetRuntime, which is nowhere near the drone tick's dependency
+// order, and assist is the only caller.
+function charactersShareFleet(leftCharacterID, rightCharacterID) {
+  const fleetHelpers = lazyRequire("../fleets/fleetHelpers");
+  return Boolean(
+    fleetHelpers &&
+      typeof fleetHelpers.isInSameFleet === "function" &&
+      fleetHelpers.isInSameFleet(leftCharacterID, rightCharacterID),
+  );
 }
 
 function resolveCharacterRecord(characterID) {
@@ -677,15 +1073,6 @@ function syncInventoryItemForCharacterSession(session, item, previousData, optio
     previousData,
     options,
   );
-}
-
-function toNumber(value, fallback = 0) {
-  const numeric = Number(value);
-  return Number.isFinite(numeric) ? numeric : fallback;
-}
-
-function toInt(value, fallback = 0) {
-  return Math.trunc(toNumber(value, fallback));
 }
 
 function buildCreatedInventoryInsertPreviousState(item) {
@@ -752,13 +1139,32 @@ function primeDroneBayDogmaForLaunch(item, shipRecord, sessions = null) {
     return false;
   }
 
+  // Prime with the operational (skill/ship/module-bonused) map, not bare
+  // type dogma: this prime is what fills the client godma cache for the
+  // drone row the moment it leaves the bay.
+  const attributeOverrides = resolveDroneTooltipAttributes(
+    bayItem,
+    targetSessions[0] || null,
+    { controllerShipID: shipID },
+  );
   const primeEntry = buildDogmaPrimeEntry(bayItem, {
     description: "drone",
     includeTypeAttributes: true,
+    attributeOverrides: attributeOverrides || {},
   });
   if (!primeEntry) {
     return false;
   }
+
+  // Seed the cache-rebuild push baseline with the values the client just
+  // received. This runs before the in-space drone entity exists, which is why
+  // the baseline map is keyed by ship and drone item rather than hung on the
+  // entity.
+  setDroneTooltipLastSentStamp(
+    shipID,
+    toInt(bayItem.itemID, 0),
+    buildDroneTooltipAttributeStamp(attributeOverrides),
+  );
 
   for (const session of targetSessions) {
     if (!session || typeof session.sendNotification !== "function") {
@@ -985,7 +1391,7 @@ function appendLaunchError(result, itemID, message) {
   return appendLaunchEntry(result, itemID, buildDroneErrorTuple(message));
 }
 
-function appendDroneError(result, droneID, message) {
+function appendDroneErrorTuple(result, droneID, errorTuple) {
   const numericDroneID = toInt(droneID, 0);
   if (
     !result ||
@@ -1000,12 +1406,25 @@ function appendDroneError(result, droneID, message) {
     (entry) => Array.isArray(entry) && toInt(entry[0], 0) === numericDroneID,
   );
   if (existingEntry) {
-    existingEntry[1] = buildDroneErrorTuple(message);
+    existingEntry[1] = errorTuple;
     return result;
   }
 
-  result.entries.push([numericDroneID, buildDroneErrorTuple(message)]);
+  result.entries.push([numericDroneID, errorTuple]);
   return result;
+}
+
+function appendDroneError(result, droneID, message) {
+  return appendDroneErrorTuple(result, droneID, buildDroneErrorTuple(message));
+}
+
+// The client re-raises a per-drone entry as UserError(key, args), so a refusal
+// that TQ names can travel as its own message key instead of a CustomNotify.
+function appendDroneUserError(result, droneID, messageKey, entries = []) {
+  return appendDroneErrorTuple(result, droneID, [
+    String(messageKey || ""),
+    buildMarshalDict(entries),
+  ]);
 }
 
 function listifyRawValue(rawValue) {
@@ -1276,6 +1695,121 @@ function ensureDroneClientIdentityState(
   return Boolean(currentItem || shipRecord);
 }
 
+function clearDroneWindowSettleForSession(session) {
+  const state = session && session._droneWindowSettleState;
+  if (!state) {
+    return false;
+  }
+  if (state.timer) {
+    clearTimeout(state.timer);
+  }
+  session._droneWindowSettleState = null;
+  return true;
+}
+
+function refreshDroneWindowInventoryRows(session, state) {
+  if (
+    !session ||
+    !state ||
+    typeof session.sendNotification !== "function" ||
+    (session.socket && session.socket.destroyed)
+  ) {
+    return;
+  }
+
+  const shipRecord = findItemById(state.shipID) || state.shipRecord || null;
+  for (const droneID of state.droneIDs) {
+    const item = findItemById(droneID);
+    if (!item || !isDroneItemRecord(item)) {
+      continue;
+    }
+
+    const entity = state.scene && typeof state.scene.getEntityByID === "function"
+      ? state.scene.getEntityByID(droneID)
+      : null;
+    if (isDroneEntity(entity)) {
+      ensureDroneClientIdentityState(entity, shipRecord, [session], {
+        forceRefresh: true,
+        skipDogmaPrime: true,
+      });
+      continue;
+    }
+
+    if (
+      toInt(item.locationID, 0) !== toInt(state.shipID, 0) ||
+      (
+        toInt(item.flagID, 0) !== ITEM_FLAGS.DRONE_BAY &&
+        toInt(item.flagID, 0) !== ITEM_FLAGS.CARGO_HOLD
+      )
+    ) {
+      continue;
+    }
+    syncInventoryItemForCharacterSession(session, item, {
+      locationID: item.locationID,
+      flagID: item.flagID,
+      quantity: item.quantity,
+      stacksize: item.stacksize,
+      singleton: item.singleton,
+    }, {
+      emitCfgLocation: false,
+    });
+  }
+}
+
+function scheduleDroneWindowInventorySettle(
+  scene,
+  shipRecord,
+  sessions,
+  droneIDs,
+) {
+  const normalizedDroneIDs = [...new Set(
+    (Array.isArray(droneIDs) ? droneIDs : [droneIDs])
+      .map((droneID) => toInt(droneID, 0))
+      .filter((droneID) => droneID > 0),
+  )];
+  if (normalizedDroneIDs.length <= 0) {
+    return 0;
+  }
+
+  let scheduledCount = 0;
+  for (const session of normalizeDroneSessions(sessions)) {
+    let state = session._droneWindowSettleState;
+    if (!state) {
+      state = {
+        timer: null,
+        scene,
+        shipID: toInt(shipRecord && shipRecord.itemID, 0),
+        shipRecord,
+        droneIDs: new Set(),
+      };
+      session._droneWindowSettleState = state;
+    }
+    if (state.timer) {
+      clearTimeout(state.timer);
+    }
+    state.scene = scene;
+    state.shipID = toInt(shipRecord && shipRecord.itemID, state.shipID);
+    state.shipRecord = shipRecord || state.shipRecord;
+    for (const droneID of normalizedDroneIDs) {
+      state.droneIDs.add(droneID);
+    }
+
+    state.timer = setTimeout(() => {
+      if (session._droneWindowSettleState !== state) {
+        return;
+      }
+      session._droneWindowSettleState = null;
+      state.timer = null;
+      refreshDroneWindowInventoryRows(session, state);
+    }, DRONE_WINDOW_SETTLE_DELAY_MS);
+    if (state.timer && typeof state.timer.unref === "function") {
+      state.timer.unref();
+    }
+    scheduledCount += 1;
+  }
+  return scheduledCount;
+}
+
 function buildDroneStateNotificationTuple(entity, overrides = {}) {
   const hasOverride = (key) =>
     Object.prototype.hasOwnProperty.call(overrides || {}, key);
@@ -1316,22 +1850,160 @@ function emitDroneStateChange(entity, overrides = {}, sessions = null) {
   }
 }
 
+function emitDroneStateChangeBatch(scene, entries) {
+  const normalizedEntries = (Array.isArray(entries) ? entries : [])
+    .filter((entry) => entry && entry.entity)
+    .map((entry) => ({
+      entity: entry.entity,
+      overrides: entry.overrides || {},
+      sessions: normalizeDroneSessions(
+        Array.isArray(entry.sessions)
+          ? entry.sessions
+          : getInterestedDroneSessions(entry.entity),
+      ),
+    }));
+  const targetSessions = normalizeDroneSessions(
+    normalizedEntries.flatMap((entry) => entry.sessions),
+  );
+  const destinyReady = canPresentDroneStateOnDestiny(scene);
+
+  for (const session of targetSessions) {
+    const sessionEntries = normalizedEntries.filter(
+      (entry) => entry.sessions.includes(session),
+    );
+    if (sessionEntries.length <= 0) {
+      continue;
+    }
+    if (
+      destinyReady &&
+      session &&
+      session._space &&
+      session._space.initialStateSent === true
+    ) {
+      const presentation = buildDroneStateChangePresentation({
+        scene,
+        stateTuples: sessionEntries.map((entry) => (
+          buildDroneStateNotificationTuple(entry.entity, entry.overrides)
+        )),
+      });
+      const emittedStamp = scene.sendDestinyUpdates(
+        session,
+        presentation.updates,
+        false,
+        presentation.sendOptions,
+      );
+      if (emittedStamp !== null && emittedStamp !== undefined) {
+        continue;
+      }
+    }
+    for (const entry of sessionEntries) {
+      emitDroneStateChange(entry.entity, entry.overrides, [session]);
+    }
+  }
+  if (
+    scene &&
+    typeof scene.flushDirectDestinyNotificationBatchIfIdle === "function"
+  ) {
+    scene.flushDirectDestinyNotificationBatchIfIdle();
+  }
+}
+
 function emitDroneActivityChange(entity, activityID = null, activity = null, sessions = null) {
   const targetSessions = normalizeDroneSessions(
     Array.isArray(sessions)
       ? sessions
       : getInterestedDroneSessions(entity),
   );
+  // A standing pilot assignment outlives any one task, so the (null, null)
+  // clear that every task reset sends must not wipe the assignment line off the
+  // drone entry. Callers that really mean to end it clear the assignment first.
+  const standingAssignment =
+    activityID === null || activityID === undefined
+      ? getDronePilotAssignment(entity)
+      : null;
   const payload = [
     toInt(entity && entity.itemID, 0),
-    toInt(activityID, 0) || null,
-    activity === null || activity === undefined ? null : String(activity),
+    toInt(standingAssignment ? standingAssignment.characterID : activityID, 0) || null,
+    standingAssignment
+      ? standingAssignment.mode
+      : activity === null || activity === undefined
+        ? null
+        : String(activity),
   ];
   for (const session of targetSessions) {
     if (!session || typeof session.sendNotification !== "function") {
       continue;
     }
     session.sendNotification("OnDroneActivityChange", "charid", payload);
+  }
+}
+
+// The tooltip attribute stamps the client last received, per controller ship
+// per drone item. Seeded by every prime emission (launch bay prime, launch
+// space prime, cache-rebuild push) and read by handleControllerDogmaCacheRebuilt
+// so an irrelevant stat change costs one string compare and zero primes.
+// Released the moment a drone leaves its controller's custody (destroyed,
+// abandoned, recalled into a hold) so the map tracks the live drone set; the
+// rebuild-handler prune is only a backstop for anything a lifecycle hook
+// misses.
+const droneTooltipLastSentByShipID = new Map();
+
+function getDroneTooltipLastSentStamp(shipID, droneItemID) {
+  const byDroneID = droneTooltipLastSentByShipID.get(toInt(shipID, 0));
+  return byDroneID
+    ? byDroneID.get(toInt(droneItemID, 0))
+    : undefined;
+}
+
+function setDroneTooltipLastSentStamp(shipID, droneItemID, stamp) {
+  const numericShipID = toInt(shipID, 0);
+  const numericDroneItemID = toInt(droneItemID, 0);
+  if (numericShipID <= 0 || numericDroneItemID <= 0) {
+    return;
+  }
+  let byDroneID = droneTooltipLastSentByShipID.get(numericShipID);
+  if (!byDroneID) {
+    byDroneID = new Map();
+    droneTooltipLastSentByShipID.set(numericShipID, byDroneID);
+  }
+  byDroneID.set(numericDroneItemID, stamp);
+}
+
+// Drop baselines for drones this ship no longer controls (recalled, destroyed,
+// abandoned) so the per-ship map tracks the live drone set.
+function pruneDroneTooltipLastSentStamps(shipID, liveDroneItemIDs) {
+  const byDroneID = droneTooltipLastSentByShipID.get(toInt(shipID, 0));
+  if (!byDroneID) {
+    return;
+  }
+  for (const droneItemID of [...byDroneID.keys()]) {
+    if (!liveDroneItemIDs.has(droneItemID)) {
+      byDroneID.delete(droneItemID);
+    }
+  }
+  if (byDroneID.size === 0) {
+    droneTooltipLastSentByShipID.delete(toInt(shipID, 0));
+  }
+}
+
+// Release one drone's baseline the moment it leaves its controller's custody,
+// so a controller that never triggers another cache rebuild (pilot recalls
+// their drones and logs off) does not keep the entry forever. Callers pass the
+// controller keys they can still read — the transitions clear
+// controllerID/launcherID as part of the release.
+function forgetDroneTooltipLastSentStamp(shipID, droneItemID) {
+  const numericShipID = toInt(shipID, 0);
+  const numericDroneItemID = toInt(droneItemID, 0);
+  if (numericShipID <= 0 || numericDroneItemID <= 0) {
+    return;
+  }
+  const byDroneID = droneTooltipLastSentByShipID.get(numericShipID);
+  if (!byDroneID) {
+    return;
+  }
+  byDroneID.delete(numericDroneItemID);
+  if (byDroneID.size === 0) {
+    droneTooltipLastSentByShipID.delete(numericShipID);
   }
 }
 
@@ -1403,13 +2075,33 @@ function emitDroneDogmaPrime(entity, shipRecord, sessions = null, itemOverride =
       toNumber(entity.volume, null),
     ),
   };
+  // Advertise the operational (skill/ship/module-bonused) attribute map, or
+  // a launched drone's tooltip falls back to base type dogma until the
+  // client re-queries the item.
+  const attributeOverrides = resolveDroneTooltipAttributes(
+    dogmaPrimeItem,
+    targetSessions[0] || null,
+    { controllerShipID: toInt(shipRecord.itemID, 0) },
+  );
   const primeEntry = buildDogmaPrimeEntry(dogmaPrimeItem, {
     description: "drone",
     includeTypeAttributes: true,
+    attributeOverrides: attributeOverrides || {},
   });
   if (!primeEntry) {
     return;
   }
+
+  // Record exactly what the client just received. The cache-rebuild push
+  // (handleControllerDogmaCacheRebuilt) compares freshly resolved values
+  // against this stamp and stays silent when they match. Keyed by ship, not
+  // hung on the drone entity: the launch-time bay prime runs before the
+  // in-space entity exists, and the scene may replace entity instances.
+  setDroneTooltipLastSentStamp(
+    toInt(shipRecord.itemID, 0),
+    toInt(entity.itemID, 0),
+    buildDroneTooltipAttributeStamp(attributeOverrides),
+  );
 
   const primeLocationID = toInt(
     dogmaPrimeItem.locationID,
@@ -1423,11 +2115,86 @@ function emitDroneDogmaPrime(entity, shipRecord, sessions = null, itemOverride =
   }
 }
 
+// Re-advertise a controller's IN-SPACE drone dogma when their stat inputs
+// actually changed. Notified by droneDogma when the per-ship drone stat cache
+// is rebuilt (fingerprint change: refit, module on/off such as an Industrial
+// Core deploying, implants, boosters, system change), which happens at most
+// once per change — never per tick. The fingerprint also flips for changes
+// that cannot move drone values (another character's refit bumping the
+// server-wide counters, a module with no drone modifiers cycling), so each
+// drone's freshly resolved map is compared against the last-advertised stamp
+// (droneTooltipLastSentByShipID, seeded by every prime emission) and only
+// genuinely changed drones are pushed. Drone-bay rows are deliberately NOT
+// refreshed: godma's UpdateItem discards attributes for bay items (the
+// client computes bay tooltips itself), so those primes were pure cost.
+let controllerDogmaCacheRebuildDepth = 0;
+function handleControllerDogmaCacheRebuilt(controllerEntity) {
+  if (!controllerEntity || controllerDogmaCacheRebuildDepth > 0) {
+    return;
+  }
+  const shipID = toInt(controllerEntity.itemID, 0);
+  if (shipID <= 0) {
+    return;
+  }
+  const session = controllerEntity.session || null;
+  const spaceRuntime = getRuntime();
+  const scene = session && spaceRuntime &&
+      typeof spaceRuntime.getSceneForSession === "function"
+    ? spaceRuntime.getSceneForSession(session)
+    : null;
+  if (!scene || typeof scene.getEntityByID !== "function") {
+    return;
+  }
+  const shipRecord = findItemById(shipID);
+  if (!shipRecord) {
+    return;
+  }
+  controllerDogmaCacheRebuildDepth += 1;
+  try {
+    const liveDroneItemIDs = new Set();
+    for (const droneEntity of listControlledDroneEntities(scene, shipID)) {
+      liveDroneItemIDs.add(toInt(droneEntity.itemID, 0));
+      const interestedSessions = getInterestedDroneSessions(droneEntity);
+      if (interestedSessions.length <= 0) {
+        continue;
+      }
+      const droneItem = findItemById(toInt(droneEntity.itemID, 0));
+      if (!droneItem) {
+        continue;
+      }
+      const attributes = resolveDroneTooltipAttributes(
+        droneItem,
+        interestedSessions[0] || session,
+        {
+          controllerShipID: shipID,
+          controllerEntity,
+          scene,
+        },
+      );
+      if (
+        !attributes ||
+        buildDroneTooltipAttributeStamp(attributes) ===
+          getDroneTooltipLastSentStamp(shipID, droneEntity.itemID)
+      ) {
+        continue;
+      }
+      emitDroneDogmaPrime(droneEntity, shipRecord, interestedSessions);
+    }
+    pruneDroneTooltipLastSentStamps(shipID, liveDroneItemIDs);
+  } finally {
+    controllerDogmaCacheRebuildDepth -= 1;
+  }
+}
+setControllerDogmaCacheRebuiltHandler(handleControllerDogmaCacheRebuilt);
+
 function handleDroneDestroyed(scene, droneEntity) {
   if (!scene || !isDroneEntity(droneEntity)) {
     return false;
   }
 
+  forgetDroneTooltipLastSentStamp(droneEntity.controllerID, droneEntity.itemID);
+  forgetDroneTooltipLastSentStamp(droneEntity.launcherID, droneEntity.itemID);
+  clearDroneAssistAssignment(scene, droneEntity);
   const interestedSessions = getInterestedDroneSessions(droneEntity);
   if (interestedSessions.length <= 0) {
     return false;
@@ -1686,21 +2453,85 @@ function resolveShipStorageSnapshotForDrone(controllerEntity) {
   };
 }
 
+function getDroneStorageCapacityByFlag(resourceState, flagID) {
+  if (!resourceState) {
+    return 0;
+  }
+
+  const normalizedFlagID = toInt(flagID, 0);
+  if (normalizedFlagID === ITEM_FLAGS.CARGO_HOLD) {
+    return toNumber(resourceState.cargoCapacity, 0);
+  }
+  // getShipHoldCapacityByFlag only knows the mining holds, so it answers 0 for
+  // the drone bay. Read droneCapacity straight off the resource state — the
+  // same number invBroker bills every other drone bay deposit against.
+  if (normalizedFlagID === ITEM_FLAGS.DRONE_BAY) {
+    return toNumber(resourceState.droneCapacity, 0);
+  }
+  return getShipHoldCapacityByFlag(resourceState, normalizedFlagID);
+}
+
 function getAvailableDroneStorageVolume(storageSnapshot, flagID) {
   if (!storageSnapshot || !storageSnapshot.resourceState) {
     return 0;
   }
 
   const normalizedFlagID = toInt(flagID, 0);
-  const capacity =
-    normalizedFlagID === ITEM_FLAGS.CARGO_HOLD
-      ? toNumber(storageSnapshot.resourceState.cargoCapacity, 0)
-      : getShipHoldCapacityByFlag(
-        storageSnapshot.resourceState,
-        normalizedFlagID,
-      );
+  const capacity = getDroneStorageCapacityByFlag(
+    storageSnapshot.resourceState,
+    normalizedFlagID,
+  );
   const used = toNumber(storageSnapshot.usedByFlag.get(normalizedFlagID), 0);
   return Math.max(0, Number((capacity - used).toFixed(6)));
+}
+
+// Launching a drone hands its item row to itemCustody.custodyRef.inSpace, which
+// stamps flagID 0 and the solar system as the location, so the drone bay reads
+// as empty space the pilot never actually got back. The bay still owes every
+// drone it has out a berth, so that volume is billed as reserved: it is what
+// stops a pilot from refilling the freed volume and then discovering their own
+// drones have nowhere to land.
+function getLaunchedDroneReservedBayVolume(
+  shipID,
+  systemID,
+  ownerID,
+  excludedItemIDs = null,
+) {
+  const normalizedShipID = toInt(shipID, 0);
+  const normalizedSystemID = toInt(systemID, 0);
+  const normalizedOwnerID = toInt(ownerID, 0);
+  if (normalizedShipID <= 0 || normalizedSystemID <= 0 || normalizedOwnerID <= 0) {
+    return 0;
+  }
+
+  let reservedVolume = 0;
+  for (const item of listContainerItems(
+    normalizedOwnerID,
+    normalizedSystemID,
+    0,
+  )) {
+    if (
+      !item ||
+      toInt(item.launcherID, 0) !== normalizedShipID ||
+      !isDroneItemRecord(item) ||
+      (excludedItemIDs && excludedItemIDs.has(toInt(item.itemID, 0)))
+    ) {
+      continue;
+    }
+    reservedVolume += getDroneInventoryVolume(item);
+  }
+
+  return Math.max(0, Number(reservedVolume.toFixed(6)));
+}
+
+function getDroneInventoryVolume(item) {
+  if (!item) {
+    return 0;
+  }
+  const units = toInt(item.singleton, 0) === 1
+    ? 1
+    : Math.max(1, toInt(item.stacksize ?? item.quantity, 1));
+  return Math.max(0, toNumber(item.volume, 0)) * units;
 }
 
 function classifyDroneMiningYieldKind(droneEntity) {
@@ -1914,6 +2745,152 @@ function clearDroneTaskState(droneEntity) {
   droneEntity.activity = null;
 }
 
+// --- Drone pilot assignments -------------------------------------------------
+//
+// ⚠ ASSIST/GUARD ARE STANDING ORDERS, NOT TASKS, so they deliberately
+// do NOT live in clearDroneTaskState above. Retail keeps a drone assisting
+// across kills: it engages what the assisted pilot engages, the target dies,
+// the drone falls idle still assisting, and the assisted pilot's next shot
+// pulls it back in. Guard has the same lifetime across incoming aggressors.
+// Clearing either with the task would make the assignment fire exactly once.
+// It ends only when an order replaces it (engage / mine / salvage / return /
+// abandon / reconnect) or the drone leaves space.
+//
+// The counters are cheap gates for the hot aggression paths. An over-count can
+// only cost a scan that finds no assignment; it can never suppress a dispatch.
+let activeDroneAssistAssignmentCount = 0;
+let activeDroneGuardAssignmentCount = 0;
+
+function getScenePilotAssignedDroneIDs(scene, create = false) {
+  if (!scene) {
+    return null;
+  }
+  if (!(scene.droneAssistEntityIDs instanceof Set)) {
+    if (!create) {
+      return null;
+    }
+    scene.droneAssistEntityIDs = new Set();
+  }
+  return scene.droneAssistEntityIDs;
+}
+
+function getDronePilotAssignment(droneEntity) {
+  const assignment = droneEntity && droneEntity.droneAssist;
+  if (
+    !assignment ||
+    typeof assignment !== "object" ||
+    toInt(assignment.characterID, 0) <= 0
+  ) {
+    return null;
+  }
+  const mode = assignment.mode === DRONE_ACTIVITY_GUARD
+    ? DRONE_ACTIVITY_GUARD
+    : DRONE_ACTIVITY_ASSIST;
+  return assignment.mode === mode
+    ? assignment
+    : { ...assignment, mode };
+}
+
+function getDroneAssistAssignment(droneEntity) {
+  const assignment = getDronePilotAssignment(droneEntity);
+  return assignment && assignment.mode === DRONE_ACTIVITY_ASSIST
+    ? assignment
+    : null;
+}
+
+function getDroneGuardAssignment(droneEntity) {
+  const assignment = getDronePilotAssignment(droneEntity);
+  return assignment && assignment.mode === DRONE_ACTIVITY_GUARD
+    ? assignment
+    : null;
+}
+
+function adjustActiveDronePilotAssignmentCount(mode, delta) {
+  if (mode === DRONE_ACTIVITY_GUARD) {
+    activeDroneGuardAssignmentCount = Math.max(
+      0,
+      activeDroneGuardAssignmentCount + delta,
+    );
+    return;
+  }
+  activeDroneAssistAssignmentCount = Math.max(
+    0,
+    activeDroneAssistAssignmentCount + delta,
+  );
+}
+
+function setDronePilotAssignment(
+  scene,
+  droneEntity,
+  assignedCharacterID,
+  assignedShipID,
+  mode,
+) {
+  const characterID = toInt(assignedCharacterID, 0);
+  const shipID = toInt(assignedShipID, 0);
+  if (
+    !isDroneEntity(droneEntity) ||
+    characterID <= 0 ||
+    shipID <= 0 ||
+    ![DRONE_ACTIVITY_ASSIST, DRONE_ACTIVITY_GUARD].includes(mode)
+  ) {
+    return false;
+  }
+  const previousAssignment = getDronePilotAssignment(droneEntity);
+  if (previousAssignment) {
+    adjustActiveDronePilotAssignmentCount(previousAssignment.mode, -1);
+  }
+  droneEntity.droneAssist = { mode, characterID, shipID };
+  adjustActiveDronePilotAssignmentCount(mode, 1);
+  const assignedDroneIDs = getScenePilotAssignedDroneIDs(scene, true);
+  if (assignedDroneIDs) {
+    assignedDroneIDs.add(toInt(droneEntity.itemID, 0));
+  }
+  return true;
+}
+
+function clearDroneAssistAssignment(scene, droneEntity) {
+  if (!droneEntity) {
+    return false;
+  }
+  const assignment = getDronePilotAssignment(droneEntity);
+  droneEntity.droneAssist = null;
+  const assignedDroneIDs = getScenePilotAssignedDroneIDs(scene);
+  if (assignedDroneIDs) {
+    assignedDroneIDs.delete(toInt(droneEntity.itemID, 0));
+  }
+  if (assignment) {
+    adjustActiveDronePilotAssignmentCount(assignment.mode, -1);
+  }
+  return Boolean(assignment);
+}
+
+function countSceneDronesAssisting(scene, assistCharacterID) {
+  const characterID = toInt(assistCharacterID, 0);
+  const assignedDroneIDs = getScenePilotAssignedDroneIDs(scene);
+  if (!assignedDroneIDs || characterID <= 0) {
+    return 0;
+  }
+
+  let count = 0;
+  for (const droneID of [...assignedDroneIDs]) {
+    const droneEntity = scene.getEntityByID(toInt(droneID, 0));
+    const pilotAssignment = getDronePilotAssignment(droneEntity);
+    if (!isDroneEntity(droneEntity) || !pilotAssignment) {
+      assignedDroneIDs.delete(droneID);
+      continue;
+    }
+    const assistAssignment = getDroneAssistAssignment(droneEntity);
+    if (
+      assistAssignment &&
+      toInt(assistAssignment.characterID, 0) === characterID
+    ) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
 function copyControllerIdentity(droneEntity, controllerEntity = null, controllerOwnerID = 0) {
   if (!droneEntity) {
     return;
@@ -1955,6 +2932,10 @@ function copyControllerIdentity(droneEntity, controllerEntity = null, controller
       controllerEntity.warFactionID,
       toInt(droneEntity.warFactionID, 0),
     );
+    applyPlayerCompanionScopeMetadata(
+      droneEntity,
+      buildPlayerCompanionScopeMetadata(controllerEntity),
+    );
     applyDroneOperationalEntityAttributes(droneEntity, controllerEntity);
   }
 }
@@ -1968,9 +2949,17 @@ function applyDroneOperationalEntityAttributes(droneEntity, controllerEntity = n
     return false;
   }
 
+  const typeID = toInt(droneEntity.typeID, 0);
+  const typeRecord = resolveItemByTypeID(typeID) || null;
   const mass = Math.max(
     1,
-    toNumber(attributes[ATTRIBUTE_MASS], droneEntity.mass || 1),
+    toNumber(
+      attributes[ATTRIBUTE_MASS] ??
+        getTypeAttributeValue(typeID, "mass") ??
+        (typeRecord && typeRecord.mass) ??
+        droneEntity.mass,
+      droneEntity.mass || 1,
+    ),
   );
   const inertia = Math.max(
     0.05,
@@ -1983,8 +2972,11 @@ function applyDroneOperationalEntityAttributes(droneEntity, controllerEntity = n
   });
   motionCommand.applyMassAndInertia();
   const maxVelocity = Math.max(
-    1,
-    toNumber(attributes[ATTRIBUTE_MAX_VELOCITY], droneEntity.maxVelocity || 1),
+    MIN_DRONE_MAX_VELOCITY,
+    toNumber(
+      attributes[ATTRIBUTE_MAX_VELOCITY] ?? droneEntity.maxVelocity,
+      droneEntity.maxVelocity || MIN_DRONE_MAX_VELOCITY,
+    ),
   );
   motionCommand.applyVelocityAndAgility({
     maxVelocity,
@@ -2087,6 +3079,54 @@ function resolveDroneControllerSession(droneEntity, controllerEntity = null) {
   return findSessionByCharacterID(controllerCharacterID) || null;
 }
 
+function resolveDroneMiningLedgerObserverContext(scene, targetEntity) {
+  const observerIDCandidates = [
+    targetEntity && targetEntity.observerItemID,
+    targetEntity && targetEntity.observerID,
+    targetEntity && targetEntity.structureID,
+    targetEntity && targetEntity.ownerStructureID,
+    targetEntity && targetEntity.sourceStructureID,
+    targetEntity && targetEntity.moonMiningStructureID,
+    scene && scene.observerItemID,
+    scene && scene.observerID,
+    scene && scene.structureID,
+  ];
+  const observerNameCandidates = [
+    targetEntity && targetEntity.observerItemName,
+    targetEntity && targetEntity.observerName,
+    targetEntity && targetEntity.structureName,
+    targetEntity && targetEntity.ownerStructureName,
+    targetEntity && targetEntity.sourceStructureName,
+    scene && scene.observerItemName,
+    scene && scene.observerName,
+    scene && scene.structureName,
+  ];
+  return {
+    observerItemID: observerIDCandidates
+      .map((candidate) => toInt(candidate, 0))
+      .find((candidate) => candidate > 0) || 0,
+    observerItemName: observerNameCandidates
+      .find((candidate) => typeof candidate === "string" && candidate.trim())
+      ?.trim() || "",
+  };
+}
+
+function notifyMiningDroneAsteroidDepleted(droneEntity, controllerEntity = null) {
+  const session = resolveDroneControllerSession(droneEntity, controllerEntity);
+  if (!session) {
+    return false;
+  }
+
+  session.sendNotification("OnRemoteMessage", "clientID", [
+    "MiningDronesDeactivatedAsteroidEmpty",
+    buildMarshalDict([
+      ["asteroidname", ""],
+      ["modulename", [4, toInt(droneEntity && droneEntity.typeID, 0)]],
+    ]),
+  ]);
+  return true;
+}
+
 function buildDroneCombatSourceEntity(droneEntity, controllerEntity = null) {
   if (!droneEntity) {
     return null;
@@ -2109,39 +3149,483 @@ function buildDroneCombatSourceEntity(droneEntity, controllerEntity = null) {
   };
 }
 
-function getEntitySurfaceDistance(left, right) {
-  return Math.max(
-    0,
-    distance(left && left.position, right && right.position) -
-      Math.max(0, toNumber(left && left.radius, 0)) -
-      Math.max(0, toNumber(right && right.radius, 0)),
+// Crimewatch belongs to the pilot who ordered the drones, not to the
+// disposable drone ball.  Keep the drone's controller attribution while using
+// the controlling hull as the offender entity (and therefore as CONCORD's
+// response target), matching the fighter activation path.
+function buildDroneCrimewatchSourceEntity(droneEntity, controllerEntity = null) {
+  const combatSourceEntity = buildDroneCombatSourceEntity(
+    droneEntity,
+    controllerEntity,
   );
+  if (!combatSourceEntity || !controllerEntity) {
+    return null;
+  }
+  return {
+    ...combatSourceEntity,
+    itemID: toInt(controllerEntity.itemID, toInt(combatSourceEntity.itemID, 0)),
+    kind: String(controllerEntity.kind || combatSourceEntity.kind || "ship"),
+    position: controllerEntity.position || combatSourceEntity.position,
+    direction: controllerEntity.direction || combatSourceEntity.direction,
+  };
 }
 
-function syncDroneOrbitBehavior(scene, droneEntity, targetEntity, orbitDistanceMeters) {
+function evaluateDroneOffensiveAggression(
+  scene,
+  droneEntity,
+  controllerEntity,
+  targetEntity,
+  nowMs,
+) {
+  const sourceEntity = buildDroneCrimewatchSourceEntity(
+    droneEntity,
+    controllerEntity,
+  );
+  if (!scene || !sourceEntity || !targetEntity) {
+    return { success: false, errorMsg: "DRONE_CONTROLLER_NOT_FOUND" };
+  }
+  try {
+    const crimewatchState = lazyRequire("../security/crimewatchState");
+    if (
+      !crimewatchState ||
+      typeof crimewatchState.evaluateOffensiveAggression !== "function"
+    ) {
+      return { success: false, errorMsg: "CRIMEWATCH_UNAVAILABLE" };
+    }
+    return crimewatchState.evaluateOffensiveAggression(
+      scene,
+      sourceEntity,
+      targetEntity,
+      nowMs,
+    );
+  } catch (error) {
+    log.warn(
+      `[DroneRuntime] Crimewatch engage preflight failed: ${
+        error && error.message || error || "UNKNOWN_ERROR"
+      }`,
+    );
+    return { success: false, errorMsg: "CRIMEWATCH_PREFLIGHT_FAILED" };
+  }
+}
+
+function recordDroneOffensiveAggression(
+  scene,
+  droneEntity,
+  controllerEntity,
+  targetEntity,
+  nowMs,
+) {
+  const sourceEntity = buildDroneCrimewatchSourceEntity(
+    droneEntity,
+    controllerEntity,
+  );
+  if (!scene || !sourceEntity || !targetEntity) {
+    return { success: false, errorMsg: "DRONE_CONTROLLER_NOT_FOUND" };
+  }
+  try {
+    const crimewatchState = lazyRequire("../security/crimewatchState");
+    if (
+      !crimewatchState ||
+      typeof crimewatchState.recordHighSecCriminalAggression !== "function"
+    ) {
+      return { success: false, errorMsg: "CRIMEWATCH_UNAVAILABLE" };
+    }
+    return crimewatchState.recordHighSecCriminalAggression(
+      scene,
+      sourceEntity,
+      targetEntity,
+      nowMs,
+    );
+  } catch (error) {
+    log.warn(
+      `[DroneRuntime] Crimewatch engage commit failed: ${
+        error && error.message || error || "UNKNOWN_ERROR"
+      }`,
+    );
+    return { success: false, errorMsg: "CRIMEWATCH_AGGRESSION_FAILED" };
+  }
+}
+
+function getEntitySurfaceDistance(
+  left,
+  right,
+  scene = null,
+  nowMs = null,
+  reason = "drone-surface-distance",
+) {
+  return getSceneSurfaceDistance(scene, left, right, {
+    nowMs,
+    reason,
+  });
+}
+
+// The controller ship's effective drone control range (metres). Read from the
+// derived droneControlDistance (458) in the ship fitting snapshot the drone
+// runtime already consumes; falls back to the 20 km base when no bonus put 458
+// in the map. This is the radius, centred on the controlling ship, that a
+// drone may operate within.
+function resolveDroneControlRangeMeters(controllerEntity) {
+  if (!controllerEntity) {
+    return DEFAULT_DRONE_CONTROL_DISTANCE_METERS;
+  }
+  const characterID = resolveDroneControllerOwnerCharacterID(controllerEntity);
+  const shipID = toInt(controllerEntity.itemID, 0);
+  if (characterID <= 0 || shipID <= 0) {
+    return DEFAULT_DRONE_CONTROL_DISTANCE_METERS;
+  }
+  const fittingSnapshot = getShipFittingSnapshot(characterID, shipID, {
+    reason: "drone.controlRange",
+  });
+  const shipAttributes =
+    fittingSnapshot && fittingSnapshot.shipAttributes
+      ? fittingSnapshot.shipAttributes
+      : null;
+  const value = shipAttributes
+    ? toNumber(shipAttributes[ATTRIBUTE_DRONE_CONTROL_DISTANCE], NaN)
+    : NaN;
+  return Number.isFinite(value) && value > 0
+    ? value
+    : DEFAULT_DRONE_CONTROL_DISTANCE_METERS;
+}
+
+// True when a target sits outside the controlling ship's drone control range.
+// Used to refuse an engage order (manual, assist or auto-aggression) against a
+// target the drones could not legally operate against.
+function isTargetBeyondDroneControlRange(scene, controllerEntity, targetEntity, now) {
+  if (!scene || !controllerEntity || !targetEntity) {
+    return false;
+  }
+  const controlRangeMeters = resolveDroneControlRangeMeters(controllerEntity);
+  const distanceMeters = getEntitySurfaceDistance(
+    controllerEntity,
+    targetEntity,
+    scene,
+    now,
+    "drone-control-range-gate",
+  );
+  return Number.isFinite(distanceMeters) && distanceMeters > controlRangeMeters;
+}
+
+function readDroneMovementAttribute(
+  attributes,
+  typeID,
+  attributeID,
+  ...attributeNames
+) {
+  if (
+    attributes &&
+    Object.prototype.hasOwnProperty.call(attributes, attributeID) &&
+    attributes[attributeID] !== null &&
+    attributes[attributeID] !== undefined
+  ) {
+    return {
+      present: true,
+      value: toNumber(attributes[attributeID], 0),
+    };
+  }
+
+  const typeValue = getTypeAttributeValue(typeID, ...attributeNames);
+  if (typeValue !== null && typeValue !== undefined) {
+    return {
+      present: true,
+      value: toNumber(typeValue, 0),
+    };
+  }
+  return {
+    present: false,
+    value: 0,
+  };
+}
+
+function resolveDroneMovementProfile(droneEntity, controllerEntity = null) {
+  const itemRecord = resolveDroneRuntimeItemRecord(droneEntity);
+  const typeID = toInt(
+    itemRecord && itemRecord.typeID,
+    toInt(droneEntity && droneEntity.typeID, 0),
+  );
+  const baseAttributes = buildEffectiveItemAttributeMap(itemRecord || typeID);
+  const operationalAttributes = controllerEntity
+    ? resolveDroneOperationalAttributes(droneEntity, controllerEntity)
+    : null;
+  const cachedOperationalAttributes =
+    droneEntity &&
+    droneEntity.passiveDerivedState &&
+    droneEntity.passiveDerivedState.attributes &&
+    typeof droneEntity.passiveDerivedState.attributes === "object"
+      ? droneEntity.passiveDerivedState.attributes
+      : null;
+  const attributes =
+    operationalAttributes || cachedOperationalAttributes || baseAttributes;
+  const itemAttributeOverrides = itemRecord
+    ? getDynamicItemAttributeOverrides(itemRecord)
+    : {};
+  const hasItemFlyRangeOverride = Object.prototype.hasOwnProperty.call(
+    itemAttributeOverrides,
+    ATTRIBUTE_ENTITY_FLY_RANGE,
+  );
+  const hasItemOrbitRangeOverride = Object.prototype.hasOwnProperty.call(
+    itemAttributeOverrides,
+    ATTRIBUTE_ORBIT_RANGE,
+  );
+
+  const maximumVelocityAttribute = readDroneMovementAttribute(
+    attributes,
+    typeID,
+    ATTRIBUTE_MAX_VELOCITY,
+    "maxVelocity",
+  );
+  const maxVelocity = Math.max(
+    MIN_DRONE_MAX_VELOCITY,
+    toNumber(
+      maximumVelocityAttribute.present
+        ? maximumVelocityAttribute.value
+        : droneEntity && droneEntity.maxVelocity,
+      MIN_DRONE_MAX_VELOCITY,
+    ),
+  );
+  const flyRangeAttribute = readDroneMovementAttribute(
+    attributes,
+    typeID,
+    ATTRIBUTE_ENTITY_FLY_RANGE,
+    "entityFlyRange",
+  );
+  const legacyOrbitRangeAttribute = readDroneMovementAttribute(
+    attributes,
+    typeID,
+    ATTRIBUTE_ORBIT_RANGE,
+    "orbitRange",
+  );
+  let orbitDistance = MIN_ORBIT_DISTANCE_METERS;
+  if (hasItemFlyRangeOverride) {
+    orbitDistance = Math.min(
+      MAX_ORBIT_DISTANCE_METERS,
+      Math.max(0, flyRangeAttribute.value),
+    );
+  } else if (
+    hasItemOrbitRangeOverride &&
+    legacyOrbitRangeAttribute.value > 0
+  ) {
+    orbitDistance = clamp(
+      legacyOrbitRangeAttribute.value,
+      MIN_ORBIT_DISTANCE_METERS,
+      MAX_ORBIT_DISTANCE_METERS,
+    );
+  } else if (flyRangeAttribute.present) {
+    orbitDistance = Math.min(
+      MAX_ORBIT_DISTANCE_METERS,
+      Math.max(0, flyRangeAttribute.value),
+    );
+  } else if (legacyOrbitRangeAttribute.present && legacyOrbitRangeAttribute.value > 0) {
+    orbitDistance = clamp(
+      legacyOrbitRangeAttribute.value,
+      MIN_ORBIT_DISTANCE_METERS,
+      MAX_ORBIT_DISTANCE_METERS,
+    );
+  }
+
+  const cruiseSpeedAttribute = readDroneMovementAttribute(
+    attributes,
+    typeID,
+    ATTRIBUTE_ENTITY_CRUISE_SPEED,
+    "entityCruiseSpeed",
+  );
+  const cruiseSpeed = cruiseSpeedAttribute.present
+    ? Math.max(0, cruiseSpeedAttribute.value)
+    : maxVelocity;
+  const cruiseFraction = clamp(cruiseSpeed / maxVelocity, 0, 1);
+  const chaseDistanceAttribute = readDroneMovementAttribute(
+    attributes,
+    typeID,
+    ATTRIBUTE_ENTITY_CHASE_MAX_DISTANCE,
+    "entityChaseMaxDistance",
+  );
+  const chaseDistance = chaseDistanceAttribute.present
+    ? Math.max(0, chaseDistanceAttribute.value)
+    : 0;
+  const fastPropulsionDisabled =
+    maxVelocity <= MIN_DRONE_MAX_VELOCITY + 0.000001 ||
+    (
+      cruiseSpeedAttribute.present &&
+      cruiseSpeed <= 0 &&
+      chaseDistanceAttribute.present &&
+      chaseDistance <= 0
+    );
+
+  return {
+    typeID,
+    maxVelocity,
+    orbitDistance,
+    cruiseSpeed,
+    cruiseFraction,
+    chaseDistance,
+    hasCruiseSpeed: cruiseSpeedAttribute.present,
+    hasChaseDistance: chaseDistanceAttribute.present,
+    fastSpeedFraction: fastPropulsionDisabled ? 0 : 1,
+  };
+}
+
+function resolveDroneControllerEntity(scene, droneEntity) {
+  if (!scene || !droneEntity || typeof scene.getEntityByID !== "function") {
+    return null;
+  }
+  const controllerID = toInt(droneEntity.controllerID, 0);
+  return controllerID > 0 ? scene.getEntityByID(controllerID) || null : null;
+}
+
+function resolveDroneFastPropulsionExitDistance(movementProfile = {}) {
+  const chaseDistance = Math.max(
+    0,
+    toNumber(movementProfile.chaseDistance, 0),
+  );
+  const deadBand = Math.min(
+    chaseDistance,
+    Math.max(
+      Math.max(0, toNumber(movementProfile.orbitDistance, 0)),
+      chaseDistance * DRONE_FAST_PROPULSION_DEAD_BAND_FRACTION,
+    ),
+  );
+  return Math.max(0, chaseDistance - deadBand);
+}
+
+// A distance-only dead band cannot latch against a target that outruns the
+// drone's own cruise speed. Standing down to cruise makes the gap re-diverge by
+// the speed difference every tick, so it blows straight back through
+// chaseDistance and the regime bounces fast/cruise forever — the drone spends
+// half its pursuit decelerating to a speed at which it is losing ground. No
+// widening of the dead band fixes that, because the release is what causes the
+// re-divergence. Cruise may only be selected when cruise can actually hold
+// station. An unknown cruise speed keeps the old distance-only rule.
+function droneCruiseCanHoldStation(targetEntity, movementProfile) {
+  const cruiseSpeed = Math.max(
+    0,
+    toNumber(movementProfile && movementProfile.cruiseSpeed, 0),
+  );
+  if (cruiseSpeed <= 0) {
+    return true;
+  }
+  return magnitude(targetEntity && targetEntity.velocity) <= cruiseSpeed;
+}
+
+function shouldUseFastDronePropulsion(
+  droneEntity,
+  targetEntity,
+  surfaceDistanceMeters,
+  movementProfile,
+  options = {},
+) {
+  if (options.forceFullSpeed === true) {
+    return true;
+  }
+  if (
+    !movementProfile ||
+    !movementProfile.hasChaseDistance ||
+    movementProfile.chaseDistance <= 0
+  ) {
+    return false;
+  }
+  if (!droneCruiseCanHoldStation(targetEntity, movementProfile)) {
+    return true;
+  }
+
+  const surfaceDistance = Math.max(0, toNumber(surfaceDistanceMeters, 0));
+  const fastPropulsionLatched = Boolean(
+    droneEntity &&
+    targetEntity &&
+    String(droneEntity.mode || "").toUpperCase() === "ORBIT" &&
+    entityIDsEqual(droneEntity.targetEntityID, targetEntity.itemID) &&
+    Math.abs(
+      toNumber(droneEntity.speedFraction, 0) -
+        toNumber(movementProfile.fastSpeedFraction, 0),
+    ) <= DRONE_SPEED_FRACTION_EPSILON,
+  );
+  const regimeThreshold = fastPropulsionLatched
+    ? resolveDroneFastPropulsionExitDistance(movementProfile)
+    : movementProfile.chaseDistance;
+  return surfaceDistance > regimeThreshold + ONE_METER;
+}
+
+function syncDroneOrbitBehavior(
+  scene,
+  droneEntity,
+  targetEntity,
+  orbitDistanceMeters,
+  options = {},
+) {
   if (!scene || !droneEntity || !targetEntity) {
     return false;
   }
+  const controllerEntity =
+    options.controllerEntity || resolveDroneControllerEntity(scene, droneEntity);
+  const movementProfile = resolveDroneMovementProfile(
+    droneEntity,
+    controllerEntity,
+  );
   return scene.orbitShipEntity(
     droneEntity,
     targetEntity.itemID,
     Math.max(0, toNumber(orbitDistanceMeters, 0)),
     {
-      broadcast: true,
+      broadcast: options.broadcast !== false,
+      speedFraction: movementProfile.cruiseFraction,
     },
   );
 }
 
-function syncDronePursuitBehavior(scene, droneEntity, targetEntity, followRangeMeters) {
+function syncDronePursuitBehavior(
+  scene,
+  droneEntity,
+  targetEntity,
+  followRangeMeters,
+  options = {},
+) {
   if (!scene || !droneEntity || !targetEntity) {
     return false;
   }
-  return scene.followShipEntity(
+  const controllerEntity =
+    options.controllerEntity || resolveDroneControllerEntity(scene, droneEntity);
+  const movementProfile = resolveDroneMovementProfile(
+    droneEntity,
+    controllerEntity,
+  );
+  const surfaceDistance = Number.isFinite(Number(options.surfaceDistanceMeters))
+    ? Math.max(0, Number(options.surfaceDistanceMeters))
+    : getEntitySurfaceDistance(
+        droneEntity,
+        targetEntity,
+        scene,
+        null,
+        "drone-propulsion-regime",
+      );
+  // TQ's analogous ball-level regime controller samples every five seconds,
+  // and mission captures show one fast-to-cruise retune roughly nine seconds
+  // into a sustained target assignment rather than a tick-by-tick boundary
+  // bounce. Preserve the standing orbit's current regime inside a real spatial
+  // dead band: enter above chaseDistance, but release only after closing by at
+  // least one orbit radius or half of chaseDistance.
+  const useFastPropulsion = shouldUseFastDronePropulsion(
+    droneEntity,
+    targetEntity,
+    surfaceDistance,
+    movementProfile,
+    options,
+  );
+  // TQ never chases with FollowBall. Across the mission captures in
+  // `LOGS/Missions/Done`, every drone engagement is `Orbit(drone, target,
+  // orbitRange)` paired with `SetSpeedFraction`, toggling between 1.0 while
+  // closing and the cruise fraction once on station; the only FollowBall calls
+  // in those logs are the player ship's own keep-at-range. Orbit is also the
+  // only correct law here: Carbon's FOLLOW damps its homing scale once the gap
+  // falls inside one step of travel, which pins a fast drone at exactly its
+  // target's speed and stops it ever closing.
+  return scene.orbitShipEntity(
     droneEntity,
     targetEntity.itemID,
     Math.max(0, toNumber(followRangeMeters, 0)),
     {
-      broadcast: true,
+      broadcast: options.broadcast !== false,
+      speedFraction: useFastPropulsion
+        ? movementProfile.fastSpeedFraction
+        : movementProfile.cruiseFraction,
     },
   );
 }
@@ -2192,6 +3676,7 @@ function persistDroneEntityState(entity) {
     quantity: null,
     stacksize: 1,
     launcherID: toInt(entity.launcherID ?? entity.controllerID, 0) || null,
+    customInfo: buildDroneAbyssalOwnershipCustomInfo(currentItem, entity),
     spaceState: serializeDroneSpaceState(entity),
   }));
   return result.success;
@@ -2233,24 +3718,14 @@ function resolveDroneRuntimeItemRecord(droneItemOrEntity) {
 }
 
 function resolveDroneOrbitDistance(entity) {
-  const itemRecord = resolveDroneRuntimeItemRecord(entity);
-  const typeID = toInt(itemRecord && itemRecord.typeID, toInt(entity && entity.typeID, 0));
-  const attributes = buildEffectiveItemAttributeMap(itemRecord || typeID);
-  const authoredOrbitDistance = toNumber(
-    attributes[ATTRIBUTE_ORBIT_RANGE] ?? getTypeAttributeValue(typeID, "orbitRange"),
-    0,
-  );
-  if (authoredOrbitDistance > 0) {
-    return clamp(
-      authoredOrbitDistance,
-      MIN_ORBIT_DISTANCE_METERS,
-      MAX_ORBIT_DISTANCE_METERS,
-    );
-  }
-  return MIN_ORBIT_DISTANCE_METERS;
+  return resolveDroneMovementProfile(entity).orbitDistance;
 }
 
-function buildDroneLaunchSpaceState(shipEntity, launchIndex = 0) {
+function buildDroneLaunchSpaceState(
+  shipEntity,
+  launchIndex = 0,
+  launchScopeMetadata = {},
+) {
   const shipDirection = normalizeVector(shipEntity && shipEntity.direction, { x: 1, y: 0, z: 0 });
   const lateralDirection = buildPerpendicular(shipDirection);
   const launchDistance =
@@ -2284,6 +3759,9 @@ function buildDroneLaunchSpaceState(shipEntity, launchIndex = 0) {
     pendingWarp: null,
     warpState: null,
     ...buildPlayerCompanionScopeMetadata(shipEntity),
+    ...(launchScopeMetadata && typeof launchScopeMetadata === "object"
+      ? launchScopeMetadata
+      : {}),
   };
 }
 
@@ -2293,27 +3771,46 @@ function hydrateDroneEntityFromItem(entity, itemRecord = null) {
   }
 
   const item = itemRecord || findItemById(entity.itemID) || null;
+  const persistedPosition = item && item.spaceState && item.spaceState.position;
+  const hasPersistedPosition =
+    persistedPosition &&
+    Number.isFinite(Number(persistedPosition.x)) &&
+    Number.isFinite(Number(persistedPosition.y)) &&
+    Number.isFinite(Number(persistedPosition.z));
   const typeID = toInt(item && item.typeID, toInt(entity.typeID, 0));
   const attributes = buildEffectiveItemAttributeMap(item || entity);
+  const cachedOperationalAttributes =
+    entity.passiveDerivedState &&
+    entity.passiveDerivedState.attributes &&
+    typeof entity.passiveDerivedState.attributes === "object"
+      ? entity.passiveDerivedState.attributes
+      : null;
+  const motionAttributes = cachedOperationalAttributes || attributes;
+  const typeRecord = resolveItemByTypeID(typeID) || null;
   const mass = Math.max(
     1,
     toNumber(
-      attributes[ATTRIBUTE_MASS] ?? getTypeAttributeValue(typeID, "mass"),
+      motionAttributes[ATTRIBUTE_MASS] ??
+        getTypeAttributeValue(typeID, "mass") ??
+        (typeRecord && typeRecord.mass) ??
+        entity.mass,
       entity.mass || 1,
     ),
   );
   const inertia = Math.max(
     0.05,
     toNumber(
-      attributes[ATTRIBUTE_AGILITY] ?? getTypeAttributeValue(typeID, "agility"),
+      motionAttributes[ATTRIBUTE_AGILITY] ??
+        getTypeAttributeValue(typeID, "agility"),
       entity.inertia || 0.1,
     ),
   );
   const maxVelocity = Math.max(
-    1,
+    MIN_DRONE_MAX_VELOCITY,
     toNumber(
-      attributes[ATTRIBUTE_MAX_VELOCITY] ?? getTypeAttributeValue(typeID, "maxVelocity"),
-      entity.maxVelocity || 1,
+      motionAttributes[ATTRIBUTE_MAX_VELOCITY] ??
+        getTypeAttributeValue(typeID, "maxVelocity"),
+      entity.maxVelocity || MIN_DRONE_MAX_VELOCITY,
     ),
   );
 
@@ -2363,13 +3860,13 @@ function hydrateDroneEntityFromItem(entity, itemRecord = null) {
   if (!entity.direction) {
     entity.direction = { x: 1, y: 0, z: 0 };
   }
-  if (!entity.position) {
-    entity.position = { x: 0, y: 0, z: 0 };
+  if (!entity.position && hasPersistedPosition) {
+    entity.position = cloneVector(persistedPosition);
   }
   if (!entity.velocity) {
     entity.velocity = { x: 0, y: 0, z: 0 };
   }
-  if (!entity.targetPoint) {
+  if (!entity.targetPoint && entity.position) {
     entity.targetPoint = cloneVector(entity.position);
   }
   return entity;
@@ -2390,6 +3887,23 @@ function buildDroneStateRows(entities = []) {
     ]);
 }
 
+function resolveRuntimeSceneForSession(runtime, session) {
+  if (!runtime || !session || !session._space) {
+    return null;
+  }
+  const sessionScene = typeof runtime.getSceneForSession === "function"
+    ? runtime.getSceneForSession(session)
+    : null;
+  if (sessionScene || sessionClaimsAbyssalScene(session)) {
+    return sessionScene;
+  }
+  return (
+    typeof runtime.ensureScene === "function"
+      ? runtime.ensureScene(toInt(session._space.systemID, 0))
+      : null
+  );
+}
+
 function getShipStateForSession(session) {
   const characterID = toInt(session && (session.characterID || session.charid), 0);
   if (characterID <= 0) {
@@ -2398,10 +3912,9 @@ function getShipStateForSession(session) {
 
   const shipRecord = resolveActiveShipRecord(characterID);
   const runtime = getRuntime();
-  const scene =
-    shipRecord && session && session._space
-      ? runtime.ensureScene(toInt(session._space.systemID, 0))
-      : null;
+  const scene = shipRecord
+    ? resolveRuntimeSceneForSession(runtime, session)
+    : null;
   const shipEntity = scene && shipRecord
     ? scene.getEntityByID(shipRecord.itemID)
     : null;
@@ -2549,6 +4062,8 @@ function isGovernedTransientNpcCombatAssignment(
 }
 
 function assignDroneCombatTask(scene, droneEntity, controllerEntity, targetEntity, options = {}) {
+  const usesManualEngagePlan =
+    options.preflightToken === MANUAL_ENGAGE_PREFLIGHT;
   const governedTransientNpcAssignment =
     isGovernedTransientNpcCombatAssignment(
       droneEntity,
@@ -2556,19 +4071,22 @@ function assignDroneCombatTask(scene, droneEntity, controllerEntity, targetEntit
       targetEntity,
     );
   if (
-    !scene ||
-    !isDroneEntity(droneEntity) ||
-    !controllerEntity ||
-    !targetEntity ||
-    !hasDamageableHealth(targetEntity) ||
+    !usesManualEngagePlan &&
     (
-      !governedTransientNpcAssignment &&
-      !canPlayerCompanionActOnTarget(
-        scene,
-        options.session || null,
-        droneEntity,
-        controllerEntity,
-        targetEntity,
+      !scene ||
+      !isDroneEntity(droneEntity) ||
+      !controllerEntity ||
+      !targetEntity ||
+      !hasDamageableHealth(targetEntity) ||
+      (
+        !governedTransientNpcAssignment &&
+        !canPlayerCompanionActOnTarget(
+          scene,
+          options.session || null,
+          droneEntity,
+          controllerEntity,
+          targetEntity,
+        )
       )
     )
   ) {
@@ -2578,8 +4096,10 @@ function assignDroneCombatTask(scene, droneEntity, controllerEntity, targetEntit
     };
   }
 
-  const snapshot = resolveDroneCombatSnapshot(droneEntity, controllerEntity);
-  if (!snapshot) {
+  const snapshot = usesManualEngagePlan
+    ? options.resolvedSnapshot
+    : resolveDroneCombatSnapshot(droneEntity, controllerEntity);
+  if (!usesManualEngagePlan && !snapshot) {
     return {
       success: false,
       errorMsg: "DRONE_NO_COMBAT_PROFILE",
@@ -2595,6 +4115,21 @@ function assignDroneCombatTask(scene, droneEntity, controllerEntity, targetEntit
         : Date.now(),
     ),
   );
+  // Drones cannot be tasked onto a target outside the ship's drone control
+  // range. The manual path already refused it in commandEngage (before the
+  // crimewatch commit); this guards the assist and auto-aggression paths, so
+  // idle drones only ever pick up targets within range. Once tasked, a drone
+  // keeps chasing its target past control range, as on TQ.
+  if (
+    !usesManualEngagePlan &&
+    !governedTransientNpcAssignment &&
+    isTargetBeyondDroneControlRange(scene, controllerEntity, targetEntity, now)
+  ) {
+    return {
+      success: false,
+      errorMsg: "DRONE_TARGET_OUT_OF_CONTROL_RANGE",
+    };
+  }
   const beforeState = captureDroneClientState(droneEntity);
   const controllerCharacterID = resolveDroneControllerOwnerCharacterID(
     controllerEntity,
@@ -2614,19 +4149,37 @@ function assignDroneCombatTask(scene, droneEntity, controllerEntity, targetEntit
   droneEntity.droneRepair = null;
   droneEntity.targetID = toInt(targetEntity.itemID, 0);
 
-  const distanceToTarget = getEntitySurfaceDistance(droneEntity, targetEntity);
+  const distanceToTarget = getEntitySurfaceDistance(
+    droneEntity,
+    targetEntity,
+    scene,
+    now,
+    "drone-combat-assignment",
+  );
   const ranges = resolveDroneEngagementRanges(snapshot);
+  const movementProfile = resolveDroneMovementProfile(
+    droneEntity,
+    controllerEntity,
+  );
   if (distanceToTarget > ranges.movementRange + 1) {
     syncDronePursuitBehavior(
       scene,
       droneEntity,
       targetEntity,
       ranges.movementRange,
+      {
+        controllerEntity,
+        surfaceDistanceMeters: distanceToTarget,
+      },
     );
     droneEntity.activityState =
-      distanceToTarget > ranges.engagementRange + 1
-        ? STATE_APPROACHING
-        : STATE_COMBAT;
+      movementProfile.hasChaseDistance &&
+      movementProfile.chaseDistance > 0 &&
+      distanceToTarget > movementProfile.chaseDistance + 1
+        ? STATE_PURSUIT
+        : distanceToTarget > ranges.engagementRange + 1
+          ? STATE_APPROACHING
+          : STATE_COMBAT;
   } else if (shouldDroneOrbitTarget(targetEntity)) {
     syncDroneOrbitBehavior(
       scene,
@@ -2697,20 +4250,25 @@ function isFriendlyRepairTarget(controllerEntity, targetEntity) {
 }
 
 function assignDroneRepairTask(scene, droneEntity, controllerEntity, targetEntity, options = {}) {
+  const usesManualEngagePlan =
+    options.preflightToken === MANUAL_ENGAGE_PREFLIGHT;
   if (
-    !scene ||
-    !isDroneEntity(droneEntity) ||
-    !controllerEntity ||
-    !targetEntity ||
-    targetEntity.kind !== "ship" ||
-    !hasDamageableHealth(targetEntity) ||
-    !isFriendlyRepairTarget(controllerEntity, targetEntity) ||
-    !canPlayerCompanionActOnTarget(
-      scene,
-      options.session || null,
-      droneEntity,
-      controllerEntity,
-      targetEntity,
+    !usesManualEngagePlan &&
+    (
+      !scene ||
+      !isDroneEntity(droneEntity) ||
+      !controllerEntity ||
+      !targetEntity ||
+      targetEntity.kind !== "ship" ||
+      !hasDamageableHealth(targetEntity) ||
+      !isFriendlyRepairTarget(controllerEntity, targetEntity) ||
+      !canPlayerCompanionActOnTarget(
+        scene,
+        options.session || null,
+        droneEntity,
+        controllerEntity,
+        targetEntity,
+      )
     )
   ) {
     return {
@@ -2719,8 +4277,10 @@ function assignDroneRepairTask(scene, droneEntity, controllerEntity, targetEntit
     };
   }
 
-  const snapshot = resolveDroneRepairSnapshot(droneEntity, controllerEntity);
-  if (!snapshot) {
+  const snapshot = usesManualEngagePlan
+    ? options.resolvedSnapshot
+    : resolveDroneRepairSnapshot(droneEntity, controllerEntity);
+  if (!usesManualEngagePlan && !snapshot) {
     return {
       success: false,
       errorMsg: "DRONE_NO_REPAIR_PROFILE",
@@ -2755,7 +4315,13 @@ function assignDroneRepairTask(scene, droneEntity, controllerEntity, targetEntit
   droneEntity.droneSalvage = null;
   droneEntity.targetID = toInt(targetEntity.itemID, 0);
 
-  const distanceToTarget = getEntitySurfaceDistance(droneEntity, targetEntity);
+  const distanceToTarget = getEntitySurfaceDistance(
+    droneEntity,
+    targetEntity,
+    scene,
+    now,
+    "drone-repair-assignment",
+  );
   const ranges = resolveDroneEngagementRanges(snapshot);
   if (distanceToTarget > ranges.movementRange + 1) {
     syncDronePursuitBehavior(
@@ -2825,6 +4391,409 @@ function clearRecalledDroneEntityState(droneEntity) {
   droneEntity.droneStateVisible = false;
   droneEntity.activityID = null;
   droneEntity.activity = null;
+}
+
+function buildDroneRecoveryItemPatch(item, customInfo = item && item.customInfo) {
+  const patch = {
+    customInfo,
+    singleton: 1,
+    quantity: 1,
+    stacksize: 1,
+    launcherID: null,
+    spaceState: null,
+  };
+
+  // Space persistence stamps the drone's live conditionState onto its item, so a
+  // drone knocked into armor carries shieldCharge 0 into the bay and redeploys
+  // with no shields at all. Shields and capacitor recharge on their own — only
+  // the armor and hull damage survives being stowed, which is what the station
+  // repair service then charges to undo. Same trade the ship gets on docking.
+  if (item && item.conditionState && typeof item.conditionState === "object") {
+    patch.conditionState = normalizeShipConditionState({
+      ...item.conditionState,
+      charge: 1,
+      shieldCharge: 1,
+    });
+  }
+
+  return patch;
+}
+
+function buildDroneRecallRollbackItemPatch(item) {
+  return {
+    customInfo: item && item.customInfo,
+    singleton: item && item.singleton,
+    quantity: item && item.quantity,
+    stacksize: item && item.stacksize,
+    launcherID: item && item.launcherID,
+    spaceState: item && item.spaceState,
+  };
+}
+
+function rollbackPreparedDroneRecallInventory(entries) {
+  const failures = [];
+  for (const entry of [...(Array.isArray(entries) ? entries : [])].reverse()) {
+    const previousData = entry && entry.sourceItem;
+    const itemID = toInt(entry && entry.droneEntity && entry.droneEntity.itemID, 0);
+    if (!previousData || itemID <= 0) {
+      failures.push(itemID);
+      continue;
+    }
+    const currentItem = findItemById(itemID);
+    if (!currentItem) {
+      failures.push(itemID);
+      continue;
+    }
+    const rollbackResult = itemCustody.transfer({
+      items: { itemID },
+      from: itemCustody.custodyRef.shipBay(
+        toInt(currentItem.ownerID, 0),
+        toInt(currentItem.locationID, 0),
+        toInt(currentItem.flagID, 0),
+      ),
+      to: itemCustody.custodyRef.inSpace(
+        toInt(previousData.ownerID, 0),
+        toInt(previousData.locationID, 0),
+        previousData.spaceState || null,
+      ),
+      reason: itemCustody.CUSTODY_REASON.DRONE_RECOVER_ROLLBACK,
+      actor: toInt(currentItem.ownerID, 0) || null,
+      idempotencyKey:
+        `drone-recover-rollback:${itemID}:` +
+        `${toInt(currentItem.locationID, 0)}:${toInt(previousData.locationID, 0)}`,
+      options: {
+        destinationItemPatch: buildDroneRecallRollbackItemPatch(previousData),
+      },
+    });
+    if (!rollbackResult || rollbackResult.success !== true) {
+      failures.push(itemID);
+    }
+  }
+  return {
+    success: failures.length === 0,
+    failedItemIDs: failures,
+  };
+}
+
+function restoreDroneRecallScene(scene, entries) {
+  const failures = [];
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    const itemID = toInt(entry && entry.droneEntity && entry.droneEntity.itemID, 0);
+    if (itemID <= 0 || scene.getEntityByID(itemID)) {
+      continue;
+    }
+    const item = findItemById(itemID);
+    if (!item || toInt(item.locationID, 0) !== toInt(scene.systemID, 0)) {
+      failures.push(itemID);
+      continue;
+    }
+    const spawnResult = getRuntime().spawnDynamicInventoryEntity(
+      scene.sceneDescriptor || scene.systemID,
+      itemID,
+      {
+        sceneDescriptor: scene.sceneDescriptor || undefined,
+        // Recall removal is withheld until custody commits. A rollback must
+        // restore only local simulation state or clients receive a duplicate
+        // AddBalls for a ball they never lost.
+        broadcast: false,
+        excludedSession: null,
+      },
+    );
+    if (!spawnResult || !spawnResult.success || !spawnResult.data || !spawnResult.data.entity) {
+      failures.push(itemID);
+      continue;
+    }
+    hydrateDroneEntityFromItem(spawnResult.data.entity, item);
+  }
+  markSceneControlledCombatDroneIndexDirty(scene);
+  return {
+    success: failures.length === 0,
+    failedItemIDs: failures,
+  };
+}
+
+// Stowing a drone is a deposit like any other, and the destination is a
+// dogma-limited bay. itemCustody carries no capacity logic of its own, so the
+// volume has to be settled here or an abandoned drone can be scooped into a bay
+// that is already full — repeatedly.
+//
+// Drones this ship still has out are already reserved against the bay (see
+// getLaunchedDroneReservedBayVolume), so excluding the batch from that reserve
+// makes their own recall net out to zero: a drone you launched always has a
+// berth waiting. Only volume nobody reserved — captures, abandoned drones,
+// drones reconnected after the bay was refilled — has to find real free space.
+function getDroneRecallCapacityRefusal(
+  scene,
+  shipRecord,
+  prepared,
+  destinationFlagID,
+) {
+  const shipID = toInt(shipRecord && shipRecord.itemID, 0);
+  const requiredVolume = prepared.reduce(
+    (sum, entry) => sum + getDroneInventoryVolume(entry.sourceItem),
+    0,
+  );
+  if (shipID <= 0 || requiredVolume <= 0) {
+    return null;
+  }
+
+  const shipEntity =
+    scene && typeof scene.getEntityByID === "function"
+      ? scene.getEntityByID(shipID)
+      : null;
+  const storageSnapshot = resolveShipStorageSnapshotForDrone(shipEntity);
+  if (!storageSnapshot) {
+    return null;
+  }
+
+  const reservedVolume =
+    destinationFlagID === ITEM_FLAGS.DRONE_BAY
+      ? getLaunchedDroneReservedBayVolume(
+        shipID,
+        toInt(scene && scene.systemID, 0),
+        toInt(shipRecord && shipRecord.ownerID, 0),
+        new Set(prepared.map((entry) => toInt(entry.sourceItem.itemID, 0))),
+      )
+      : 0;
+  const availableVolume =
+    getAvailableDroneStorageVolume(storageSnapshot, destinationFlagID) -
+    reservedVolume;
+  if (requiredVolume <= availableVolume + 1e-7) {
+    return null;
+  }
+
+  return {
+    success: false,
+    errorMsg:
+      destinationFlagID === ITEM_FLAGS.DRONE_BAY
+        ? "NOT_ENOUGH_DRONE_BAY_SPACE"
+        : "NOT_ENOUGH_CARGO_SPACE",
+  };
+}
+
+function recallDronesToShipBay(
+  scene,
+  shipRecord,
+  droneEntities,
+  destinationFlagID = ITEM_FLAGS.DRONE_BAY,
+) {
+  const shipID = toInt(shipRecord && shipRecord.itemID, 0);
+  const shipOwnerID = toInt(shipRecord && shipRecord.ownerID, 0);
+  const normalizedDestinationFlagID = toInt(
+    destinationFlagID,
+    ITEM_FLAGS.DRONE_BAY,
+  );
+  if (
+    normalizedDestinationFlagID !== ITEM_FLAGS.DRONE_BAY &&
+    normalizedDestinationFlagID !== ITEM_FLAGS.CARGO_HOLD
+  ) {
+    return {
+      success: false,
+      errorMsg: "INVALID_DRONE_SCOOP_DESTINATION",
+    };
+  }
+  const ownerSession = findSessionByCharacterID(toInt(shipRecord && shipRecord.ownerID, 0));
+  const candidates = (Array.isArray(droneEntities) ? droneEntities : [droneEntities])
+    .filter((droneEntity) =>
+      isDroneEntity(droneEntity) &&
+      scene.getEntityByID(toInt(droneEntity && droneEntity.itemID, 0)),
+    );
+  if (candidates.length <= 0) {
+    return {
+      success: false,
+      errorMsg: "DRONE_REMOVE_FAILED",
+    };
+  }
+
+  const recalled = [];
+  const prepared = [];
+  for (const droneEntity of candidates) {
+    const sourceItem = findItemById(droneEntity.itemID);
+    if (
+      !sourceItem ||
+      toInt(sourceItem.locationID, 0) !== toInt(scene.systemID, 0) ||
+      toInt(sourceItem.flagID, 0) !== 0
+    ) {
+      return {
+        success: false,
+        errorMsg: "DRONE_INVENTORY_SOURCE_INVALID",
+      };
+    }
+    prepared.push({
+      droneEntity,
+      sourceItem,
+      interestedSessions: getInterestedDroneSessions(droneEntity),
+    });
+  }
+
+  const capacityRefusal = getDroneRecallCapacityRefusal(
+    scene,
+    shipRecord,
+    prepared,
+    normalizedDestinationFlagID,
+  );
+  if (capacityRefusal) {
+    return capacityRefusal;
+  }
+
+  // Unload carried salvage before any drone leaves space. A drone whose salvage
+  // cannot be unloaded stays out, so the rows are never shut inside a bay item.
+  const unloadNowMs = toNumber(
+    typeof scene.getCurrentSimTimeMs === "function"
+      ? scene.getCurrentSimTimeMs()
+      : scene.simTimeMs,
+    Date.now(),
+  );
+  const shipEntity = scene.getEntityByID(shipID) || null;
+  const unloaded = prepared.filter((entry) => unloadDroneSalvageBeforeRecall(
+    scene,
+    entry.droneEntity,
+    shipEntity,
+    shipOwnerID,
+    unloadNowMs,
+  ));
+  if (unloaded.length <= 0) {
+    return {
+      success: false,
+      errorMsg: "DRONE_SALVAGE_UNLOAD_FAILED",
+    };
+  }
+  prepared.length = 0;
+  prepared.push(...unloaded);
+
+  const removed = [];
+  for (const entry of prepared) {
+    const removeResult = scene.removeDynamicEntity(entry.droneEntity.itemID, {
+      broadcast: false,
+      persistSpaceState: false,
+    });
+    if (!removeResult || removeResult.success !== true) {
+      const restoreResult = restoreDroneRecallScene(scene, [...removed, entry]);
+      return restoreResult.success
+        ? removeResult || { success: false, errorMsg: "DRONE_REMOVE_FAILED" }
+        : {
+            success: false,
+            errorMsg: "DRONE_RECALL_ROLLBACK_FAILED",
+            data: { restoreResult, cause: removeResult || null },
+          };
+    }
+    removed.push(entry);
+  }
+
+  for (const entry of prepared) {
+    const sourceOwnerID = toInt(entry.sourceItem.ownerID, 0);
+    const capture = shipOwnerID > 0 && sourceOwnerID !== shipOwnerID;
+    const bayUpdateResult = itemCustody.transfer({
+      items: { itemID: entry.droneEntity.itemID },
+      from: itemCustody.custodyRef.inSpace(
+        sourceOwnerID,
+        toInt(scene.systemID, 0),
+        entry.sourceItem.spaceState || null,
+      ),
+      to: itemCustody.custodyRef.shipBay(
+        shipOwnerID || sourceOwnerID,
+        shipID,
+        normalizedDestinationFlagID,
+      ),
+      reason: capture
+        ? itemCustody.CUSTODY_REASON.DRONE_CAPTURE
+        : itemCustody.CUSTODY_REASON.DRONE_RECOVER,
+      actor: shipOwnerID || null,
+      idempotencyKey:
+        `${capture ? "drone-capture" : "drone-recover"}:` +
+        `${entry.droneEntity.itemID}:${shipID}:${normalizedDestinationFlagID}`,
+      options: {
+        destinationItemPatch: buildDroneRecoveryItemPatch(
+          entry.sourceItem,
+          buildDroneAbyssalOwnershipCustomInfo(entry.sourceItem, null),
+        ),
+      },
+    });
+    if (!bayUpdateResult.success) {
+      const rollbackResult = rollbackPreparedDroneRecallInventory(
+        recalled,
+      );
+      const restoreResult = restoreDroneRecallScene(scene, prepared);
+      return rollbackResult.success && restoreResult.success
+        ? bayUpdateResult
+        : {
+            success: false,
+            errorMsg: "DRONE_RECALL_ROLLBACK_FAILED",
+            data: { rollbackResult, restoreResult, cause: bayUpdateResult },
+          };
+    }
+
+    recalled.push({
+      ...entry,
+      changes: bayUpdateResult.data && bayUpdateResult.data.changes || [],
+    });
+  }
+
+  for (const entry of recalled) {
+    emitRelevantInventoryChanges(ownerSession, shipID, entry.changes);
+  }
+  emitDroneStateChangeBatch(
+    scene,
+    recalled.map((entry) => ({
+      entity: entry.droneEntity,
+      overrides: {
+        ownerID: null,
+        controllerID: null,
+        activityState: null,
+        typeID: null,
+        controllerOwnerID: null,
+        targetID: null,
+      },
+      sessions: entry.interestedSessions,
+    })),
+  );
+  const recalledDroneIDs = recalled.map((entry) =>
+    toInt(entry && entry.droneEntity && entry.droneEntity.itemID, 0),
+  ).filter((droneID) => droneID > 0);
+  const removalSessions = normalizeDroneSessions([
+    ownerSession,
+    ...recalled.flatMap((entry) => entry.interestedSessions),
+    ...(scene.sessions instanceof Map ? [...scene.sessions.values()] : []),
+  ]);
+  for (const targetSession of removalSessions) {
+    scene.sendRemoveBallsToSession(targetSession, recalledDroneIDs);
+  }
+  scheduleDroneWindowInventorySettle(
+    scene,
+    shipRecord,
+    normalizeDroneSessions([
+      ownerSession,
+      ...recalled.flatMap((entry) => entry.interestedSessions),
+    ]),
+    recalled.map((entry) => entry.droneEntity.itemID),
+  );
+
+  for (const entry of recalled) {
+    // Read the controller keys before clearRecalledDroneEntityState nulls
+    // them — the recall may even capture a foreign drone whose baseline
+    // hangs under its previous controller, not under this ship.
+    forgetDroneTooltipLastSentStamp(
+      entry.droneEntity.controllerID,
+      entry.droneEntity.itemID,
+    );
+    forgetDroneTooltipLastSentStamp(
+      entry.droneEntity.launcherID,
+      entry.droneEntity.itemID,
+    );
+    clearRecalledDroneEntityState(entry.droneEntity);
+  }
+
+  markSceneControlledCombatDroneIndexDirty(scene);
+  return {
+    success: true,
+    data: {
+      droneID: toInt(recalled[0] && recalled[0].droneEntity && recalled[0].droneEntity.itemID, 0),
+      droneIDs: recalled.map((entry) => toInt(entry && entry.droneEntity && entry.droneEntity.itemID, 0)),
+      shipID,
+      destinationFlagID: normalizedDestinationFlagID,
+      changes: recalled.flatMap((entry) => entry.changes),
+    },
+  };
 }
 
 function spawnTransientNpcDroneWing(
@@ -2981,90 +4950,25 @@ function spawnTransientNpcDroneWing(
 }
 
 function recallDronesToBay(scene, shipRecord, droneEntities) {
-  const shipID = toInt(shipRecord && shipRecord.itemID, 0);
-  const shipOwnerID = toInt(shipRecord && shipRecord.ownerID, 0);
-  const ownerSession = findSessionByCharacterID(toInt(shipRecord && shipRecord.ownerID, 0));
-  const candidates = (Array.isArray(droneEntities) ? droneEntities : [droneEntities])
-    .filter((droneEntity) =>
-      isDroneEntity(droneEntity) &&
-      scene.getEntityByID(toInt(droneEntity && droneEntity.itemID, 0)),
-    );
-  if (candidates.length <= 0) {
-    return {
-      success: false,
-      errorMsg: "DRONE_REMOVE_FAILED",
-    };
-  }
-
-  const recalled = [];
-  for (const droneEntity of candidates) {
-    const bayUpdateResult = updateInventoryItem(droneEntity.itemID, (currentItem) => ({
-      ...currentItem,
-      ownerID: shipOwnerID || toInt(currentItem && currentItem.ownerID, 0),
-      locationID: shipID,
-      flagID: ITEM_FLAGS.DRONE_BAY,
-      customInfo: currentItem && currentItem.customInfo ? currentItem.customInfo : "",
-      singleton: 1,
-      quantity: 1,
-      stacksize: 1,
-      launcherID: null,
-      spaceState: null,
-    }));
-    if (!bayUpdateResult.success) {
-      return bayUpdateResult;
-    }
-
-    const changes = [{
-      item: bayUpdateResult.data,
-      previousData: bayUpdateResult.previousData || {},
-    }];
-    emitRelevantInventoryChanges(ownerSession, shipID, changes);
-    recalled.push({
-      droneEntity,
-      interestedSessions: getInterestedDroneSessions(droneEntity),
-      changes,
-    });
-  }
-
-  for (const entry of recalled) {
-    emitDroneStateChange(entry.droneEntity, {
-      ownerID: null,
-      controllerID: null,
-      activityState: null,
-      typeID: null,
-      controllerOwnerID: null,
-      targetID: null,
-    }, entry.interestedSessions);
-  }
-
-  for (const entry of recalled) {
-    const removeResult = scene.removeDynamicEntity(entry.droneEntity.itemID, {
-      broadcast: true,
-      persistSpaceState: false,
-    });
-    if (!removeResult || removeResult.success !== true) {
-      return removeResult || {
-        success: false,
-        errorMsg: "DRONE_REMOVE_FAILED",
-      };
-    }
-    clearRecalledDroneEntityState(entry.droneEntity);
-  }
-
-  markSceneControlledCombatDroneIndexDirty(scene);
-  return {
-    success: true,
-    data: {
-      droneID: toInt(recalled[0] && recalled[0].droneEntity && recalled[0].droneEntity.itemID, 0),
-      droneIDs: recalled.map((entry) => toInt(entry && entry.droneEntity && entry.droneEntity.itemID, 0)),
-      shipID,
-      changes: recalled.flatMap((entry) => entry.changes),
-    },
-  };
+  return recallDronesToShipBay(
+    scene,
+    shipRecord,
+    droneEntities,
+    ITEM_FLAGS.DRONE_BAY,
+  );
 }
 
 function recallDroneToBay(scene, shipRecord, droneEntity) {
   return recallDronesToBay(scene, shipRecord, [droneEntity]);
+}
+
+function recallDroneToCargo(scene, shipRecord, droneEntity) {
+  return recallDronesToShipBay(
+    scene,
+    shipRecord,
+    [droneEntity],
+    ITEM_FLAGS.CARGO_HOLD,
+  );
 }
 
 function launchDronesForSession(session, rawLaunchRequests) {
@@ -3098,6 +5002,25 @@ function launchDronesForSession(session, rawLaunchRequests) {
       response,
     };
   }
+  const launchScope = resolveAbyssalPlayerLaunchScope(
+    session,
+    shipEntity,
+    scene,
+  );
+  if (launchScope.valid !== true) {
+    for (const request of requests) {
+      ensureLaunchResponseEntry(response, request.itemID);
+      appendLaunchError(
+        response,
+        request.itemID,
+        "Unable to launch a drone while the Abyssal room scope is unresolved.",
+      );
+    }
+    return {
+      success: true,
+      response,
+    };
+  }
   const ownerSession = findSessionByCharacterID(toInt(shipRecord && shipRecord.ownerID, 0));
   const launchIdentitySessions = normalizeDroneSessions([session, ownerSession]);
   const fittingSnapshot = getShipFittingSnapshot(characterID, shipRecord.itemID, {
@@ -3109,7 +5032,8 @@ function launchDronesForSession(session, rawLaunchRequests) {
     : {};
   const maxActiveDrones = Math.max(
     0,
-    toInt(shipAttributes[ATTRIBUTE_MAX_ACTIVE_DRONES], 5),
+    // No derived value means the pilot has no Drones skill: no drones in space.
+    toInt(shipAttributes[ATTRIBUTE_MAX_ACTIVE_DRONES], 0),
   );
   const droneBandwidth = Math.max(
     0,
@@ -3117,12 +5041,12 @@ function launchDronesForSession(session, rawLaunchRequests) {
   );
   let activeDroneEntities = listControlledDroneEntities(scene, shipRecord.itemID);
   let activeDroneCount = activeDroneEntities.length;
-  const launchedDroneEntities = [];
+  const launchedDroneEntries = [];
   let usedBandwidth = activeDroneEntities.reduce(
     (sum, entity) => sum + getDroneBandwidthLoad(entity),
     0,
   );
-  let launchIndex = 0;
+  let launchIndex = activeDroneCount;
 
   for (const request of requests) {
     ensureLaunchResponseEntry(response, request.itemID);
@@ -3154,12 +5078,28 @@ function launchDronesForSession(session, rawLaunchRequests) {
         break;
       }
 
-      const moveResult = moveItemToLocation(
-        refreshedSource.itemID,
-        scene.systemID,
-        0,
-        1,
-      );
+      const moveResult = itemCustody.transfer({
+        items: {
+          itemID: refreshedSource.itemID,
+          quantity: 1,
+        },
+        from: itemCustody.custodyRef.shipBay(
+          Number(refreshedSource.ownerID) || 0,
+          shipRecord.itemID,
+          ITEM_FLAGS.DRONE_BAY,
+        ),
+        to: itemCustody.custodyRef.inSpace(
+          Number(refreshedSource.ownerID) || 0,
+          scene.systemID,
+        ),
+        reason: itemCustody.CUSTODY_REASON.DRONE_LAUNCH,
+        actor: characterID,
+        idempotencyKey:
+          `drone-launch:${characterID}:${shipRecord.itemID}:` +
+          `${request.itemID}:` +
+          `${toNumber(scene.getCurrentSimTimeMs && scene.getCurrentSimTimeMs(), Date.now())}:` +
+          `${count}`,
+      });
       if (!moveResult.success) {
         appendLaunchError(response, request.itemID, "Unable to launch that drone.");
         break;
@@ -3184,7 +5124,11 @@ function launchDronesForSession(session, rawLaunchRequests) {
         inventoryChanges,
       );
 
-      const spaceState = buildDroneLaunchSpaceState(shipEntity, launchIndex);
+      const spaceState = buildDroneLaunchSpaceState(
+        shipEntity,
+        launchIndex,
+        launchScope.metadata,
+      );
       const updateResult = updateInventoryItem(launchedItem.itemID, (currentItem) => ({
         ...currentItem,
         singleton: 1,
@@ -3204,16 +5148,36 @@ function launchDronesForSession(session, rawLaunchRequests) {
         launchIdentitySessions,
       );
 
-      const spawnResult = getRuntime().spawnDynamicInventoryEntity(scene.systemID, launchedItem.itemID, {
-        broadcast: true,
-        excludedSession: null,
-      });
+      const spawnResult = getRuntime().spawnDynamicInventoryEntity(
+        scene.sceneDescriptor || scene.systemID,
+        launchedItem.itemID,
+        {
+          sceneDescriptor: scene.sceneDescriptor || undefined,
+          broadcast: false,
+          excludedSession: null,
+        },
+      );
       if (!spawnResult.success || !spawnResult.data || !spawnResult.data.entity) {
         appendLaunchError(response, request.itemID, "Unable to materialize drone in space.");
         break;
       }
 
       const droneEntity = hydrateDroneEntityFromItem(spawnResult.data.entity, updateResult.data);
+      applyPlayerCompanionScopeMetadata(
+        droneEntity,
+        launchScope.metadata,
+      );
+      if (scene && scene.sceneDescriptor) {
+        droneEntity.sceneKey = scene.sceneKey;
+        droneEntity.sceneKind = scene.sceneKind;
+        droneEntity.instanceScope = scene.sceneKind;
+        if (
+          String(scene.sceneKind || "").trim().toLowerCase() === "abyssal" &&
+          toInt(scene.instanceID, 0) > 0
+        ) {
+          droneEntity.abyssalRunID = toInt(scene.instanceID, 0);
+        }
+      }
       droneEntity.launcherID = shipRecord.itemID;
       droneEntity.controllerID = shipRecord.itemID;
       copyControllerIdentity(droneEntity, shipEntity, characterID);
@@ -3226,48 +5190,131 @@ function launchDronesForSession(session, rawLaunchRequests) {
         droneEntity,
         shipEntity,
         droneEntity.droneHomeOrbitDistance,
+        {
+          broadcast: false,
+          controllerEntity: shipEntity,
+        },
       );
       droneEntity.droneStateVisible = true;
       persistDroneEntityState(droneEntity);
       const splitCreatedLaunch =
         toInt(droneEntity.itemID, 0) !== toInt(refreshedSource.itemID, 0);
-      // Keep the first launch-side identity row on the finalized singleton
-      // drone state instead of the transient split-stack row. That gives the
-      // client a real inv/dogma item before OnDroneStateChange2 runs.
-      ensureDroneClientIdentityState(
-        droneEntity,
-        shipRecord,
-        launchIdentitySessions,
-        {
-          forceInsert: splitCreatedLaunch,
-          skipDogmaPrime: true,
-        },
-      );
-      emitDroneStateChange(droneEntity);
       markSceneControlledCombatDroneIndexDirty(scene);
       appendLaunchEntry(response, request.itemID, toInt(droneEntity.itemID, 0));
       activeDroneEntities.push(droneEntity);
-      launchedDroneEntities.push(droneEntity);
+      launchedDroneEntries.push({
+        droneEntity,
+        splitCreatedLaunch,
+      });
       activeDroneCount += 1;
       usedBandwidth += launchBandwidth;
       launchIndex += 1;
     }
   }
 
-  // The drone window reloads from both invCache and Michelle when it receives
-  // OnItemChange. Reassert every launched row only after Michelle has all of
-  // the matching OnDroneStateChange entries for this launch transaction.
+  const launchedDroneEntities = launchedDroneEntries.map(
+    (entry) => entry.droneEntity,
+  );
+  const launchIdentitySessionSet = new Set(launchIdentitySessions);
+  const launchDeliveries = launchedDroneEntities.length > 0
+    ? scene.broadcastAddBalls(launchedDroneEntities, null, {
+        freshAcquire: true,
+        waitForBubble: true,
+        bypassTickPresentationBatch: true,
+        deferDirectDestinyFlush: true,
+        leadingDestinyPayloadsForSession(targetSession, visibleEntities) {
+          if (!launchIdentitySessionSet.has(targetSession)) {
+            return [];
+          }
+          const visibleEntityIDs = new Set(
+            visibleEntities.map((entity) => toInt(entity && entity.itemID, 0)),
+          );
+          return launchedDroneEntities
+            .filter((entity) => visibleEntityIDs.has(toInt(entity && entity.itemID, 0)))
+            .map((entity) => [
+              "OnDroneStateChange",
+              buildDroneStateNotificationTuple(entity),
+            ]);
+        },
+      })
+    : [];
+  const batchDeliveredIdentitySessions = new Set(
+    launchDeliveries
+      .filter((delivery) => delivery && delivery.delivered === true)
+      .map((delivery) => delivery.session)
+      .filter((targetSession) => launchIdentitySessionSet.has(targetSession)),
+  );
+  // Reassert controller-derived motion after the slim refresh, then replay the
+  // acquired ORBIT contract at the exact AddBalls stamp. Hydration preserves
+  // the same operational fields in the encoded ball, so simulation and wire
+  // state cannot disagree during the acquisition boundary.
   for (const droneEntity of launchedDroneEntities) {
+    applyDroneOperationalEntityAttributes(droneEntity, shipEntity);
+  }
+  for (const delivery of launchDeliveries) {
+    if (
+      !delivery ||
+      delivery.delivered !== true ||
+      !delivery.session ||
+      delivery.stamp === null ||
+      delivery.stamp === undefined
+    ) {
+      continue;
+    }
+    const deliveredEntityIDs = new Set(
+      (Array.isArray(delivery.entities) ? delivery.entities : [])
+        .map((entity) => toInt(entity && entity.itemID, 0))
+        .filter((entityID) => entityID > 0),
+    );
+    const modeUpdates = launchedDroneEntities
+      .filter((entity) => deliveredEntityIDs.has(toInt(entity && entity.itemID, 0)))
+      .flatMap((entity) => scene.buildModeUpdates(entity, delivery.stamp));
+    if (modeUpdates.length > 0) {
+      scene.sendDestinyUpdates(delivery.session, modeUpdates, false, {
+        deferDirectDestinyFlush: true,
+        translateStamps: false,
+      });
+    }
+  }
+  if (launchDeliveries.length > 0) {
+    scene.flushDirectDestinyNotificationBatchIfIdle();
+  }
+
+  // Tests and bootstrap callers can launch before Michelle is ready for a
+  // destiny delivery. Keep the legacy direct event only for that pre-ballpark
+  // case; live launches use the golden OnDroneStateChange* + AddBalls2 batch.
+  for (const targetSession of launchIdentitySessions) {
+    if (
+      batchDeliveredIdentitySessions.has(targetSession) ||
+      (targetSession && targetSession._space && targetSession._space.initialStateSent === true)
+    ) {
+      continue;
+    }
+    for (const droneEntity of launchedDroneEntities) {
+      emitDroneStateChange(droneEntity, {}, [targetSession]);
+    }
+  }
+
+  // Prime and advertise only finalized singleton rows, after Michelle has the
+  // complete authoritative launch set. The count remains bounded above by the
+  // fitting snapshot's pilot skill cap and the hull's bandwidth budget.
+  for (const entry of launchedDroneEntries) {
     ensureDroneClientIdentityState(
-      droneEntity,
+      entry.droneEntity,
       shipRecord,
       launchIdentitySessions,
       {
-        forceRefresh: true,
+        forceInsert: entry.splitCreatedLaunch,
         skipDogmaPrime: true,
       },
     );
   }
+  scheduleDroneWindowInventorySettle(
+    scene,
+    shipRecord,
+    launchIdentitySessions,
+    launchedDroneEntities.map((entity) => entity.itemID),
+  );
 
   return {
     success: true,
@@ -3283,7 +5330,7 @@ function commandReturnDrones(session, rawDroneIDs, commandName) {
     return response;
   }
 
-  const { shipRecord, scene } = shipState;
+  const { shipRecord, shipEntity, scene } = shipState;
   const ownerSession = findSessionByCharacterID(toInt(shipRecord && shipRecord.ownerID, 0));
   const interestedSessions = normalizeDroneSessions([session, ownerSession]);
   for (const droneID of droneIDs) {
@@ -3292,14 +5339,50 @@ function commandReturnDrones(session, rawDroneIDs, commandName) {
       appendDroneError(response, droneID, "That drone is not currently under this ship's control.");
       continue;
     }
+    if (
+      !securityScopesExactlyMatch(
+        getPlayerCompanionSecurityScope(droneEntity),
+        getPlayerCompanionSecurityScope(shipEntity, { controller: true }),
+      )
+    ) {
+      appendDroneError(response, droneID, "That drone is not in this private-site room.");
+      continue;
+    }
+
+    // Coming home ends a standing pilot assignment. Clear it before the state
+    // emit below so the drone entry drops its Assist/Guard line with the order.
+    clearDroneAssistAssignment(scene, droneEntity);
 
     const followDistance =
       commandName === DRONE_COMMAND_RETURN_BAY
         ? DRONE_BAY_RETURN_APPROACH_DISTANCE_METERS
         : resolveDroneOrbitDistance(droneEntity);
-    scene.followShipEntity(droneEntity, shipRecord.itemID, followDistance, {
-      broadcast: commandName !== DRONE_COMMAND_RETURN_BAY,
-    });
+    const returnSurfaceDistance = getEntitySurfaceDistance(
+      droneEntity,
+      shipEntity,
+      scene,
+      null,
+      commandName === DRONE_COMMAND_RETURN_BAY
+        ? "drone-return-bay-command"
+        : "drone-return-home-command",
+    );
+    const alreadyWithinScoopRange =
+      commandName === DRONE_COMMAND_RETURN_BAY &&
+      returnSurfaceDistance <= DRONE_BAY_SCOOP_DISTANCE_METERS;
+    if (!alreadyWithinScoopRange) {
+      syncDronePursuitBehavior(
+        scene,
+        droneEntity,
+        shipEntity,
+        followDistance,
+        {
+          broadcast: true,
+          controllerEntity: shipEntity,
+          forceFullSpeed: true,
+          surfaceDistanceMeters: returnSurfaceDistance,
+        },
+      );
+    }
     droneEntity.launcherID = shipRecord.itemID;
     droneEntity.controllerID = shipRecord.itemID;
     droneEntity.controllerOwnerID = toInt(shipRecord.ownerID, 0);
@@ -3364,6 +5447,17 @@ function commandEngage(session, rawDroneIDs, rawTargetID) {
     return response;
   }
 
+  const nowMs = toNumber(
+    scene.getCurrentSimTimeMs && scene.getCurrentSimTimeMs(),
+    Date.now(),
+  );
+  const commandPlans = [];
+  let crimewatchPreflightFailure = null;
+
+  // The retail client asks Crimewatch for the minimum safety level across all
+  // active effects on every selected drone before it sends CmdEngage. Mirror
+  // that as a server-side, mutation-free planning pass so a forged RPC cannot
+  // assign an illegal task before its consequence is durably recorded.
   for (const droneID of droneIDs) {
     const droneEntity = scene.getEntityByID(droneID);
     if (!isDroneEntity(droneEntity) || toInt(droneEntity.controllerID, 0) !== toInt(shipRecord.itemID, 0)) {
@@ -3383,35 +5477,306 @@ function commandEngage(session, rawDroneIDs, rawTargetID) {
       continue;
     }
 
-    stopDroneMiningCycleFx(scene, droneEntity);
-    const assignOptions = {
-      session,
-      nowMs: scene.getCurrentSimTimeMs && scene.getCurrentSimTimeMs(),
-      emitActivity: true,
-    };
-    const repairResult = assignDroneRepairTask(
+    const repairSnapshot =
+      targetEntity.kind === "ship" &&
+      isFriendlyRepairTarget(shipEntity, targetEntity)
+        ? resolveDroneRepairSnapshot(droneEntity, shipEntity)
+        : null;
+    if (repairSnapshot) {
+      commandPlans.push({
+        droneID,
+        droneEntity,
+        taskKind: "repair",
+        snapshot: repairSnapshot,
+      });
+      continue;
+    }
+
+    const combatSnapshot = resolveDroneCombatSnapshot(
+      droneEntity,
+      shipEntity,
+    );
+    if (!combatSnapshot) {
+      appendDroneError(response, droneID, "That drone has no supported engage profile.");
+      continue;
+    }
+
+    if (isTargetBeyondDroneControlRange(scene, shipEntity, targetEntity, nowMs)) {
+      appendDroneError(response, droneID, "That target is out of drone control range.");
+      continue;
+    }
+
+    const crimewatchEvaluation = evaluateDroneOffensiveAggression(
       scene,
       droneEntity,
       shipEntity,
       targetEntity,
-      assignOptions,
+      nowMs,
     );
-    const assignResult = repairResult && repairResult.success === true
-      ? repairResult
-      : assignDroneCombatTask(
-          scene,
-          droneEntity,
-          shipEntity,
-          targetEntity,
-          assignOptions,
-        );
-    if (!assignResult || assignResult.success !== true) {
-      appendDroneError(response, droneID, "That drone has no supported engage profile.");
+    if (!crimewatchEvaluation || crimewatchEvaluation.success !== true) {
+      crimewatchPreflightFailure =
+        crimewatchEvaluation ||
+        { success: false, errorMsg: "CRIMEWATCH_PREFLIGHT_FAILED" };
+      appendDroneError(
+        response,
+        droneID,
+        crimewatchPreflightFailure.errorMsg === "SafetyActivated"
+          ? "Your safety setting prevents that drone attack."
+          : "Crimewatch could not authorize that drone attack.",
+      );
       continue;
+    }
+
+    commandPlans.push({
+      droneID,
+      droneEntity,
+      taskKind: "combat",
+      snapshot: combatSnapshot,
+    });
+  }
+
+  if (crimewatchPreflightFailure) {
+    // The client treats the selected collection as one safety decision. Keep
+    // repair drones in a mixed batch unchanged too; otherwise a rejected
+    // command would report a partial success the client never issues itself.
+    for (const plan of commandPlans) {
+      appendDroneError(
+        response,
+        plan.droneID,
+        crimewatchPreflightFailure.errorMsg === "SafetyActivated"
+          ? "Your safety setting prevents that drone command."
+          : "Crimewatch could not authorize that drone command.",
+      );
+    }
+    return response;
+  }
+
+  const offensivePlans = commandPlans.filter(
+    (plan) => plan.taskKind === "combat",
+  );
+  if (offensivePlans.length > 0) {
+    // CmdEngage is one player order even when it carries several drones. One
+    // durable consequence commits the order without multiplying security hits
+    // or CONCORD responses by the number of selected drone balls.
+    const firstOffensivePlan = offensivePlans[0];
+    const crimewatchCommit = recordDroneOffensiveAggression(
+      scene,
+      firstOffensivePlan.droneEntity,
+      shipEntity,
+      targetEntity,
+      nowMs,
+    );
+    if (!crimewatchCommit || crimewatchCommit.success !== true) {
+      for (const plan of commandPlans) {
+        appendDroneError(
+          response,
+          plan.droneID,
+          "Crimewatch could not authorize that drone command.",
+        );
+      }
+      return response;
+    }
+  }
+
+  for (const plan of commandPlans) {
+    const { droneEntity, snapshot, taskKind } = plan;
+    // An engage order the player gave by hand replaces any standing assignment,
+    // but only after every safety check and durable Crimewatch write succeeds.
+    // This loop is synchronous with the planning pass. The module-private
+    // Symbol consumes those exact entity references and fixed snapshot, so the
+    // assignment helpers have no validation/return-false path after commit.
+    clearDroneAssistAssignment(scene, droneEntity);
+    stopDroneMiningCycleFx(scene, droneEntity);
+    const assignOptions = {
+      session,
+      nowMs,
+      emitActivity: true,
+      resolvedSnapshot: snapshot,
+      preflightToken: MANUAL_ENGAGE_PREFLIGHT,
+    };
+    if (taskKind === "repair") {
+      assignDroneRepairTask(
+        scene,
+        droneEntity,
+        shipEntity,
+        targetEntity,
+        assignOptions,
+      );
+    } else {
+      assignDroneCombatTask(
+        scene,
+        droneEntity,
+        shipEntity,
+        targetEntity,
+        assignOptions,
+      );
     }
   }
 
   return response;
+}
+
+// entity.CmdAssist/CmdGuard(characterID, droneIDs) — attach a standing drone
+// order to a fleet mate without transferring ownership or controller identity.
+//
+// ⚠ THE ARGUMENT ORDER IS THE INVERSE OF ITS SIBLINGS. CmdEngage, CmdSalvage and
+// CmdMineRepeatedly are all (droneIDs, targetID); CmdAssist and CmdGuard are
+// (charID, droneIDs). That is the retail wire, not a typo — see
+// menuSvcExtras/droneFunctions.py Assist().
+//
+// ⚠ THE SUBJECT IS A CHARACTER, NOT A BALL. Every other drone order names a
+// thing in space; these name a PILOT, and the drones then follow that pilot's
+// qualifying NPC combat while the assignment remains valid. The client picks
+// the charID two ways: off the active target (where it does the
+// ship/capsule/fleet checks itself) or
+// straight off the fleet-member menu (where it does none of them and puts a bare
+// charID on the wire). So the server has to be the one that means those checks.
+function commandDronePilotAssignment(session, rawAssignedCharacterID, rawDroneIDs, mode) {
+  const shipState = getShipStateForSession(session);
+  const droneIDs = normalizeDroneIDList(rawDroneIDs);
+  const response = buildMultiDroneResult(droneIDs);
+  if (
+    !shipState ||
+    ![DRONE_ACTIVITY_ASSIST, DRONE_ACTIVITY_GUARD].includes(mode)
+  ) {
+    return response;
+  }
+
+  const { characterID, shipRecord, shipEntity, scene } = shipState;
+  const assignedCharacterID = toInt(rawAssignedCharacterID, 0);
+  const assignedShipRecord =
+    assignedCharacterID > 0 ? resolveActiveShipRecord(assignedCharacterID) : null;
+  const assignedShipEntity = assignedShipRecord
+    ? scene.getEntityByID(toInt(assignedShipRecord.itemID, 0))
+    : null;
+  if (
+    assignedCharacterID <= 0 ||
+    !assignedShipEntity ||
+    String(assignedShipEntity.kind || "") !== "ship" ||
+    toInt(assignedShipEntity.groupID, 0) === GROUP_CAPSULE_ID ||
+    resolveShipPilotCharacterID(assignedShipEntity) !== assignedCharacterID ||
+    !securityScopesExactlyMatch(
+      getPlayerCompanionSecurityScope(shipEntity, { controller: true }),
+      getPlayerCompanionSecurityScope(assignedShipEntity, { controller: true }),
+    )
+  ) {
+    for (const droneID of droneIDs) {
+      appendDroneUserError(
+        response,
+        droneID,
+        "DroneCommandRequiresShipButNotCapsule",
+      );
+    }
+    return response;
+  }
+  // Assigning to yourself is legal and is what the fleet-member menu offers
+  // when you pick your own name. Anyone else must satisfy the fleet rule the
+  // client checks before it draws the entry.
+  if (
+    assignedCharacterID !== characterID &&
+    !charactersShareFleet(characterID, assignedCharacterID)
+  ) {
+    for (const droneID of droneIDs) {
+      appendDroneUserError(
+        response,
+        droneID,
+        "DroneCommandRequiresShipPilotedFleetMember",
+      );
+    }
+    return response;
+  }
+
+  const ownerSession = findSessionByCharacterID(
+    toInt(shipRecord && shipRecord.ownerID, 0),
+  );
+  const interestedSessions = normalizeDroneSessions([session, ownerSession]);
+  let assistingDroneCount = mode === DRONE_ACTIVITY_ASSIST
+    ? countSceneDronesAssisting(scene, assignedCharacterID)
+    : 0;
+  for (const droneID of droneIDs) {
+    const droneEntity = scene.getEntityByID(droneID);
+    if (
+      !isDroneEntity(droneEntity) ||
+      toInt(droneEntity.controllerID, 0) !== toInt(shipRecord.itemID, 0)
+    ) {
+      appendDroneError(response, droneID, "That drone is not currently under this ship's control.");
+      continue;
+    }
+    if (
+      !securityScopesExactlyMatch(
+        getPlayerCompanionSecurityScope(droneEntity),
+        getPlayerCompanionSecurityScope(shipEntity, { controller: true }),
+      )
+    ) {
+      appendDroneError(response, droneID, "That drone is not in this private-site room.");
+      continue;
+    }
+    // Both modes dispatch through the combat assignment path, so a drone with no
+    // combat profile could accept the order and then never act on it. Refuse it
+    // where the player can see the refusal instead.
+    if (!isDroneCombatCapable(droneEntity, shipEntity)) {
+      appendDroneError(response, droneID, "That drone has no supported engage profile.");
+      continue;
+    }
+
+    const existingAssignment = getDronePilotAssignment(droneEntity);
+    const isNewSubject =
+      !existingAssignment ||
+      existingAssignment.mode !== mode ||
+      toInt(existingAssignment.characterID, 0) !== assignedCharacterID;
+    if (
+      mode === DRONE_ACTIVITY_ASSIST &&
+      isNewSubject &&
+      assistingDroneCount >= MAX_DRONE_ASSIST
+    ) {
+      appendDroneError(
+        response,
+        droneID,
+        "That pilot already has the maximum number of assisting drones.",
+      );
+      continue;
+    }
+    if (mode === DRONE_ACTIVITY_ASSIST && isNewSubject) {
+      assistingDroneCount += 1;
+    }
+
+    setDronePilotAssignment(
+      scene,
+      droneEntity,
+      assignedCharacterID,
+      assignedShipRecord.itemID,
+      mode,
+    );
+    droneEntity.activity = mode;
+    droneEntity.activityID = assignedCharacterID;
+    persistDroneEntityState(droneEntity);
+    emitDroneActivityChange(
+      droneEntity,
+      assignedCharacterID,
+      mode,
+      interestedSessions,
+    );
+  }
+
+  return response;
+}
+
+function commandAssist(session, rawAssistID, rawDroneIDs) {
+  return commandDronePilotAssignment(
+    session,
+    rawAssistID,
+    rawDroneIDs,
+    DRONE_ACTIVITY_ASSIST,
+  );
+}
+
+function commandGuard(session, rawGuardID, rawDroneIDs) {
+  return commandDronePilotAssignment(
+    session,
+    rawGuardID,
+    rawDroneIDs,
+    DRONE_ACTIVITY_GUARD,
+  );
 }
 
 function assignDroneSalvageTask({
@@ -3464,6 +5829,8 @@ function assignDroneSalvageTask({
     snapshot.accessBonusPercent,
   );
   const beforeState = captureDroneClientState(droneEntity);
+  // A salvage order the player gave by hand replaces any standing assignment.
+  clearDroneAssistAssignment(scene, droneEntity);
   stopDroneMiningCycleFx(scene, droneEntity);
   copyControllerIdentity(droneEntity, shipEntity, characterID);
   droneEntity.launcherID = toInt(shipRecord && shipRecord.itemID, toInt(shipEntity.itemID, 0));
@@ -3484,7 +5851,13 @@ function assignDroneSalvageTask({
   droneEntity.droneCombat = null;
   droneEntity.droneRepair = null;
 
-  const distanceToTarget = getEntitySurfaceDistance(droneEntity, targetEntity);
+  const distanceToTarget = getEntitySurfaceDistance(
+    droneEntity,
+    targetEntity,
+    scene,
+    scene.simTimeMs,
+    "drone-salvage-assignment",
+  );
   const orbitDistance = Math.max(
     MIN_ORBIT_DISTANCE_METERS,
     toNumber(snapshot.orbitDistanceMeters, MIN_ORBIT_DISTANCE_METERS),
@@ -3505,11 +5878,15 @@ function assignDroneSalvageTask({
   return { success: true };
 }
 
-function isOwnedSalvageCandidate(targetEntity, characterID) {
+function isAutomaticSalvageCandidate(targetEntity, characterID) {
+  // Unattended selection includes the pilot's and current fleet mates' wrecks.
+  // Explicit salvage orders may target any pilot's wreck.
+  const ownerID = toInt(targetEntity && targetEntity.ownerID, 0);
   return Boolean(
     targetEntity &&
       salvagerRuntime.isSalvageableTarget(targetEntity) &&
-      toInt(targetEntity.ownerID, 0) === toInt(characterID, 0)
+      (ownerID === toInt(characterID, 0) ||
+        charactersShareFleet(characterID, ownerID))
   );
 }
 
@@ -3537,7 +5914,7 @@ function resolveAutomaticSalvageTarget(
     if (
       targetID <= 0 ||
       (assignedTargetIDs instanceof Set && assignedTargetIDs.has(targetID)) ||
-      !isOwnedSalvageCandidate(targetEntity, characterID) ||
+      !isAutomaticSalvageCandidate(targetEntity, characterID) ||
       !canPlayerCompanionActOnTarget(
         scene,
         session,
@@ -3549,8 +5926,20 @@ function resolveAutomaticSalvageTarget(
       continue;
     }
 
-    const distanceToShip = getEntitySurfaceDistance(shipEntity, targetEntity);
-    const distanceToDrone = getEntitySurfaceDistance(droneEntity, targetEntity);
+    const distanceToShip = getEntitySurfaceDistance(
+      shipEntity,
+      targetEntity,
+      scene,
+      scene.simTimeMs,
+      "drone-auto-salvage-ship",
+    );
+    const distanceToDrone = getEntitySurfaceDistance(
+      droneEntity,
+      targetEntity,
+      scene,
+      scene.simTimeMs,
+      "drone-auto-salvage-drone",
+    );
     const candidateDistance = Math.min(distanceToShip, distanceToDrone);
     if (candidateDistance < bestDistance) {
       bestDistance = candidateDistance;
@@ -3627,6 +6016,8 @@ function commandMineRepeatedly(session, rawDroneIDs, rawTargetID) {
         toNumber(scene.getCurrentSimTimeMs && scene.getCurrentSimTimeMs(), Date.now()),
         Date.now(),
       );
+      // A mining order the player gave by hand replaces any standing assignment.
+      clearDroneAssistAssignment(scene, droneEntity);
       stopDroneMiningCycleFx(scene, droneEntity);
       copyControllerIdentity(droneEntity, shipEntity, characterID);
       droneEntity.launcherID = shipRecord.itemID;
@@ -3644,7 +6035,13 @@ function commandMineRepeatedly(session, rawDroneIDs, rawTargetID) {
       droneEntity.droneCombat = null;
       droneEntity.droneRepair = null;
 
-      const distanceToTarget = getEntitySurfaceDistance(droneEntity, targetEntity);
+      const distanceToTarget = getEntitySurfaceDistance(
+        droneEntity,
+        targetEntity,
+        scene,
+        nowMs,
+        "drone-mining-assignment",
+      );
       const orbitDistance = Math.max(
         MIN_ORBIT_DISTANCE_METERS,
         toNumber(snapshot.orbitDistanceMeters, MIN_ORBIT_DISTANCE_METERS),
@@ -3739,7 +6136,7 @@ function commandSalvage(session, rawDroneIDs, rawTargetID) {
         session,
       );
     if (!targetEntity) {
-      appendDroneError(response, droneID, "No owned salvageable wreck is available.");
+      appendDroneError(response, droneID, "No salvageable wreck owned by you or a fleet member is available.");
       continue;
     }
 
@@ -3799,6 +6196,9 @@ function abandonDroneInSpace(scene, droneEntity, options = {}) {
     return false;
   }
 
+  forgetDroneTooltipLastSentStamp(droneEntity.controllerID, droneEntity.itemID);
+  forgetDroneTooltipLastSentStamp(droneEntity.launcherID, droneEntity.itemID);
+
   if (options.stopMovement !== false && typeof scene.stopShipEntity === "function") {
     scene.stopShipEntity(droneEntity, {
       allowSessionOwned: true,
@@ -3812,6 +6212,7 @@ function abandonDroneInSpace(scene, droneEntity, options = {}) {
   droneEntity.targetID = null;
   droneEntity.activityState = STATE_IDLE;
   stopDroneMiningCycleFx(scene, droneEntity);
+  clearDroneAssistAssignment(scene, droneEntity);
   clearDroneTaskState(droneEntity);
   droneEntity.droneStateVisible = false;
   droneEntity.activityID = null;
@@ -3858,14 +6259,26 @@ function handleControllerLost(scene, controllerEntity, options = {}) {
   const shouldAttemptBayRecovery =
     options.attemptBayRecovery === true ||
     ["disconnect", "logoff"].includes(String(options.lifecycleReason || "").trim().toLowerCase());
+  const requestedEntityIDs = Array.isArray(options.entityIDs)
+    ? new Set(normalizeDroneIDList(options.entityIDs))
+    : null;
   let releasedCount = 0;
   let recoveredCount = 0;
 
   for (const droneEntity of listControlledDroneEntities(scene, controllerID)) {
+    if (requestedEntityIDs && !requestedEntityIDs.has(toInt(droneEntity.itemID, 0))) {
+      continue;
+    }
     if (
       shouldAttemptBayRecovery &&
       shipRecord &&
-      getEntitySurfaceDistance(droneEntity, controllerEntity) <= DRONE_BAY_SCOOP_DISTANCE_METERS
+      getEntitySurfaceDistance(
+        droneEntity,
+        controllerEntity,
+        scene,
+        toNumber(options.nowMs, scene.simTimeMs),
+        "drone-controller-loss-recovery",
+      ) <= DRONE_BAY_SCOOP_DISTANCE_METERS
     ) {
       const recallResult = recallDroneToBay(scene, shipRecord, droneEntity);
       if (recallResult && recallResult.success === true) {
@@ -3893,7 +6306,7 @@ function commandReconnectToDrones(session, rawDroneIDs) {
     return buildMarshalDict();
   }
 
-  const { characterID, shipRecord, scene } = shipState;
+  const { characterID, shipRecord, shipEntity, scene } = shipState;
   const droneIDs = normalizeDroneIDList(rawDroneIDs);
   const fittingSnapshot = getShipFittingSnapshot(characterID, shipRecord.itemID, {
     shipItem: shipRecord,
@@ -3904,7 +6317,8 @@ function commandReconnectToDrones(session, rawDroneIDs) {
     : {};
   const maxActiveDrones = Math.max(
     0,
-    toInt(shipAttributes[ATTRIBUTE_MAX_ACTIVE_DRONES], 5),
+    // No derived value means the pilot has no Drones skill: no drones in space.
+    toInt(shipAttributes[ATTRIBUTE_MAX_ACTIVE_DRONES], 0),
   );
   const droneBandwidth = Math.max(
     0,
@@ -3925,6 +6339,14 @@ function commandReconnectToDrones(session, rawDroneIDs) {
     if (toInt(droneEntity.ownerID, 0) !== characterID || toInt(droneEntity.controllerID, 0) > 0) {
       continue;
     }
+    if (
+      !securityScopesExactlyMatch(
+        getPlayerCompanionSecurityScope(droneEntity),
+        getPlayerCompanionSecurityScope(shipEntity, { controller: true }),
+      )
+    ) {
+      continue;
+    }
     if (maxActiveDrones <= 0 || activeDroneCount >= maxActiveDrones) {
       return buildNotifyErrorResult("Maximum active drones already in space.");
     }
@@ -3942,6 +6364,7 @@ function commandReconnectToDrones(session, rawDroneIDs) {
     copyControllerIdentity(droneEntity, scene.getEntityByID(shipRecord.itemID), characterID);
     droneEntity.activityState = STATE_IDLE;
     droneEntity.targetID = null;
+    clearDroneAssistAssignment(scene, droneEntity);
     clearDroneTaskState(droneEntity);
     droneEntity.droneStateVisible = true;
     droneEntity.launcherID = shipRecord.itemID;
@@ -3975,18 +6398,126 @@ function scoopDrone(session, rawDroneIDs) {
       appendDroneError(response, droneID, "That drone cannot currently be scooped into the drone bay.");
       continue;
     }
-    if (getEntitySurfaceDistance(droneEntity, shipEntity) > DRONE_BAY_SCOOP_DISTANCE_METERS) {
+    if (
+      !securityScopesExactlyMatch(
+        getPlayerCompanionSecurityScope(droneEntity),
+        getPlayerCompanionSecurityScope(shipEntity, { controller: true }),
+      )
+    ) {
+      appendDroneError(response, droneID, "That drone is not in this private-site room.");
+      continue;
+    }
+    if (
+      getEntitySurfaceDistance(
+        droneEntity,
+        shipEntity,
+        scene,
+        scene.simTimeMs,
+        "drone-scoop",
+      ) > DRONE_BAY_SCOOP_DISTANCE_METERS
+    ) {
       appendDroneError(response, droneID, "Drone is too far away to scoop into the bay.");
       continue;
     }
 
     const recallResult = recallDroneToBay(scene, shipRecord, droneEntity);
     if (!recallResult || recallResult.success !== true) {
+      if (
+        recallResult &&
+        recallResult.errorMsg === "NOT_ENOUGH_DRONE_BAY_SPACE"
+      ) {
+        appendDroneUserError(response, droneID, "NotEnoughDroneBaySpace");
+        continue;
+      }
       appendDroneError(response, droneID, "Unable to scoop that drone.");
     }
   }
 
   return response;
+}
+
+function scoopDroneToCargo(session, rawDroneID) {
+  const shipState = getShipStateForSession(session);
+  if (!shipState) {
+    return {
+      success: false,
+      errorMsg: "INVALID_SESSION",
+    };
+  }
+
+  const droneID = toInt(rawDroneID, 0);
+  const { shipRecord, shipEntity, scene } = shipState;
+  const droneEntity = droneID > 0 ? scene.getEntityByID(droneID) : null;
+  if (!isDroneEntity(droneEntity)) {
+    return {
+      success: false,
+      errorMsg: "TARGET_NOT_FOUND",
+    };
+  }
+  if (toInt(droneEntity.controllerID, 0) > 0) {
+    return {
+      success: false,
+      errorMsg: "DRONE_CONTROLLED",
+    };
+  }
+  if (
+    !securityScopesExactlyMatch(
+      getPlayerCompanionSecurityScope(droneEntity),
+      getPlayerCompanionSecurityScope(shipEntity, { controller: true }),
+    )
+  ) {
+    return {
+      success: false,
+      errorMsg: "DRONE_SECURITY_SCOPE_MISMATCH",
+    };
+  }
+  if (
+    getEntitySurfaceDistance(
+      droneEntity,
+      shipEntity,
+      scene,
+      scene.simTimeMs,
+      "drone-cargo-scoop",
+    ) > DRONE_BAY_SCOOP_DISTANCE_METERS
+  ) {
+    return {
+      success: false,
+      errorMsg: "TARGET_TOO_FAR",
+    };
+  }
+
+  const sourceItem = findItemById(droneID);
+  if (
+    !sourceItem ||
+    !isDroneItemRecord(sourceItem) ||
+    toInt(sourceItem.locationID, 0) !== toInt(scene.systemID, 0) ||
+    toInt(sourceItem.flagID, 0) !== 0
+  ) {
+    return {
+      success: false,
+      errorMsg: "DRONE_INVENTORY_SOURCE_INVALID",
+    };
+  }
+
+  const requiredVolume = getDroneInventoryVolume(sourceItem);
+  const storageSnapshot = resolveShipStorageSnapshotForDrone(shipEntity);
+  if (!storageSnapshot || requiredVolume <= 0) {
+    return {
+      success: false,
+      errorMsg: "SHIP_CARGO_UNAVAILABLE",
+    };
+  }
+  if (
+    requiredVolume >
+    getAvailableDroneStorageVolume(storageSnapshot, ITEM_FLAGS.CARGO_HOLD) + 1e-7
+  ) {
+    return {
+      success: false,
+      errorMsg: "NOT_ENOUGH_CARGO_SPACE",
+    };
+  }
+
+  return recallDroneToCargo(scene, shipRecord, droneEntity);
 }
 
 function resetDroneToIdle(droneEntity, controllerEntity = null, options = {}) {
@@ -4090,6 +6621,279 @@ function idleMiningDronesTargeting(scene, rawTargetID, options = {}) {
   return idledCount;
 }
 
+function resolveAggressionScene(entity) {
+  const systemID = toInt(entity && entity.systemID, 0);
+  if (!entity || systemID <= 0) {
+    return null;
+  }
+
+  const runtime = getRuntime();
+  const scene =
+    runtime && typeof runtime.findSceneContainingDynamicEntity === "function"
+      ? runtime.findSceneContainingDynamicEntity(toInt(entity.itemID, 0))
+      : null;
+  return scene ||
+    (
+      runtime && typeof runtime.getSceneByDescriptor === "function" && entity.sceneKey
+        ? runtime.getSceneByDescriptor({
+          sceneKey: entity.sceneKey,
+          sceneKind: entity.sceneKind,
+          instanceID: entity.abyssalRunID || entity.instanceID,
+          locationID: entity.locationID || systemID,
+          solarSystemID: entity.locationID || systemID,
+        })
+        : null
+    ) ||
+    (
+      runtime && typeof runtime.ensureScene === "function"
+        ? runtime.ensureScene(systemID)
+        : null
+    );
+}
+
+function isNativeNpcDroneAssignmentTarget(entity) {
+  return Boolean(
+    entity &&
+      String(entity.kind || "") === "ship" &&
+      entity.nativeNpc === true &&
+      entity.nativeNpcOccupied === true &&
+      !entity.session &&
+      toInt(entity.characterID, 0) === 0 &&
+      toInt(entity.pilotCharacterID, 0) === 0,
+  );
+}
+
+function resolveShipPilotCharacterID(entity) {
+  return toInt(
+    entity && entity.session &&
+      (entity.session.characterID || entity.session.charid || entity.session.charID) ||
+      entity && (entity.pilotCharacterID || entity.characterID),
+    0,
+  );
+}
+
+function getDroneCombatAssignmentMode(droneEntity) {
+  const combatState =
+    droneEntity && droneEntity.droneCombat && typeof droneEntity.droneCombat === "object"
+      ? droneEntity.droneCombat
+      : null;
+  if (!combatState) {
+    return null;
+  }
+  if ([DRONE_ACTIVITY_ASSIST, DRONE_ACTIVITY_GUARD].includes(combatState.assignmentMode)) {
+    return combatState.assignmentMode;
+  }
+  return combatState.assistAssigned === true ? DRONE_ACTIVITY_ASSIST : null;
+}
+
+function resolveDronePilotAssignmentContext(
+  scene,
+  droneEntity,
+  expectedMode = null,
+  assignedShipEntity = null,
+) {
+  const assignment = getDronePilotAssignment(droneEntity);
+  if (
+    !scene ||
+    !isDroneEntity(droneEntity) ||
+    !assignment ||
+    (expectedMode && assignment.mode !== expectedMode)
+  ) {
+    return null;
+  }
+
+  const controllerEntity = scene.getEntityByID(toInt(droneEntity.controllerID, 0));
+  const resolvedAssignedShip = assignedShipEntity ||
+    scene.getEntityByID(toInt(assignment.shipID, 0));
+  const ownerCharacterID = resolveDroneControllerOwnerCharacterID(
+    controllerEntity,
+    droneEntity,
+  );
+  const assignedCharacterID = toInt(assignment.characterID, 0);
+  if (
+    !controllerEntity ||
+    !resolvedAssignedShip ||
+    String(resolvedAssignedShip.kind || "") !== "ship" ||
+    toInt(resolvedAssignedShip.itemID, 0) !== toInt(assignment.shipID, 0) ||
+    resolveShipPilotCharacterID(resolvedAssignedShip) !== assignedCharacterID ||
+    toInt(droneEntity.ownerID, 0) !== ownerCharacterID ||
+    toInt(droneEntity.controllerOwnerID, 0) !== ownerCharacterID ||
+    toInt(droneEntity.launcherID, 0) !== toInt(controllerEntity.itemID, 0) ||
+    (
+      ownerCharacterID !== assignedCharacterID &&
+      !charactersShareFleet(ownerCharacterID, assignedCharacterID)
+    ) ||
+    !securityScopesExactlyMatch(
+      getPlayerCompanionSecurityScope(droneEntity),
+      getPlayerCompanionSecurityScope(controllerEntity, { controller: true }),
+    ) ||
+    !securityScopesExactlyMatch(
+      getPlayerCompanionSecurityScope(controllerEntity, { controller: true }),
+      getPlayerCompanionSecurityScope(resolvedAssignedShip, { controller: true }),
+    )
+  ) {
+    return null;
+  }
+
+  return {
+    assignment,
+    controllerEntity,
+    assignedShipEntity: resolvedAssignedShip,
+  };
+}
+
+function invalidateDronePilotAssignment(scene, droneEntity, controllerEntity = null) {
+  const assignmentDerivedCombat = Boolean(getDroneCombatAssignmentMode(droneEntity));
+  const cleared = clearDroneAssistAssignment(scene, droneEntity);
+  if (assignmentDerivedCombat) {
+    resetDroneToIdle(droneEntity, controllerEntity, {
+      scene,
+      stopMovement: Boolean(controllerEntity),
+    });
+  } else if (cleared) {
+    droneEntity.activityID = null;
+    droneEntity.activity = null;
+    persistDroneEntityState(droneEntity);
+    emitDroneActivityChange(droneEntity, null, null);
+  }
+  return cleared;
+}
+
+function dispatchDronePilotAssignment(
+  scene,
+  assignedShipEntity,
+  combatTargetEntity,
+  mode,
+  whenMs,
+) {
+  const activeCount = mode === DRONE_ACTIVITY_GUARD
+    ? activeDroneGuardAssignmentCount
+    : activeDroneAssistAssignmentCount;
+  if (
+    activeCount <= 0 ||
+    !scene ||
+    ![DRONE_ACTIVITY_ASSIST, DRONE_ACTIVITY_GUARD].includes(mode) ||
+    !isNativeNpcDroneAssignmentTarget(combatTargetEntity) ||
+    !hasDamageableHealth(combatTargetEntity)
+  ) {
+    return 0;
+  }
+
+  const assignedCharacterID = resolveShipPilotCharacterID(assignedShipEntity);
+  const assignedShipID = toInt(assignedShipEntity && assignedShipEntity.itemID, 0);
+  const assignedDroneIDs = getScenePilotAssignedDroneIDs(scene);
+  if (assignedCharacterID <= 0 || !assignedDroneIDs || assignedDroneIDs.size <= 0) {
+    return 0;
+  }
+
+  const assignedTarget = scene.getEntityByID(toInt(combatTargetEntity.itemID, 0));
+  if (!assignedTarget || !isNativeNpcDroneAssignmentTarget(assignedTarget)) {
+    return 0;
+  }
+
+  let engagedCount = 0;
+  for (const droneID of [...assignedDroneIDs]) {
+    const droneEntity = scene.getEntityByID(toInt(droneID, 0));
+    const assignment = getDronePilotAssignment(droneEntity);
+    if (!isDroneEntity(droneEntity) || !assignment) {
+      assignedDroneIDs.delete(droneID);
+      continue;
+    }
+    if (
+      assignment.mode !== mode ||
+      toInt(assignment.characterID, 0) !== assignedCharacterID ||
+      toInt(assignment.shipID, 0) !== assignedShipID
+    ) {
+      continue;
+    }
+
+    const context = resolveDronePilotAssignmentContext(
+      scene,
+      droneEntity,
+      mode,
+      assignedShipEntity,
+    );
+    if (!context) {
+      invalidateDronePilotAssignment(
+        scene,
+        droneEntity,
+        scene.getEntityByID(toInt(droneEntity.controllerID, 0)),
+      );
+      continue;
+    }
+
+    // Explicit owner tasks always win. An assignment-derived task is only
+    // replaceable after its target has actually left the scene or died.
+    if (droneEntity.droneCommand) {
+      const assignmentMode = getDroneCombatAssignmentMode(droneEntity);
+      const combatState = droneEntity.droneCombat;
+      const currentTarget = combatState
+        ? scene.getEntityByID(toInt(combatState.targetID, 0))
+        : null;
+      if (
+        assignmentMode !== mode ||
+        (currentTarget && hasDamageableHealth(currentTarget))
+      ) {
+        continue;
+      }
+      resetDroneToIdle(droneEntity, context.controllerEntity, {
+        scene,
+        stopMovement: true,
+      });
+    }
+
+    const assignResult = assignDroneCombatTask(
+      scene,
+      droneEntity,
+      context.controllerEntity,
+      assignedTarget,
+      {
+        nowMs: whenMs,
+        autoAssigned: true,
+        emitActivity: true,
+      },
+    );
+    if (assignResult && assignResult.success === true) {
+      droneEntity.droneCombat.assignmentMode = mode;
+      engagedCount += 1;
+    }
+  }
+  return engagedCount;
+}
+
+// Assist reads a successful offensive event from the attacker's end. The
+// explicit scene form is also used by module activation/repeat paths, including
+// successful targeted EWAR that does not produce a damage notification.
+function noteAssistedPilotOffensiveAction(
+  scene,
+  assistedShipEntity,
+  targetEntity,
+  whenMs = Date.now(),
+) {
+  return dispatchDronePilotAssignment(
+    scene,
+    assistedShipEntity,
+    targetEntity,
+    DRONE_ACTIVITY_ASSIST,
+    whenMs,
+  );
+}
+
+function noteGuardedPilotIncomingAggression(
+  scene,
+  guardedShipEntity,
+  attackerEntity,
+  whenMs = Date.now(),
+) {
+  return dispatchDronePilotAssignment(
+    scene,
+    guardedShipEntity,
+    attackerEntity,
+    DRONE_ACTIVITY_GUARD,
+    whenMs,
+  );
+}
+
 function noteIncomingAggression(attackerEntity, targetEntity, whenMs = Date.now()) {
   const targetSystemID = toInt(targetEntity && targetEntity.systemID, 0);
   if (
@@ -4098,34 +6902,46 @@ function noteIncomingAggression(attackerEntity, targetEntity, whenMs = Date.now(
     targetSystemID <= 0 ||
     toInt(attackerEntity.itemID, 0) <= 0 ||
     toInt(targetEntity.itemID, 0) <= 0 ||
-    toInt(attackerEntity.itemID, 0) === toInt(targetEntity.itemID, 0) ||
+    toInt(attackerEntity.itemID, 0) === toInt(targetEntity.itemID, 0)
+  ) {
+    return 0;
+  }
+
+  // Assist is deliberately not inferred from generic damage here. Doing so
+  // would make excluded area/vorton/superweapon families look like supported
+  // targeted actions. The module activation and repeat paths call the explicit
+  // Assist hook only after a qualifying cycle succeeds.
+  if (
     String(targetEntity.kind || "") !== "ship" ||
     !hasDamageableHealth(attackerEntity)
   ) {
     return 0;
   }
 
-  const runtime = getRuntime();
-  const scene =
-    runtime && typeof runtime.ensureScene === "function"
-      ? runtime.ensureScene(targetSystemID)
-      : null;
-  if (!scene) {
+  const resolvedScene = resolveAggressionScene(targetEntity);
+  if (!resolvedScene) {
     return 0;
   }
 
-  const controllerEntity = scene.getEntityByID(toInt(targetEntity.itemID, 0)) || null;
-  const hostileEntity = scene.getEntityByID(toInt(attackerEntity.itemID, 0)) || null;
+  const controllerEntity = resolvedScene.getEntityByID(toInt(targetEntity.itemID, 0)) || null;
+  const hostileEntity = resolvedScene.getEntityByID(toInt(attackerEntity.itemID, 0)) || null;
   if (!controllerEntity || !hostileEntity) {
     return 0;
   }
 
+  const guardEngagedCount = noteGuardedPilotIncomingAggression(
+    resolvedScene,
+    controllerEntity,
+    hostileEntity,
+    whenMs,
+  );
+
   const behaviorSettings = getControllerDroneBehaviorSettings(controllerEntity);
   if (behaviorSettings.aggressive !== true) {
-    return 0;
+    return guardEngagedCount;
   }
 
-  const controlledCombatIndex = getSceneControlledCombatDroneIndex(scene);
+  const controlledCombatIndex = getSceneControlledCombatDroneIndex(resolvedScene);
   const controllerEntry =
     controlledCombatIndex.get(toInt(controllerEntity.itemID, 0)) || null;
   const idleCombatDroneIDs =
@@ -4133,11 +6949,11 @@ function noteIncomingAggression(attackerEntity, targetEntity, whenMs = Date.now(
       ? controllerEntry.idleCombatDroneIDs
       : [];
   if (idleCombatDroneIDs.length <= 0) {
-    return 0;
+    return guardEngagedCount;
   }
 
   const targetIDs = selectAggressiveTargetIDs(
-    scene,
+    resolvedScene,
     controllerEntity,
     hostileEntity.itemID,
     {
@@ -4147,24 +6963,24 @@ function noteIncomingAggression(attackerEntity, targetEntity, whenMs = Date.now(
     },
   );
   if (targetIDs.length <= 0) {
-    return 0;
+    return guardEngagedCount;
   }
 
-  let engagedCount = 0;
+  let engagedCount = guardEngagedCount;
   const assignmentCount =
     behaviorSettings.focusFire === true
       ? idleCombatDroneIDs.length
       : Math.min(idleCombatDroneIDs.length, targetIDs.length);
   for (let index = 0; index < assignmentCount; index += 1) {
-    const droneEntity = scene.getEntityByID(toInt(idleCombatDroneIDs[index], 0));
+    const droneEntity = resolvedScene.getEntityByID(toInt(idleCombatDroneIDs[index], 0));
     const targetID = toInt(targetIDs[Math.min(index, targetIDs.length - 1)], 0);
-    const assignedTarget = targetID > 0 ? scene.getEntityByID(targetID) : null;
+    const assignedTarget = targetID > 0 ? resolvedScene.getEntityByID(targetID) : null;
     if (!droneEntity || !assignedTarget || !hasDamageableHealth(assignedTarget)) {
       continue;
     }
 
     const assignResult = assignDroneCombatTask(
-      scene,
+      resolvedScene,
       droneEntity,
       controllerEntity,
       assignedTarget,
@@ -4179,6 +6995,123 @@ function noteIncomingAggression(attackerEntity, targetEntity, whenMs = Date.now(
     }
   }
   return engagedCount;
+}
+
+function resolveDroneJammerCycleMs(jammerConfig) {
+  return Math.max(1, toNumber(jammerConfig && jammerConfig.durationMs, 20_000));
+}
+
+// One ECM cycle for a drone. Shared by the pure ECM drones, whose whole combat
+// snapshot IS the jammer, and by the faction hybrids, which carry it alongside a
+// turret and run it on its own clock.
+function runDroneJammerCycle(scene, droneEntity, targetEntity, jammerConfig, now) {
+  const runtime = getRuntime();
+  const cycleMs = resolveDroneJammerCycleMs(jammerConfig);
+  if (jammerConfig.effectGUID) {
+    scene.broadcastSpecialFx(
+      droneEntity.itemID,
+      jammerConfig.effectGUID,
+      {
+        moduleID: toInt(droneEntity && droneEntity.itemID, 0),
+        moduleTypeID: toInt(droneEntity && droneEntity.typeID, 0),
+        targetID: targetEntity.itemID,
+        isOffensive: true,
+        start: true,
+        active: false,
+        duration: cycleMs,
+        repeat: 1,
+        useCurrentVisibleStamp: true,
+        avoidCurrentHistoryInsertion: true,
+      },
+      droneEntity,
+    );
+  }
+  const effectState = {
+    moduleID: toInt(droneEntity && droneEntity.itemID, 0),
+    targetID: targetEntity.itemID,
+    hostileJammingType: jammerModuleRuntime.ECM_JAMMING_TYPE,
+    jammerModuleEffect: true,
+    jammerStrengthBySensorType: jammerConfig.jammerStrengthBySensorType || {},
+    jammerMaxRangeMeters: Math.max(0, toNumber(jammerConfig.optimalRange, 0)),
+    jammerFalloffMeters: Math.max(0, toNumber(jammerConfig.falloff, 0)),
+    durationMs: cycleMs,
+    jamDurationMs: Math.max(1, toNumber(jammerConfig.jamDurationMs, 5_000)),
+    nextCycleAtMs: now + cycleMs,
+  };
+  const cycleResult = jammerModuleRuntime.executeJammerModuleCycle({
+    scene,
+    entity: droneEntity,
+    effectState,
+    nowMs: now,
+    callbacks: {
+      getEntityByID(entityID) {
+        return scene && typeof scene.getEntityByID === "function"
+          ? scene.getEntityByID(entityID)
+          : null;
+      },
+      isEntityLockedTarget() {
+        return true;
+      },
+      getEntitySurfaceDistance(sourceEntity, externalTargetEntity) {
+        return getEntitySurfaceDistance(
+          sourceEntity,
+          externalTargetEntity,
+          scene,
+          now,
+          "drone-jammer-cycle",
+        );
+      },
+      clearOutgoingTargetLocksExcept(externalTargetEntity, allowedTargetIDs, options = {}) {
+        return scene && typeof scene.clearOutgoingTargetLocksExcept === "function"
+          ? scene.clearOutgoingTargetLocksExcept(externalTargetEntity, allowedTargetIDs, options)
+          : {
+            clearedTargetIDs: [],
+            cancelledPendingIDs: [],
+          };
+      },
+      random() {
+        return scene && typeof scene.__jammerRandom === "function"
+          ? Number(scene.__jammerRandom()) || 0
+          : Math.random();
+      },
+    },
+  });
+  if (
+    cycleResult.success &&
+    runtime &&
+    typeof runtime.applyJammerCyclePresentation === "function"
+  ) {
+    runtime.applyJammerCyclePresentation(
+      scene,
+      droneEntity,
+      effectState,
+      now,
+      cycleResult,
+    );
+  }
+  return cycleResult;
+}
+
+// The faction hybrids shoot on a 4 s turret cycle and jam on a 20 s ECM cycle at
+// the same time, so the jam cannot hang off the turret's `nextCycleAtMs` — it
+// gets its own, evaluated before the turret gate so a 20 s jam is not quantised
+// up to the next turret boundary.
+function tickDroneHybridJammer(scene, droneEntity, targetEntity, snapshot, combatState, now) {
+  const jammerConfig = snapshot && snapshot.jammer;
+  if (!jammerConfig) {
+    return false;
+  }
+  if (toNumber(combatState.nextJammerCycleAtMs, 0) > now) {
+    return false;
+  }
+  // The cycle clock advances whether or not the jam lands, exactly as the
+  // pure-ECM drone path already does. Retrying a refused cycle every tick would
+  // also re-broadcast the activation FX every tick, and the three hybrids are
+  // never out of jam range while they are in turret range anyway — their jam
+  // optimal is more than twice their turret's.
+  runDroneJammerCycle(scene, droneEntity, targetEntity, jammerConfig, now);
+  combatState.nextJammerCycleAtMs = now + resolveDroneJammerCycleMs(jammerConfig);
+  return true;
 }
 
 function tickDroneCombat(scene, droneEntity, controllerEntity, now) {
@@ -4236,19 +7169,35 @@ function tickDroneCombat(scene, droneEntity, controllerEntity, now) {
   combatState.snapshot = snapshot;
 
   const ranges = resolveDroneEngagementRanges(snapshot);
-  const surfaceDistance = getEntitySurfaceDistance(droneEntity, targetEntity);
+  const surfaceDistance = getEntitySurfaceDistance(
+    droneEntity,
+    targetEntity,
+    scene,
+    now,
+    "drone-combat-tick",
+  );
   const beforeState = captureDroneClientState(droneEntity);
   copyControllerIdentity(droneEntity, controllerEntity);
   droneEntity.targetID = targetEntity.itemID;
+  const movementProfile = resolveDroneMovementProfile(
+    droneEntity,
+    controllerEntity,
+  );
   if (surfaceDistance > ranges.engagementRange + 1) {
     syncDronePursuitBehavior(
       scene,
       droneEntity,
       targetEntity,
       ranges.movementRange,
+      {
+        controllerEntity,
+        surfaceDistanceMeters: surfaceDistance,
+      },
     );
     droneEntity.activityState =
-      surfaceDistance > ranges.chaseRange + 1
+      movementProfile.hasChaseDistance &&
+      movementProfile.chaseDistance > 0 &&
+      surfaceDistance > movementProfile.chaseDistance + 1
         ? STATE_PURSUIT
         : STATE_APPROACHING;
     persistAndNotifyDroneState(droneEntity, beforeState);
@@ -4264,6 +7213,10 @@ function tickDroneCombat(scene, droneEntity, controllerEntity, now) {
       droneEntity,
       targetEntity,
       ranges.movementRange,
+      {
+        controllerEntity,
+        surfaceDistanceMeters: surfaceDistance,
+      },
     );
   } else {
     syncDroneOrbitBehavior(
@@ -4276,89 +7229,17 @@ function tickDroneCombat(scene, droneEntity, controllerEntity, now) {
   droneEntity.activityState = STATE_COMBAT;
   persistAndNotifyDroneState(droneEntity, beforeState);
 
+  if (tickDroneHybridJammer(scene, droneEntity, targetEntity, snapshot, combatState, now)) {
+    persistDroneEntityState(droneEntity);
+  }
+
   if (toNumber(combatState.nextCycleAtMs, 0) > now) {
     return;
   }
 
   if (String(snapshot && snapshot.effectKind || "") === "jammer") {
-    const runtime = getRuntime();
-    if (snapshot.effectGUID) {
-      scene.broadcastSpecialFx(
-        droneEntity.itemID,
-        snapshot.effectGUID,
-        {
-          moduleID: toInt(droneEntity && droneEntity.itemID, 0),
-          moduleTypeID: toInt(droneEntity && droneEntity.typeID, 0),
-          targetID: targetEntity.itemID,
-          isOffensive: true,
-          start: true,
-          active: false,
-          duration: Math.max(1, toNumber(snapshot.durationMs, 20_000)),
-          repeat: 1,
-          useCurrentVisibleStamp: true,
-          avoidCurrentHistoryInsertion: true,
-        },
-        droneEntity,
-      );
-    }
-    const effectState = {
-      moduleID: toInt(droneEntity && droneEntity.itemID, 0),
-      targetID: targetEntity.itemID,
-      hostileJammingType: jammerModuleRuntime.ECM_JAMMING_TYPE,
-      jammerModuleEffect: true,
-      jammerStrengthBySensorType: snapshot.jammerStrengthBySensorType || {},
-      jammerMaxRangeMeters: Math.max(0, toNumber(snapshot.optimalRange, 0)),
-      jammerFalloffMeters: Math.max(0, toNumber(snapshot.falloff, 0)),
-      durationMs: Math.max(1, toNumber(snapshot.durationMs, 20_000)),
-      jamDurationMs: Math.max(1, toNumber(snapshot.jamDurationMs, 5_000)),
-      nextCycleAtMs: now + Math.max(1, toNumber(snapshot.durationMs, 20_000)),
-    };
-    const cycleResult = jammerModuleRuntime.executeJammerModuleCycle({
-      scene,
-      entity: droneEntity,
-      effectState,
-      nowMs: now,
-      callbacks: {
-        getEntityByID(entityID) {
-          return scene && typeof scene.getEntityByID === "function"
-            ? scene.getEntityByID(entityID)
-            : null;
-        },
-        isEntityLockedTarget() {
-          return true;
-        },
-        getEntitySurfaceDistance(sourceEntity, externalTargetEntity) {
-          return getEntitySurfaceDistance(sourceEntity, externalTargetEntity);
-        },
-        clearOutgoingTargetLocksExcept(externalTargetEntity, allowedTargetIDs, options = {}) {
-          return scene && typeof scene.clearOutgoingTargetLocksExcept === "function"
-            ? scene.clearOutgoingTargetLocksExcept(externalTargetEntity, allowedTargetIDs, options)
-            : {
-              clearedTargetIDs: [],
-              cancelledPendingIDs: [],
-            };
-        },
-        random() {
-          return scene && typeof scene.__jammerRandom === "function"
-            ? Number(scene.__jammerRandom()) || 0
-            : Math.random();
-        },
-      },
-    });
-    if (
-      cycleResult.success &&
-      runtime &&
-      typeof runtime.applyJammerCyclePresentation === "function"
-    ) {
-      runtime.applyJammerCyclePresentation(
-        scene,
-        droneEntity,
-        effectState,
-        now,
-        cycleResult,
-      );
-    }
-    combatState.nextCycleAtMs = now + Math.max(1, toNumber(snapshot.durationMs, 20_000));
+    runDroneJammerCycle(scene, droneEntity, targetEntity, snapshot, now);
+    combatState.nextCycleAtMs = now + resolveDroneJammerCycleMs(snapshot);
     persistDroneEntityState(droneEntity);
     return;
   }
@@ -4546,7 +7427,13 @@ function tickDroneMining(scene, droneEntity, controllerEntity, now) {
     orbitDistance,
     toNumber(snapshot.maxRangeMeters, orbitDistance),
   );
-  const surfaceDistance = getEntitySurfaceDistance(droneEntity, targetEntity);
+  const surfaceDistance = getEntitySurfaceDistance(
+    droneEntity,
+    targetEntity,
+    scene,
+    now,
+    "drone-mining-tick",
+  );
   const beforeState = captureDroneClientState(droneEntity);
 
   copyControllerIdentity(droneEntity, controllerEntity);
@@ -4628,8 +7515,12 @@ function tickDroneMining(scene, droneEntity, controllerEntity, now) {
     volume: miningAmountM3,
     unitVolume,
     asteroidQuantity: mineableState.remainingQuantity,
-    wasteVolumeMultiplier: 0,
-    wasteProbability: 0,
+    wasteVolumeMultiplier: toNumber(snapshot.wasteVolumeMultiplier, 0),
+    wasteProbability: toNumber(snapshot.wasteProbability, 0),
+    // Mining drones carry no miningCritChance / miningCritBonusYield rows in the
+    // SDE, so there is nothing to read for the critical half; leaving it at zero
+    // keeps `criticalHitQuantity` out of the transferred total, which the cargo
+    // clamp below assumes.
     critQuantityMultiplier: 0,
     critProbability: 0,
     efficiency: 1,
@@ -4642,29 +7533,31 @@ function tickDroneMining(scene, droneEntity, controllerEntity, now) {
   );
   const transferredQuantity = miningResult.getTotalTransferredQuantity();
   const yieldTypeRecord = resolveItemByTypeID(toInt(mineableState.yieldTypeID, 0)) || null;
-  if (!yieldTypeRecord || transferredQuantity <= 0) {
+  // Yield and residue round independently, so a small cycle can waste a unit
+  // even when no whole unit is transferred. Settle that residue normally.
+  if (!yieldTypeRecord || (transferredQuantity <= 0 && miningResult.wastedQuantity <= 0)) {
     beginDroneMiningCycle(miningState, snapshot, now);
     return;
   }
 
-  const grantResult = grantItemToCharacterLocation(
-    destination.storageSnapshot.characterID,
-    destination.storageSnapshot.shipID,
-    destination.flagID,
-    yieldTypeRecord,
-    transferredQuantity,
-  );
-  if (!grantResult || grantResult.success !== true) {
-    resetDroneToIdle(droneEntity, controllerEntity, {
-      scene,
-      stopMovement: true,
-    });
-    return;
+  const controllerSession = resolveDroneControllerSession(droneEntity, controllerEntity);
+  if (transferredQuantity > 0) {
+    const grantResult = grantItemToCharacterLocation(
+      destination.storageSnapshot.characterID,
+      destination.storageSnapshot.shipID,
+      destination.flagID,
+      yieldTypeRecord,
+      transferredQuantity,
+    );
+    if (!grantResult || grantResult.success !== true) {
+      resetDroneToIdle(droneEntity, controllerEntity, {
+        scene,
+        stopMovement: true,
+      });
+      return;
+    }
+    syncDroneInventoryChangesToSession(controllerSession, grantResult.data && grantResult.data.changes);
   }
-  syncDroneInventoryChangesToSession(
-    resolveDroneControllerSession(droneEntity, controllerEntity),
-    grantResult.data && grantResult.data.changes,
-  );
 
   const pseudoModuleItem = buildDronePseudoModuleItem(droneEntity);
   const deltaResult = applyMiningDelta(
@@ -4693,10 +7586,43 @@ function tickDroneMining(scene, droneEntity, controllerEntity, now) {
     return;
   }
 
+  const ledgerCharacterID = toInt(
+    destination.storageSnapshot && destination.storageSnapshot.characterID,
+    resolveDroneControllerOwnerCharacterID(controllerEntity, droneEntity),
+  );
+  if (ledgerCharacterID > 0) {
+    const observerContext = resolveDroneMiningLedgerObserverContext(scene, targetEntity);
+    lazyRequire("../mining/miningLedgerState").recordMiningLedgerEvent({
+      characterID: ledgerCharacterID,
+      corporationID: toInt(
+        controllerSession && (controllerSession.corporationID || controllerSession.corpid),
+        toInt(controllerEntity && controllerEntity.corporationID, 0),
+      ),
+      solarSystemID: toInt(
+        scene && (scene.systemID || scene.solarSystemID),
+        toInt(controllerEntity && controllerEntity.systemID, 0),
+      ),
+      typeID: mineableState.yieldTypeID,
+      quantity: transferredQuantity,
+      quantityWasted: miningResult.wastedQuantity,
+      quantityCritical: miningResult.criticalHitQuantity,
+      shipTypeID: toInt(controllerEntity && controllerEntity.typeID, 0),
+      moduleTypeID: toInt(droneEntity && droneEntity.typeID, 0),
+      observerItemID: observerContext.observerItemID,
+      observerItemName: observerContext.observerItemName,
+      yieldKind: mineableState.yieldKind,
+      eventDateMs: now,
+    });
+  }
+
   if (
     deltaResult.data &&
     deltaResult.data.depleted === true
   ) {
+    // Mining modules surface this named UserError through their terminal
+    // OnGodmaShipEffect. Drones have no module effect to stop, so send the
+    // same client message explicitly; it drives Aura's depletion voice cue.
+    notifyMiningDroneAsteroidDepleted(droneEntity, controllerEntity);
     resetDroneToIdle(droneEntity, controllerEntity, {
       scene,
       stopMovement: true,
@@ -4716,7 +7642,156 @@ function tickDroneMining(scene, droneEntity, controllerEntity, now) {
   persistDroneEntityState(droneEntity);
 }
 
+function getCarriedDroneSalvage(droneEntity) {
+  return listContainerItems(null, droneEntity.itemID, ITEM_FLAGS.CARGO_HOLD);
+}
+
+function depositDroneSalvage(scene, droneEntity, controllerEntity, now) {
+  const cargo = getCarriedDroneSalvage(droneEntity);
+  if (cargo.length === 0) return true;
+  if (getEntitySurfaceDistance(droneEntity, controllerEntity, scene, now,
+    "drone-salvage-delivery") > DRONE_BAY_SCOOP_DISTANCE_METERS) return false;
+  const storage = resolveShipStorageSnapshotForDrone(controllerEntity);
+  const volume = cargo.reduce((sum, item) => sum +
+    toNumber(item.volume, 0) * Math.max(1, toInt(item.stacksize ?? item.quantity, 1)), 0);
+  if (!storage || volume > getAvailableDroneStorageVolume(storage, ITEM_FLAGS.CARGO_HOLD) + 1e-6) {
+    return false;
+  }
+  const session = resolveDroneControllerSession(droneEntity, controllerEntity);
+  for (const item of cargo) {
+    const ownerID = toInt(item.ownerID, 0);
+    const result = itemCustody.transfer({
+      items: { itemID: item.itemID },
+      from: itemCustody.custodyRef.container(ownerID, droneEntity.itemID, ITEM_FLAGS.CARGO_HOLD),
+      to: itemCustody.custodyRef.shipBay(ownerID, storage.shipID, ITEM_FLAGS.CARGO_HOLD),
+      reason: itemCustody.CUSTODY_REASON.DRONE_SALVAGE_DELIVER,
+      actor: toInt(session && session.characterID, 0) || ownerID,
+      idempotencyKey: `drone-salvage-deliver:${droneEntity.itemID}:${item.itemID}`,
+    });
+    if (!result.success) return false;
+    // Each successful move is durable. A later failed move leaves only the
+    // remaining rows on the drone, so retrying cannot duplicate a delivery.
+    for (const change of (result.data && result.data.changes) || []) {
+      lazyRequire("../character/characterState").emitItemsChangedForSession(
+        session, change.item, change.previousData || change.previousState || {},
+        { locationContext: ["Ship", storage.shipID, "ShipCargo"] },
+      );
+    }
+  }
+  return true;
+}
+
+// Salvage a drone cannot hand over goes into a cargo container where the drone
+// is. The container belongs to whoever owns the salvage, which is not the ship's
+// owner when another pilot scoops an abandoned drone.
+function jettisonDroneSalvage(scene, droneEntity, now, launcherID = 0) {
+  const cargo = getCarriedDroneSalvage(droneEntity);
+  if (cargo.length === 0) return true;
+  const characterID = toInt(cargo[0].ownerID, 0) || toInt(droneEntity.ownerID, 0);
+  const systemID = toInt(scene && scene.systemID, 0);
+  const containerLookup = resolveItemByName(DRONE_SALVAGE_JETTISON_CONTAINER_NAME);
+  if (characterID <= 0 || systemID <= 0 ||
+      !containerLookup || !containerLookup.success || !containerLookup.match) {
+    return false;
+  }
+  const nowMs = toNumber(now, Date.now());
+  const createResult = createSpaceItemForCharacter(characterID, systemID, containerLookup.match, {
+    ...buildChildEntityScopeMetadata(droneEntity),
+    position: { ...droneEntity.position },
+    velocity: { x: 0, y: 0, z: 0 },
+    direction: { ...(droneEntity.direction || { x: 1, y: 0, z: 0 }) },
+    mode: "STOP",
+    speedFraction: 0,
+    createdAtMs: nowMs,
+    expiresAtMs: nowMs + DRONE_SALVAGE_JETTISON_LIFETIME_MS,
+    launcherID: toInt(launcherID, 0) || null,
+  });
+  if (!createResult.success || !createResult.data) return false;
+  const containerID = toInt(createResult.data.itemID, 0);
+  const spawnResult = getRuntime().spawnDynamicInventoryEntity(
+    scene.sceneDescriptor || scene.systemID,
+    containerID,
+    {
+      broadcast: true,
+      broadcastOptions: { freshAcquire: true },
+      sceneDescriptor: scene.sceneDescriptor || undefined,
+    },
+  );
+  if (!spawnResult || spawnResult.success !== true) {
+    // A container nobody can see would hide the salvage. Keep it on the drone.
+    removeInventoryItem(containerID, { removeContents: true });
+    return false;
+  }
+  for (const item of cargo) {
+    const ownerID = toInt(item.ownerID, 0);
+    const result = itemCustody.transfer({
+      items: { itemID: item.itemID },
+      from: itemCustody.custodyRef.container(ownerID, droneEntity.itemID, ITEM_FLAGS.CARGO_HOLD),
+      to: itemCustody.custodyRef.container(ownerID, containerID, ITEM_FLAGS.HANGAR),
+      reason: itemCustody.CUSTODY_REASON.DRONE_SALVAGE_JETTISON,
+      actor: characterID,
+      idempotencyKey: `drone-salvage-jettison:${containerID}:${item.itemID}`,
+    });
+    // Rows that fail to move stay on the drone, and the caller keeps it out.
+    if (!result.success) return false;
+  }
+  return true;
+}
+
+// Every way into a bay ends in recallDronesToShipBay: a recall order, the
+// recall on disconnect, and a scoop to the drone bay or the cargo hold. Salvage
+// the drone still holds is unloaded there first, into the ship's hold when the
+// salvage is the ship owner's and it fits, otherwise into a container in space.
+// A drone must never go into a bay with salvage rows still inside it.
+function unloadDroneSalvageBeforeRecall(scene, droneEntity, shipEntity, shipOwnerID, now) {
+  const cargo = getCarriedDroneSalvage(droneEntity);
+  if (cargo.length === 0) return true;
+  const ownSalvage = cargo.every((item) => toInt(item.ownerID, 0) === toInt(shipOwnerID, 0));
+  if (shipEntity && ownSalvage &&
+      depositDroneSalvage(scene, droneEntity, shipEntity, now)) {
+    return true;
+  }
+  return jettisonDroneSalvage(scene, droneEntity, now, toInt(shipEntity && shipEntity.itemID, 0));
+}
+
+function returnDroneSalvage(scene, droneEntity, controllerEntity, now) {
+  const beforeState = captureDroneClientState(droneEntity);
+  droneEntity.targetID = controllerEntity.itemID;
+  droneEntity.activityState = STATE_DEPARTING;
+  syncDronePursuitBehavior(scene, droneEntity, controllerEntity,
+    DRONE_BAY_RETURN_APPROACH_DISTANCE_METERS, {
+      broadcast: true, controllerEntity, forceFullSpeed: true,
+      surfaceDistanceMeters: getEntitySurfaceDistance(
+        droneEntity, controllerEntity, scene, now, "drone-salvage-return"),
+    });
+  persistAndNotifyDroneState(droneEntity, beforeState);
+}
+
+function selectNextDroneSalvageTarget(scene, droneEntity, controllerEntity) {
+  const session = resolveDroneControllerSession(droneEntity, controllerEntity);
+  const characterID = resolveDroneControllerOwnerCharacterID(controllerEntity, droneEntity);
+  const targetEntity = resolveAutomaticSalvageTarget(
+    scene, droneEntity, controllerEntity, characterID, null, session,
+  );
+  if (targetEntity) {
+    return assignDroneSalvageTask({
+      scene, session, droneEntity, shipEntity: controllerEntity,
+      shipRecord: findItemById(controllerEntity.itemID), characterID, targetEntity,
+    });
+  }
+  resetDroneToIdle(droneEntity, controllerEntity, { scene, stopMovement: true });
+  return null;
+}
+
 function tickDroneSalvage(scene, droneEntity, controllerEntity, now) {
+  if (controllerEntity && getCarriedDroneSalvage(droneEntity).length > 0) {
+    if (!depositDroneSalvage(scene, droneEntity, controllerEntity, now)) {
+      returnDroneSalvage(scene, droneEntity, controllerEntity, now);
+      return;
+    }
+    selectNextDroneSalvageTarget(scene, droneEntity, controllerEntity);
+    return;
+  }
   const salvageState =
     droneEntity &&
     droneEntity.droneSalvage &&
@@ -4728,6 +7803,10 @@ function tickDroneSalvage(scene, droneEntity, controllerEntity, now) {
     toInt(droneEntity && droneEntity.targetID, 0),
   );
   const targetEntity = targetID > 0 ? scene.getEntityByID(targetID) : null;
+  if (salvageState && controllerEntity && !salvagerRuntime.isSalvageableTarget(targetEntity)) {
+    selectNextDroneSalvageTarget(scene, droneEntity, controllerEntity);
+    return;
+  }
   if (
     !salvageState ||
     !controllerEntity ||
@@ -4773,7 +7852,13 @@ function tickDroneSalvage(scene, droneEntity, controllerEntity, now) {
     orbitDistance,
     toNumber(snapshot.maxRangeMeters, orbitDistance),
   );
-  const surfaceDistance = getEntitySurfaceDistance(droneEntity, targetEntity);
+  const surfaceDistance = getEntitySurfaceDistance(
+    droneEntity,
+    targetEntity,
+    scene,
+    now,
+    "drone-salvage-tick",
+  );
   const beforeState = captureDroneClientState(droneEntity);
 
   copyControllerIdentity(droneEntity, controllerEntity);
@@ -4824,13 +7909,46 @@ function tickDroneSalvage(scene, droneEntity, controllerEntity, now) {
     nowMs: now,
     callbacks: {
       isEntityLockedTarget: () => true,
-      getEntitySurfaceDistance,
+      getEntitySurfaceDistance(sourceEntity, externalTargetEntity) {
+        return getEntitySurfaceDistance(
+          sourceEntity,
+          externalTargetEntity,
+          scene,
+          now,
+          "drone-salvager-cycle",
+        );
+      },
       resolveCharacterID: () => controllerCharacterID,
       getEntityRuntimeShipItem: () => controllerShipItem,
       getEntityRuntimeFittedItems: () => controllerEntity.fittedItems || [],
       getEntityRuntimeSkillMap: () => controllerEntity.skillMap || new Map(),
       resolveSession: () => controllerSession,
+      suppressSalvageMessages: true,
+      salvageRewardLocationID: droneEntity.itemID,
       syncInventoryChangesToSession: syncDroneInventoryChangesToSession,
+      spawnInventoryBackedEntity(itemRecord, options = {}) {
+        return getRuntime().spawnDynamicInventoryEntity(
+          scene.sceneDescriptor || scene.systemID,
+          itemRecord.itemID,
+          {
+            ...options,
+            sceneDescriptor: scene.sceneDescriptor || undefined,
+          },
+        );
+      },
+      onWreckSalvaged(event = {}) {
+        try {
+          lazyRequire("../achievement/achievementRuntime").recordSalvage(
+            event.characterID || controllerCharacterID,
+            event.targetID,
+          );
+        } catch (error) {
+          log.warn(
+            `[Achievements] Failed to record drone salvage ` +
+              `wreck=${toInt(event && event.targetID, 0)}: ${error.message}`,
+          );
+        }
+      },
       random() {
         return scene && typeof scene.__salvageRandom === "function"
           ? scene.__salvageRandom()
@@ -4858,6 +7976,14 @@ function tickDroneSalvage(scene, droneEntity, controllerEntity, now) {
     );
   }
 
+  if (cycleResult.data && cycleResult.data.salvaged === true) {
+    if (getCarriedDroneSalvage(droneEntity).length > 0) {
+      returnDroneSalvage(scene, droneEntity, controllerEntity, now);
+    } else {
+      selectNextDroneSalvageTarget(scene, droneEntity, controllerEntity);
+    }
+    return;
+  }
   if (!cycleResult.success) {
     resetDroneToIdle(droneEntity, controllerEntity, {
       scene,
@@ -4918,7 +8044,13 @@ function tickDroneRepair(scene, droneEntity, controllerEntity, now) {
   repairState.snapshot = snapshot;
 
   const ranges = resolveDroneEngagementRanges(snapshot);
-  const surfaceDistance = getEntitySurfaceDistance(droneEntity, targetEntity);
+  const surfaceDistance = getEntitySurfaceDistance(
+    droneEntity,
+    targetEntity,
+    scene,
+    now,
+    "drone-repair-tick",
+  );
   const beforeState = captureDroneClientState(droneEntity);
   copyControllerIdentity(droneEntity, controllerEntity);
   droneEntity.targetID = targetEntity.itemID;
@@ -5008,7 +8140,13 @@ function tickDroneRepair(scene, droneEntity, controllerEntity, now) {
     callbacks: {
       isEntityLockedTarget: () => true,
       getEntitySurfaceDistance(sourceEntity, externalTargetEntity) {
-        return getEntitySurfaceDistance(sourceEntity, externalTargetEntity);
+        return getEntitySurfaceDistance(
+          sourceEntity,
+          externalTargetEntity,
+          scene,
+          now,
+          "drone-assistance-cycle",
+        );
       },
       normalizeShipConditionState: droneInterop.normalizeShipConditionState,
       buildShipHealthTransitionResult: droneInterop.buildShipHealthTransitionResult,
@@ -5043,11 +8181,45 @@ function tickScene(scene, now) {
   for (const droneEntity of droneEntities) {
     const controllerID = toInt(droneEntity.controllerID, 0);
     const controllerEntity = controllerID > 0 ? scene.getEntityByID(controllerID) : null;
-    if (!controllerEntity && controllerID > 0) {
+    const controllerScopeMismatch = Boolean(
+      controllerEntity &&
+      !securityScopesExactlyMatch(
+        getPlayerCompanionSecurityScope(droneEntity),
+        getPlayerCompanionSecurityScope(controllerEntity, { controller: true }),
+      )
+    );
+    if ((!controllerEntity && controllerID > 0) || controllerScopeMismatch) {
       abandonDroneInSpace(scene, droneEntity, {
         stopMovement: true,
       });
       continue;
+    }
+
+    // A recall or new order must not discard salvage already in the drone's
+    // inventory. Deposit at the ship even if the original task was replaced.
+    if (controllerEntity && droneEntity.droneCommand !== DRONE_COMMAND_SALVAGE &&
+        getCarriedDroneSalvage(droneEntity).length > 0) {
+      // Out of reach or no room: carry on with the order. A drone that ends up
+      // going into a bay unloads what it still holds in recallDronesToShipBay.
+      depositDroneSalvage(scene, droneEntity, controllerEntity, now);
+    }
+
+    const pilotAssignment = getDronePilotAssignment(droneEntity);
+    if (pilotAssignment) {
+      const assignmentContext = resolveDronePilotAssignmentContext(
+        scene,
+        droneEntity,
+        pilotAssignment.mode,
+      );
+      if (!assignmentContext) {
+        const assignmentDerivedCombat = Boolean(
+          getDroneCombatAssignmentMode(droneEntity),
+        );
+        invalidateDronePilotAssignment(scene, droneEntity, controllerEntity);
+        if (assignmentDerivedCombat) {
+          continue;
+        }
+      }
     }
 
     if (
@@ -5079,10 +8251,25 @@ function tickScene(scene, now) {
         resolveDroneOrbitDistance(droneEntity),
         toNumber(droneEntity.droneHomeOrbitDistance, 0),
       );
-      if (distance(droneEntity.position, controllerEntity.position) <= orbitDistance + controllerEntity.radius + droneEntity.radius) {
-        scene.orbitShipEntity(droneEntity, controllerEntity.itemID, orbitDistance, {
-          broadcast: true,
-        });
+      if (
+        getEntitySurfaceDistance(
+          droneEntity,
+          controllerEntity,
+          scene,
+          now,
+          "drone-return-home",
+        ) <= orbitDistance
+      ) {
+        syncDroneOrbitBehavior(
+          scene,
+          droneEntity,
+          controllerEntity,
+          orbitDistance,
+          {
+            broadcast: true,
+            controllerEntity,
+          },
+        );
         droneEntity.activityState = STATE_IDLE;
         droneEntity.targetID = null;
         droneEntity.droneCommand = null;
@@ -5097,7 +8284,15 @@ function tickScene(scene, now) {
     }
 
     if (droneEntity.droneCommand === DRONE_COMMAND_RETURN_BAY && controllerEntity) {
-      if (getEntitySurfaceDistance(droneEntity, controllerEntity) <= DRONE_BAY_SCOOP_DISTANCE_METERS) {
+      if (
+        getEntitySurfaceDistance(
+          droneEntity,
+          controllerEntity,
+          scene,
+          now,
+          "drone-return-bay",
+        ) <= DRONE_BAY_SCOOP_DISTANCE_METERS
+      ) {
         const shipRecord = findItemById(controllerEntity.itemID);
         if (shipRecord) {
           const shipID = toInt(shipRecord.itemID, 0);
@@ -5129,6 +8324,8 @@ module.exports = {
   DRONE_COMMAND_ENGAGE,
   DRONE_COMMAND_MINE,
   DRONE_COMMAND_SALVAGE,
+  DRONE_ACTIVITY_ASSIST,
+  DRONE_ACTIVITY_GUARD,
   STATE_IDLE,
   STATE_COMBAT,
   STATE_MINING,
@@ -5138,16 +8335,21 @@ module.exports = {
   STATE_SALVAGING,
   isDroneEntity,
   getDroneBandwidthLoad,
+  getLaunchedDroneReservedBayVolume,
+  resolveDroneMovementProfile,
   resolveDroneOrbitDistance,
   hydrateDroneEntityFromItem,
   buildDroneStateRows,
   buildDroneStateNotificationTuple,
   emitDroneActivityChange,
   handleDroneDestroyed,
+  noteAssistedPilotOffensiveAction,
   noteIncomingAggression,
   normalizeDroneIDList,
   normalizeLaunchRequests,
   launchDronesForSession,
+  commandAssist,
+  commandGuard,
   commandEngage,
   commandMineRepeatedly,
   commandSalvage,
@@ -5157,12 +8359,28 @@ module.exports = {
   commandReconnectToDrones,
   handleControllerLost,
   scoopDrone,
+  scoopDroneToCargo,
   idleMiningDronesTargeting,
   spawnTransientNpcDroneWing,
   tickScene,
   _testing: {
+    buildDroneAbyssalOwnershipCustomInfo,
     canPlayerCompanionActOnTarget,
-    persistDroneEntityState,
+    getDroneAssistAssignment,
+    getDroneGuardAssignment,
+    getDronePilotAssignment,
+    invalidateDronePilotAssignment,
+    isNativeNpcDroneAssignmentTarget,
+    noteGuardedPilotIncomingAggression,
+    resetDroneToIdle,
+    resolveDronePilotAssignmentContext,
+    clearDroneWindowSettleForSession,
+    recallDronesToShipBay,
+    resolveAbyssalPlayerCompanionInstanceID,
     serializePlayerCompanionScopeMetadata,
+    resolveRuntimeSceneForSession,
+    resolveDroneFastPropulsionExitDistance,
+    droneCruiseCanHoldStation,
+    shouldUseFastDronePropulsion,
   },
 };

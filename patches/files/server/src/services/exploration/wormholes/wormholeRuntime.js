@@ -1,6 +1,22 @@
+"use strict";
+
+const {
+  cloneVector,
+} = require("../../../common/vector");
+
+const {
+  toFiniteNumber,
+} = require("../../../common/numbers");
+
 const crypto = require("crypto");
 const path = require("path");
 
+const {
+  getFamilyEstateProfile,
+  isFamilyEstateHomeSystem,
+  isFamilyEstateRelevantSystem,
+  validateFamilyEstateProfile,
+} = require(path.join(__dirname, "../../estate/familyEstateProfile"));
 const config = require(path.join(__dirname, "../../../config"));
 const log = require(path.join(__dirname, "../../../utils/logger"));
 const worldData = require(path.join(__dirname, "../../../space/worldData"));
@@ -25,7 +41,9 @@ const {
 const {
   getStateView,
   getStateSnapshot,
+  listPairsForSystem: listIndexedPairsForSystem,
   mutateState,
+  mutateStateRows,
 } = require("./wormholeRuntimeState");
 const wormholeEnvironmentRuntime = require("./wormholeEnvironmentRuntime");
 const {
@@ -38,12 +56,6 @@ const targetIdRuntime = require(path.join(
   __dirname,
   "../signatures/targetIdRuntime",
 ));
-const {
-  getFamilyEstateProfile,
-  isFamilyEstateHomeSystem,
-  isFamilyEstateRelevantSystem,
-  validateFamilyEstateProfile,
-} = require(path.join(__dirname, "../../estate/familyEstateProfile"));
 
 const WORMHOLE_GROUP_ID = 988;
 const WORMHOLE_CATEGORY_ID = 2;
@@ -51,6 +63,10 @@ const K162_CODE = "K162";
 const POLARIZATION_DURATION_SECONDS = 5 * 60;
 const WORMHOLE_ENDPOINT_ID_BASE = 9_920_000_000_000;
 const WORMHOLE_TICK_INTERVAL_MS = 5000;
+const WORMHOLE_MAINTENANCE_DEFAULT_INTERVAL_MS = 1000;
+const WORMHOLE_MAINTENANCE_DEFAULT_MAX_ITEMS_PER_SLICE = 24;
+const WORMHOLE_MAINTENANCE_DEFAULT_MAX_SLICE_MS = 8;
+const WORMHOLE_PREPARED_JUMP_RESERVATION_MS = 5000;
 const WORMHOLE_PASSIVE_K162_REVEAL_THRESHOLD_MS = 15 * 60 * 60 * 1000;
 const WORMHOLE_PASSIVE_K162_CHECK_INTERVAL_MS = 5 * 60 * 1000;
 const WORMHOLE_PASSIVE_K162_FORCE_REVEAL_MS = 30 * 60 * 1000;
@@ -75,15 +91,16 @@ const signatureStateChangeListeners = new Set();
 const systemNameCache = new Map();
 const sceneAnchorsCache = new Map();
 const pairIndexCache = new WeakMap();
+let lifecycleMaintenanceCycle = null;
+let lifecycleSchedulerHandle = null;
+let lifecycleSchedulerRunning = false;
+let staticMaintenanceItemsCache = null;
+const preparedJumpReservationsByPairID = new Map();
+let preparedJumpReservationSequence = 1;
 
 function toInt(value, fallback = 0) {
   const numeric = Number(value);
   return Number.isFinite(numeric) ? Math.trunc(numeric) : fallback;
-}
-
-function toFiniteNumber(value, fallback = 0) {
-  const numeric = Number(value);
-  return Number.isFinite(numeric) ? numeric : fallback;
 }
 
 function cloneValue(value) {
@@ -92,24 +109,6 @@ function cloneValue(value) {
 
 function getPairState(pair) {
   return String((pair && pair.state) || "").toLowerCase();
-}
-
-function isPersistentPair(pair) {
-  return pair && pair.persistent === true;
-}
-
-function hasUnlimitedMass(pair) {
-  return pair && pair.unlimitedMass === true;
-}
-
-function hasUnrestrictedShipMass(pair) {
-  return pair && pair.unrestrictedShipMass === true;
-}
-
-function exceedsShipMassLimit(pair, shipMass) {
-  const numericShipMass = Math.max(0, toFiniteNumber(shipMass, 0));
-  const maxJumpMass = Math.max(0, toFiniteNumber(pair && pair.maxJumpMass, 0));
-  return !hasUnrestrictedShipMass(pair) && maxJumpMass > 0 && numericShipMass > maxJumpMass;
 }
 
 function addIndexedPair(indexMap, systemID, pair) {
@@ -218,14 +217,6 @@ function collectVisibleSignatureSystemIDsForPair(pair, options = {}) {
     systems.add(toInt(pair.destination && pair.destination.systemID, 0));
   }
   return [...systems].filter((systemID) => systemID > 0);
-}
-
-function cloneVector(vector = null, fallback = { x: 0, y: 0, z: 0 }) {
-  return {
-    x: toFiniteNumber(vector && vector.x, fallback.x),
-    y: toFiniteNumber(vector && vector.y, fallback.y),
-    z: toFiniteNumber(vector && vector.z, fallback.z),
-  };
 }
 
 function scaleVector(vector, scalar) {
@@ -344,9 +335,13 @@ function buildEndpointPose(systemID, seed) {
 }
 
 function resolveDestinationSystemID(sourceSystemID, targetClassID, seed) {
+  const estateProfile = getFamilyEstateProfile();
   const candidates = listCandidateSystemIDsForClass(targetClassID)
-    .filter((systemID) => systemID > 0 && systemID !== toInt(sourceSystemID, 0))
-    .filter((systemID) => !isFamilyEstateHomeSystem(systemID));
+    .filter((systemID) =>
+      systemID > 0 &&
+      systemID !== toInt(sourceSystemID, 0) &&
+      !isFamilyEstateHomeSystem(systemID, estateProfile),
+    );
   if (candidates.length <= 0) {
     return 0;
   }
@@ -446,23 +441,16 @@ function isEndpointVisible(endpoint) {
 }
 
 function getPairRemainingLifetimeMs(pair, nowMs) {
-  if (isPersistentPair(pair)) {
+  if (pair && pair.persistent === true) {
     return Number.MAX_SAFE_INTEGER;
   }
   const expiresAtMs = Math.max(0, toInt(pair && pair.expiresAtMs, 0));
   return Math.max(0, expiresAtMs - Math.max(0, toInt(nowMs, 0)));
 }
 
-function getEndpointEntityByID(endpointID, nowMs = Date.now()) {
-  const pair = getPairByEndpoint(getStateView(), endpointID);
-  if (!pair || String(pair.state || "").toLowerCase() !== "active") return null;
-  const role = getPairRole(pair, endpointID);
-  return role ? buildEntityFromPair(pair, role, nowMs) : null;
-}
-
 function projectRemainingMass(pair, nowMs) {
   const totalMass = Math.max(0, toFiniteNumber(pair && pair.totalMass, 0));
-  if (hasUnlimitedMass(pair)) {
+  if (pair && pair.unlimitedMass === true) {
     return totalMass;
   }
   const remainingMass = Math.max(0, toFiniteNumber(pair && pair.remainingMass, 0));
@@ -492,7 +480,7 @@ function applyMassRegeneration(pair, nowMs) {
     return;
   }
   const totalMass = Math.max(0, toFiniteNumber(pair.totalMass, 0));
-  if (hasUnlimitedMass(pair)) {
+  if (pair.unlimitedMass === true) {
     pair.remainingMass = totalMass;
     pair.massRegenRemainder = 0;
     pair.lastMassStateAtMs = Math.max(0, toInt(nowMs, pair.lastMassStateAtMs));
@@ -565,10 +553,7 @@ function maybePassivelyRevealDestination(pair, nowMs) {
 }
 
 function pairNeedsMassRegeneration(pair, nowMs) {
-  if (!pair) {
-    return false;
-  }
-  if (hasUnlimitedMass(pair)) {
+  if (!pair || pair.unlimitedMass === true) {
     return false;
   }
   const totalMass = Math.max(0, toFiniteNumber(pair.totalMass, 0));
@@ -612,19 +597,6 @@ function advancePairState(pair, nowMs) {
   maybePassivelyRevealDestination(pair, nowMs);
 }
 
-function applyJumpMassConsumption(pair, shipMass, nowMs) {
-  if (!pair) {
-    return 0;
-  }
-  const numericShipMass = Math.max(0, toInt(shipMass, 0));
-  pair.remainingMass = hasUnlimitedMass(pair)
-    ? Math.max(1, toInt(pair.totalMass, 1))
-    : Math.max(0, toInt(pair.remainingMass, 0) - numericShipMass);
-  pair.lastMassStateAtMs = Math.max(0, toInt(nowMs, pair.lastMassStateAtMs));
-  pair.massRegenRemainder = Math.max(0, toFiniteNumber(pair.massRegenRemainder, 0));
-  return pair.remainingMass;
-}
-
 function interpolateAnchoredValue(anchors, value) {
   const numericValue = Math.max(0, toFiniteNumber(value, 0));
   if (!Array.isArray(anchors) || anchors.length <= 0) {
@@ -652,9 +624,6 @@ function interpolateAnchoredValue(anchors, value) {
 }
 
 function resolveWormholeAge(pair, nowMs) {
-  if (isPersistentPair(pair)) {
-    return 0;
-  }
   const createdAtMs = Math.max(0, toInt(pair && pair.createdAtMs, 0));
   const expiresAtMs = Math.max(0, toInt(pair && pair.expiresAtMs, 0));
   const state = String(pair && pair.state || "").toLowerCase();
@@ -678,9 +647,6 @@ function resolveWormholeAge(pair, nowMs) {
 }
 
 function resolveWormholeSize(pair, nowMs = Date.now()) {
-  if (hasUnlimitedMass(pair)) {
-    return 1.0;
-  }
   const totalMass = Math.max(0, toFiniteNumber(pair && pair.totalMass, 0));
   const remainingMass = Math.max(0, projectRemainingMass(pair, nowMs));
   if (totalMass <= 0) {
@@ -749,11 +715,11 @@ function buildEntityFromPair(pair, role, nowMs = Date.now()) {
     nebulaType: toInt(otherEndpoint.nebulaID, 0),
     wormholeAge: resolveWormholeAge(pair, nowMs),
     wormholeSize: resolveWormholeSize(pair, nowMs),
-    maxShipJumpMass: hasUnrestrictedShipMass(pair)
+    maxShipJumpMass: pair.unrestrictedShipMass === true
       ? WORMHOLE_MAX_SHIP_MASS_VERY_LARGE
       : resolveMaxShipMassCategory(pair.maxJumpMass),
     isDestTriglavian: isTriglavianSystem(toInt(otherEndpoint && otherEndpoint.systemID, 0)),
-    maxJumpMass: hasUnrestrictedShipMass(pair)
+    maxJumpMass: pair.unrestrictedShipMass === true
       ? Number.MAX_SAFE_INTEGER
       : Math.max(0, toInt(pair.maxJumpMass, 0)),
     remainingMass: projectedRemainingMass,
@@ -845,9 +811,9 @@ function selectSourceSystemIDForRandomProfile(
   occupiedSystemIDsOverride = null,
 ) {
   const sourceClassID = toInt(profile && profile.sourceClassID, 0);
+  const estateProfile = getFamilyEstateProfile();
   const candidates = listCandidateSystemIDsForClass(sourceClassID)
-    .filter((systemID) => systemID > 0)
-    .filter((systemID) => !isFamilyEstateHomeSystem(systemID));
+    .filter((systemID) => systemID > 0 && !isFamilyEstateHomeSystem(systemID, estateProfile));
   if (candidates.length <= 0) {
     return 0;
   }
@@ -952,6 +918,9 @@ function createRandomPairFromProfile(table, profile, nowMs, options = {}) {
 
 function createRandomPair(table, systemID, nowMs, options = {}) {
   const sourceSystemID = toInt(systemID, 0);
+  if (sourceSystemID <= 0 || isFamilyEstateHomeSystem(sourceSystemID)) {
+    return null;
+  }
   const codeTypes = listCodeTypes();
   if (codeTypes.length <= 0) {
     return null;
@@ -1013,303 +982,6 @@ function createRandomPair(table, systemID, nowMs, options = {}) {
   return pair;
 }
 
-function getManagedSlotState(table, slotKey, systemID) {
-  const normalizedSlotKey = String(slotKey || "").trim();
-  const existing = table.staticSlotsByKey[normalizedSlotKey] || null;
-  return existing || {
-    slotKey: normalizedSlotKey,
-    systemID: toInt(systemID, 0),
-    generation: 0,
-    activePairID: 0,
-    nextRespawnAtMs: 0,
-  };
-}
-
-function findActiveManagedPair(table, slotKey) {
-  const normalizedSlotKey = String(slotKey || "").trim();
-  const slotState = table.staticSlotsByKey[normalizedSlotKey] || null;
-  const bySlotState = slotState && table.pairsByID[String(slotState.activePairID)] || null;
-  if (bySlotState && getPairState(bySlotState) === "active") {
-    return bySlotState;
-  }
-  return Object.values(table.pairsByID || {}).find((pair) =>
-    getPairState(pair) === "active" &&
-    String(pair && pair.managedSlotKey || "").trim() === normalizedSlotKey,
-  ) || null;
-}
-
-function createFamilyEstatePermanentPair(table, connection, nowMs) {
-  const sourceType = getCodeTypeRecord(connection && connection.sourceCode);
-  const k162Type = getK162TypeRecord();
-  const sourceSystemID = toInt(connection && connection.sourceSystemID, 0);
-  const destinationSystemID = toInt(connection && connection.destinationSystemID, 0);
-  const slotKey = String(connection && connection.slotKey || "").trim();
-  if (!sourceType || !k162Type || !sourceSystemID || !destinationSystemID || !slotKey) {
-    return null;
-  }
-
-  const pairID = allocatePairID(table);
-  const totalMass = Math.max(1, toInt(sourceType.maxStableMass, 1));
-  const pair = {
-    pairID,
-    kind: "estate",
-    managedSlotKey: slotKey,
-    estateConnectionRole: String(connection.key || "permanent").trim().toLowerCase(),
-    persistent: true,
-    unlimitedMass: true,
-    unrestrictedShipMass: true,
-    randomProfileKey: null,
-    state: "active",
-    createdAtMs: nowMs,
-    expiresAtMs: 0,
-    collapseAtMs: 0,
-    collapseReason: null,
-    totalMass,
-    remainingMass: totalMass,
-    massRegeneration: 0,
-    maxJumpMass: 0,
-    lifetimeMinutes: 0,
-    lastMassStateAtMs: nowMs,
-    massRegenRemainder: 0,
-    lastPassiveRevealCheckAtMs: 0,
-    staticSlotKey: slotKey,
-    source: buildEndpointRecord(sourceSystemID, sourceType, {
-      endpointID: allocateEndpointID(table),
-      code: sourceType.code,
-      discovered: true,
-      seed: `${slotKey}:source`,
-      slotKey,
-    }),
-    destination: buildEndpointRecord(destinationSystemID, k162Type, {
-      endpointID: allocateEndpointID(table),
-      code: K162_CODE,
-      discovered: true,
-      seed: `${slotKey}:destination`,
-      slotKey,
-    }),
-  };
-  const slotState = getManagedSlotState(table, slotKey, sourceSystemID);
-  slotState.generation = Math.max(0, toInt(slotState.generation, 0)) + 1;
-  slotState.activePairID = pairID;
-  slotState.nextRespawnAtMs = 0;
-  table.staticSlotsByKey[slotKey] = slotState;
-  table.pairsByID[String(pairID)] = pair;
-  return pair;
-}
-
-function createFamilyEstateRandomPair(table, profile, slotIndex, nowMs) {
-  const slotKey = `${profile.randomSlotPrefix}${slotIndex + 1}`;
-  const slotState = getManagedSlotState(table, slotKey, profile.homeSystemID);
-  const generation = Math.max(0, toInt(slotState.generation, 0)) + 1;
-  const destinationClassChoices = Array.isArray(profile.randomDestinationClassIDs)
-    ? profile.randomDestinationClassIDs.map((entry) => toInt(entry, 0)).filter((entry) => entry > 0)
-    : [];
-  if (destinationClassChoices.length <= 0) {
-    return null;
-  }
-  const destinationClassID = destinationClassChoices[
-    hashSeed(`${slotKey}:${generation}:destination-class`) % destinationClassChoices.length
-  ];
-  const codeTypes = listCodeTypes().filter(
-    (record) => toInt(record && record.targetClassID, 0) === destinationClassID,
-  );
-  if (codeTypes.length <= 0) {
-    return null;
-  }
-  const sourceType = codeTypes[
-    hashSeed(`${slotKey}:${generation}:source-type`) % codeTypes.length
-  ];
-  const destinationSystemID = resolveDestinationSystemID(
-    profile.homeSystemID,
-    destinationClassID,
-    `${slotKey}:${generation}:destination-system`,
-  );
-  const k162Type = getK162TypeRecord();
-  if (!sourceType || !destinationSystemID || !k162Type) {
-    return null;
-  }
-
-  const pairID = allocatePairID(table);
-  const lifetimeMinutes = Math.max(
-    1,
-    Math.round(Math.max(1, toInt(sourceType.lifetimeMinutes, 960)) *
-      Math.max(0.0001, toFiniteNumber(config.wormholeLifetimeScale, 1))),
-  );
-  const totalMass = Math.max(1, toInt(sourceType.maxStableMass, 1));
-  const pair = {
-    pairID,
-    kind: "random",
-    managedSlotKey: slotKey,
-    estateConnectionRole: "random",
-    persistent: false,
-    unlimitedMass: false,
-    randomProfileKey: "family-estate-random",
-    state: "active",
-    createdAtMs: nowMs,
-    expiresAtMs: nowMs + lifetimeMinutes * 60 * 1000,
-    collapseAtMs: 0,
-    collapseReason: null,
-    totalMass,
-    remainingMass: totalMass,
-    massRegeneration: Math.max(0, toInt(sourceType.massRegeneration, 0)),
-    maxJumpMass: Math.max(1, toInt(sourceType.maxJumpMass, 1)),
-    lifetimeMinutes,
-    lastMassStateAtMs: nowMs,
-    massRegenRemainder: 0,
-    lastPassiveRevealCheckAtMs: 0,
-    staticSlotKey: slotKey,
-    source: buildEndpointRecord(profile.homeSystemID, sourceType, {
-      endpointID: allocateEndpointID(table),
-      code: sourceType.code,
-      discovered: true,
-      seed: `${slotKey}:${generation}:source`,
-      slotKey,
-    }),
-    destination: buildEndpointRecord(destinationSystemID, k162Type, {
-      endpointID: allocateEndpointID(table),
-      code: K162_CODE,
-      discovered: false,
-      seed: `${slotKey}:${generation}:destination`,
-      slotKey,
-    }),
-  };
-  slotState.generation = generation;
-  slotState.activePairID = pairID;
-  slotState.nextRespawnAtMs = 0;
-  table.staticSlotsByKey[slotKey] = slotState;
-  table.pairsByID[String(pairID)] = pair;
-  return pair;
-}
-
-function isConfiguredPermanentPair(pair, connection) {
-  return Boolean(
-    pair && connection &&
-    getPairState(pair) === "active" &&
-    isPersistentPair(pair) &&
-    hasUnlimitedMass(pair) &&
-    hasUnrestrictedShipMass(pair) &&
-    toInt(pair.source && pair.source.systemID, 0) === toInt(connection.sourceSystemID, 0) &&
-    toInt(pair.destination && pair.destination.systemID, 0) === toInt(connection.destinationSystemID, 0) &&
-    String(pair.source && pair.source.code || "").toUpperCase() ===
-      String(connection.sourceCode || "").toUpperCase()
-  );
-}
-
-function suppressFamilyEstateUnmanagedConnections(table, profile, nowMs, changedPairs) {
-  if (!profile.suppressNativeHomeStatics) {
-    return;
-  }
-  for (const pair of Object.values(table.pairsByID || {})) {
-    if (
-      getPairState(pair) !== "active" ||
-      String(pair.managedSlotKey || "").startsWith("family-estate:") ||
-      toInt(pair.source && pair.source.systemID, 0) !== toInt(profile.homeSystemID, 0)
-    ) {
-      continue;
-    }
-    collapsePairInTable(table, pair, nowMs, "estate-managed-home");
-    changedPairs.push(pair);
-  }
-}
-
-function ensureFamilyEstateConnectionsInTable(table, nowMs, options = {}) {
-  const profile = options.profile || getFamilyEstateProfile();
-  const createdPairs = [];
-  const changedPairs = [];
-  if (profile.enabled !== true) {
-    return { success: true, enabled: false, createdPairs, changedPairs, profile };
-  }
-  if (options.validate !== false) {
-    const validation = validateFamilyEstateProfile(profile);
-    if (!validation.success) {
-      return {
-        success: false,
-        errorMsg: validation.errorMsg,
-        createdPairs,
-        changedPairs,
-        profile,
-      };
-    }
-  }
-
-  suppressFamilyEstateUnmanagedConnections(table, profile, nowMs, changedPairs);
-
-  for (const connection of profile.permanentConnections || []) {
-    const activePair = findActiveManagedPair(table, connection.slotKey);
-    if (activePair && !isConfiguredPermanentPair(activePair, connection)) {
-      collapsePairInTable(table, activePair, nowMs, "estate-configuration-changed");
-      changedPairs.push(activePair);
-    }
-    const currentPair = findActiveManagedPair(table, connection.slotKey);
-    if (currentPair) {
-      currentPair.remainingMass = Math.max(1, toInt(currentPair.totalMass, 1));
-      currentPair.expiresAtMs = 0;
-      setEndpointVisibilityState(currentPair.source, "visible");
-      setEndpointVisibilityState(currentPair.destination, "visible");
-      continue;
-    }
-    const created = createFamilyEstatePermanentPair(table, connection, nowMs);
-    if (created) {
-      createdPairs.push(created);
-    }
-  }
-
-  const desiredRandomCount = Math.max(0, toInt(profile.randomConnectionCount, 0));
-  for (let index = 0; index < desiredRandomCount; index += 1) {
-    const slotKey = `${profile.randomSlotPrefix}${index + 1}`;
-    if (findActiveManagedPair(table, slotKey)) {
-      continue;
-    }
-    const slotState = getManagedSlotState(table, slotKey, profile.homeSystemID);
-    if (toInt(slotState.nextRespawnAtMs, 0) > nowMs) {
-      table.staticSlotsByKey[slotKey] = slotState;
-      continue;
-    }
-    const created = createFamilyEstateRandomPair(table, profile, index, nowMs + index);
-    if (created) {
-      createdPairs.push(created);
-    }
-  }
-  for (const pair of Object.values(table.pairsByID || {})) {
-    const slotKey = String(pair && pair.managedSlotKey || "").trim();
-    if (
-      getPairState(pair) !== "active" ||
-      !slotKey.startsWith(profile.randomSlotPrefix)
-    ) {
-      continue;
-    }
-    const slotNumber = toInt(slotKey.slice(profile.randomSlotPrefix.length), 0);
-    if (slotNumber <= desiredRandomCount) {
-      continue;
-    }
-    collapsePairInTable(table, pair, nowMs, "estate-random-slot-disabled");
-    changedPairs.push(pair);
-  }
-  return { success: true, enabled: true, createdPairs, changedPairs, profile };
-}
-
-function familyEstateConnectionsNeedEnsure(table, nowMs, profile = getFamilyEstateProfile()) {
-  if (profile.enabled !== true) {
-    return false;
-  }
-  for (const connection of profile.permanentConnections || []) {
-    if (!isConfiguredPermanentPair(findActiveManagedPair(table, connection.slotKey), connection)) {
-      return true;
-    }
-  }
-  for (let index = 0; index < Math.max(0, toInt(profile.randomConnectionCount, 0)); index += 1) {
-    const slotKey = `${profile.randomSlotPrefix}${index + 1}`;
-    if (findActiveManagedPair(table, slotKey)) {
-      continue;
-    }
-    const slotState = getManagedSlotState(table, slotKey, profile.homeSystemID);
-    if (toInt(slotState.nextRespawnAtMs, 0) <= nowMs) {
-      return true;
-    }
-  }
-  return false;
-}
-
 function collapsePairInTable(table, pair, nowMs, reason = "collapsed") {
   if (!pair || String(pair.state || "").toLowerCase() !== "active") {
     return pair;
@@ -1326,15 +998,135 @@ function collapsePairInTable(table, pair, nowMs, reason = "collapsed") {
       nextRespawnAtMs: 0,
     };
     slotState.activePairID = 0;
-    const estateProfile = getFamilyEstateProfile();
-    const isEstateRandomSlot = String(pair.managedSlotKey || "")
-      .startsWith(String(estateProfile.randomSlotPrefix || "family-estate:random:"));
-    const respawnDelaySeconds = isEstateRandomSlot
-      ? Math.max(0, toInt(estateProfile.randomRespawnDelaySeconds, 60))
-      : Math.max(0, toInt(config.wormholeStaticRespawnDelaySeconds, 60));
-    slotState.nextRespawnAtMs = nowMs + respawnDelaySeconds * 1000;
+    slotState.nextRespawnAtMs =
+      nowMs + Math.max(0, toInt(config.wormholeStaticRespawnDelaySeconds, 60)) * 1000;
     table.staticSlotsByKey[pair.staticSlotKey] = slotState;
   }
+  return pair;
+}
+
+function prunePreparedJumpReservations(nowMs = Date.now()) {
+  for (const [pairID, reservations] of preparedJumpReservationsByPairID) {
+    for (const [token, expiresAtMs] of reservations) {
+      if (toInt(expiresAtMs, 0) <= nowMs) {
+        reservations.delete(token);
+      }
+    }
+    if (reservations.size <= 0) {
+      preparedJumpReservationsByPairID.delete(pairID);
+    }
+  }
+}
+
+function reservePreparedJump(pairID, options = {}) {
+  const numericPairID = toInt(pairID, 0);
+  if (numericPairID <= 0) {
+    return null;
+  }
+  const nowMs = Math.max(0, toInt(options.nowMs, Date.now()));
+  prunePreparedJumpReservations(nowMs);
+  const token = `${numericPairID}:${preparedJumpReservationSequence}`;
+  preparedJumpReservationSequence += 1;
+  const expiresAtMs = Math.max(
+    nowMs + 1,
+    toInt(options.expiresAtMs, nowMs + WORMHOLE_PREPARED_JUMP_RESERVATION_MS),
+  );
+  const reservations = preparedJumpReservationsByPairID.get(numericPairID) || new Map();
+  reservations.set(token, expiresAtMs);
+  preparedJumpReservationsByPairID.set(numericPairID, reservations);
+  return token;
+}
+
+function releasePreparedJump(pairID, token) {
+  const numericPairID = toInt(pairID, 0);
+  const reservations = preparedJumpReservationsByPairID.get(numericPairID);
+  if (!reservations || !reservations.delete(String(token || ""))) {
+    return false;
+  }
+  if (reservations.size <= 0) {
+    preparedJumpReservationsByPairID.delete(numericPairID);
+  }
+  return true;
+}
+
+function isPairReservedForPreparedJump(pairID, nowMs = Date.now()) {
+  prunePreparedJumpReservations(nowMs);
+  const reservations = preparedJumpReservationsByPairID.get(toInt(pairID, 0));
+  return Boolean(reservations && reservations.size > 0);
+}
+
+function createStaticPairInRowTransaction(transaction, systemID, slot, nowMs) {
+  const slotKey = String(slot && slot.slotKey || "").trim();
+  const generationTable = {
+    nextPairSequence: Math.max(1, toInt(transaction.getScalar("nextPairSequence"), 1)),
+    nextEndpointSequence: Math.max(
+      1,
+      toInt(transaction.getScalar("nextEndpointSequence"), 1),
+    ),
+    pairsByID: {},
+    staticSlotsByKey: {},
+  };
+  const existingSlot = transaction.getStaticSlot(slotKey);
+  if (existingSlot) {
+    generationTable.staticSlotsByKey[slotKey] = { ...existingSlot };
+  }
+  const pair = createStaticPair(generationTable, systemID, slot, nowMs);
+  if (!pair) {
+    return null;
+  }
+  transaction.setScalar("nextPairSequence", generationTable.nextPairSequence);
+  transaction.setScalar("nextEndpointSequence", generationTable.nextEndpointSequence);
+  transaction.setStaticSlot(slotKey, generationTable.staticSlotsByKey[slotKey]);
+  transaction.setPair(pair);
+  return pair;
+}
+
+function createRandomPairInRowTransaction(
+  transaction,
+  profile,
+  nowMs,
+  options = {},
+) {
+  const generationTable = {
+    nextPairSequence: Math.max(1, toInt(transaction.getScalar("nextPairSequence"), 1)),
+    nextEndpointSequence: Math.max(
+      1,
+      toInt(transaction.getScalar("nextEndpointSequence"), 1),
+    ),
+    pairsByID: {},
+    staticSlotsByKey: {},
+  };
+  const pair = createRandomPairFromProfile(generationTable, profile, nowMs, options);
+  if (!pair) {
+    return null;
+  }
+  transaction.setScalar("nextPairSequence", generationTable.nextPairSequence);
+  transaction.setScalar("nextEndpointSequence", generationTable.nextEndpointSequence);
+  transaction.setPair(pair);
+  return pair;
+}
+
+function collapsePairInRowTransaction(transaction, pair, nowMs, reason = "collapsed") {
+  if (!pair || String(pair.state || "").toLowerCase() !== "active") {
+    return pair;
+  }
+  pair.state = "collapsed";
+  pair.collapseAtMs = nowMs;
+  pair.collapseReason = String(reason || "collapsed");
+  if (pair.staticSlotKey) {
+    const slotState = transaction.getStaticSlot(pair.staticSlotKey) || {
+      slotKey: pair.staticSlotKey,
+      systemID: toInt(pair.source && pair.source.systemID, 0),
+      generation: 0,
+      activePairID: 0,
+      nextRespawnAtMs: 0,
+    };
+    slotState.activePairID = 0;
+    slotState.nextRespawnAtMs =
+      nowMs + Math.max(0, toInt(config.wormholeStaticRespawnDelaySeconds, 60)) * 1000;
+    transaction.setStaticSlot(pair.staticSlotKey, slotState);
+  }
+  transaction.setPair(pair);
   return pair;
 }
 
@@ -1388,9 +1180,6 @@ function ensureStaticPairsInTable(table, systemID, nowMs) {
 }
 
 function resolveDesiredRandomProfileCount(profile) {
-  if (config.wormholeWanderingEnabled !== true) {
-    return 0;
-  }
   const authoredCount = Math.max(0, toInt(profile && profile.estimatedUniverseCount, 0));
   const scale = Math.max(0, toFiniteNumber(config.wormholeWanderingCountScale, 1));
   return Math.max(0, Math.round(authoredCount * scale));
@@ -1472,9 +1261,6 @@ function collectRandomProfileStats(table, nowMs) {
 
 function ensureRandomPairsInTable(table, nowMs) {
   const createdPairs = [];
-  if (config.wormholeWanderingEnabled !== true) {
-    return createdPairs;
-  }
   const {
     countsByProfileKey,
     occupiedSystemIDsByProfileKey,
@@ -1507,18 +1293,23 @@ function ensureRandomPairsInTable(table, nowMs) {
 }
 
 function seedUniverseStaticsInTable(table, nowMs) {
+  const estateProfile = getFamilyEstateProfile();
   const createdPairs = [];
   for (const system of listSystems()) {
-    if (!system || !Array.isArray(system.staticSlots) || system.staticSlots.length <= 0) {
+    const systemID = toInt(system && system.solarSystemID, 0);
+    if (
+      !system ||
+      !Array.isArray(system.staticSlots) ||
+      system.staticSlots.length <= 0 ||
+      isFamilyEstateHomeSystem(systemID, estateProfile)
+    ) {
       continue;
     }
     createdPairs.push(
-      ...ensureStaticPairsInTable(table, toInt(system.solarSystemID, 0), nowMs),
+      ...ensureStaticPairsInTable(table, systemID, nowMs),
     );
   }
   createdPairs.push(...ensureRandomPairsInTable(table, nowMs));
-  const estateResult = ensureFamilyEstateConnectionsInTable(table, nowMs);
-  createdPairs.push(...estateResult.createdPairs);
   if (toInt(table.universeSeededAtMs, 0) <= 0) {
     table.universeSeededAtMs = nowMs;
   }
@@ -1529,6 +1320,12 @@ function collectPairsForSystem(table, systemID, options = {}) {
   const numericSystemID = toInt(systemID, 0);
   const includeCollapsed = options.includeCollapsed === true;
   if (numericSystemID > 0) {
+    if (table === getStateView()) {
+      return listIndexedPairsForSystem(numericSystemID, {
+        clone: false,
+        includeCollapsed,
+      });
+    }
     const index = getPairIndex(table);
     const indexedPairs = includeCollapsed
       ? index.allPairsBySystemID.get(numericSystemID)
@@ -1698,9 +1495,6 @@ function systemNeedsStaticEnsure(table, systemID, nowMs) {
   if (numericSystemID <= 0) {
     return false;
   }
-  if (isFamilyEstateHomeSystem(numericSystemID)) {
-    return familyEstateConnectionsNeedEnsure(table, nowMs);
-  }
   const staticSlots = listStaticSlotsForSystem(numericSystemID);
   if (!Array.isArray(staticSlots) || staticSlots.length <= 0) {
     return false;
@@ -1725,19 +1519,434 @@ function systemNeedsStaticEnsure(table, systemID, nowMs) {
   return false;
 }
 
-function pairsNeedSceneMaintenance(pairs, nowMs) {
-  for (const pair of pairs || []) {
-    if (!pair || getPairState(pair) !== "active") {
+function ensureStaticSlotWithRows(systemID, slot, nowMs) {
+  const slotKey = String(slot && slot.slotKey || "").trim();
+  if (!slotKey) {
+    return null;
+  }
+  const currentTable = getStateView();
+  const slotState = currentTable.staticSlotsByKey && currentTable.staticSlotsByKey[slotKey];
+  const activePair = slotState && currentTable.pairsByID &&
+    currentTable.pairsByID[String(slotState.activePairID)];
+  if (activePair && getPairState(activePair) === "active") {
+    return null;
+  }
+  if (slotState && toInt(slotState.nextRespawnAtMs, 0) > nowMs) {
+    return null;
+  }
+  const result = mutateStateRows((transaction) =>
+    createStaticPairInRowTransaction(transaction, systemID, slot, nowMs));
+  return result.success === true && result.data ? result.data : null;
+}
+
+function getManagedSlotState(table, slotKey, systemID) {
+  const key = String(slotKey || "").trim();
+  const current = table.staticSlotsByKey && table.staticSlotsByKey[key];
+  return current || {
+    slotKey: key,
+    systemID: toInt(systemID, 0),
+    generation: 0,
+    activePairID: 0,
+    nextRespawnAtMs: 0,
+  };
+}
+
+function findActiveManagedPair(table, slotKey) {
+  const key = String(slotKey || "").trim();
+  return Object.values(table.pairsByID || {}).find((pair) =>
+    getPairState(pair) === "active" &&
+    String(pair && pair.managedSlotKey || "").trim() === key
+  ) || null;
+}
+
+function isConfiguredPermanentPair(pair, connection) {
+  const slotKey = String(connection.slotKey || "").trim();
+  return Boolean(
+    pair &&
+    getPairState(pair) === "active" &&
+    pair.kind === "estate" &&
+    String(pair.managedSlotKey || "").trim() === slotKey &&
+    String(pair.staticSlotKey || "").trim() === slotKey &&
+    String(pair.estateConnectionRole || "").trim().toLowerCase() ===
+      String(connection.key || "permanent").trim().toLowerCase() &&
+    pair.persistent === true &&
+    pair.unlimitedMass === true &&
+    pair.unrestrictedShipMass === true &&
+    toInt(pair.source && pair.source.systemID, 0) === toInt(connection.sourceSystemID, 0) &&
+    toInt(pair.destination && pair.destination.systemID, 0) ===
+      toInt(connection.destinationSystemID, 0) &&
+    String(pair.source && pair.source.code || "").trim().toUpperCase() ===
+      String(connection.sourceCode || "").trim().toUpperCase()
+  );
+}
+
+function createFamilyEstatePermanentPair(table, connection, nowMs) {
+  const sourceType = getCodeTypeRecord(connection && connection.sourceCode);
+  const k162Type = getK162TypeRecord();
+  const sourceSystemID = toInt(connection && connection.sourceSystemID, 0);
+  const destinationSystemID = toInt(connection && connection.destinationSystemID, 0);
+  const slotKey = String(connection && connection.slotKey || "").trim();
+  if (!sourceType || !k162Type || !sourceSystemID || !destinationSystemID || !slotKey) {
+    return null;
+  }
+
+  const pairID = allocatePairID(table);
+  const totalMass = Math.max(1, toInt(sourceType.maxStableMass, 1));
+  const pair = {
+    pairID,
+    kind: "estate",
+    managedSlotKey: slotKey,
+    estateConnectionRole: String(connection.key || "permanent").trim().toLowerCase(),
+    persistent: true,
+    unlimitedMass: true,
+    unrestrictedShipMass: true,
+    randomProfileKey: null,
+    state: "active",
+    createdAtMs: nowMs,
+    expiresAtMs: 0,
+    collapseAtMs: 0,
+    collapseReason: null,
+    totalMass,
+    remainingMass: totalMass,
+    massRegeneration: 0,
+    maxJumpMass: 0,
+    lifetimeMinutes: 0,
+    lastMassStateAtMs: nowMs,
+    massRegenRemainder: 0,
+    lastPassiveRevealCheckAtMs: 0,
+    staticSlotKey: slotKey,
+    source: buildEndpointRecord(sourceSystemID, sourceType, {
+      endpointID: allocateEndpointID(table),
+      code: sourceType.code,
+      discovered: true,
+      seed: `${slotKey}:source`,
+      slotKey,
+    }),
+    destination: buildEndpointRecord(destinationSystemID, k162Type, {
+      endpointID: allocateEndpointID(table),
+      code: K162_CODE,
+      discovered: true,
+      seed: `${slotKey}:destination`,
+      slotKey,
+    }),
+  };
+  const slotState = getManagedSlotState(table, slotKey, sourceSystemID);
+  slotState.generation = Math.max(0, toInt(slotState.generation, 0)) + 1;
+  slotState.activePairID = pairID;
+  slotState.nextRespawnAtMs = 0;
+  table.staticSlotsByKey[slotKey] = slotState;
+  table.pairsByID[String(pairID)] = pair;
+  return pair;
+}
+
+function createFamilyEstateRandomPair(table, profile, slotIndex, nowMs) {
+  const slotKey = `${profile.randomSlotPrefix}${slotIndex + 1}`;
+  const slotState = getManagedSlotState(table, slotKey, profile.homeSystemID);
+  const generation = Math.max(0, toInt(slotState.generation, 0)) + 1;
+  const destinationClassChoices = Array.isArray(profile.randomDestinationClassIDs)
+    ? profile.randomDestinationClassIDs.map((entry) => toInt(entry, 0)).filter((entry) => entry > 0)
+    : [];
+  if (destinationClassChoices.length <= 0) {
+    return null;
+  }
+  const destinationClassID = destinationClassChoices[
+    hashSeed(`${slotKey}:${generation}:destination-class`) % destinationClassChoices.length
+  ];
+  const codeTypes = listCodeTypes().filter(
+    (record) => toInt(record && record.targetClassID, 0) === destinationClassID,
+  );
+  if (codeTypes.length <= 0) {
+    return null;
+  }
+  const sourceType = codeTypes[
+    hashSeed(`${slotKey}:${generation}:source-type`) % codeTypes.length
+  ];
+  const destinationSystemID = resolveDestinationSystemID(
+    profile.homeSystemID,
+    destinationClassID,
+    `${slotKey}:${generation}:destination-system`,
+  );
+  const k162Type = getK162TypeRecord();
+  if (!sourceType || !destinationSystemID || !k162Type) {
+    return null;
+  }
+
+  const pairID = allocatePairID(table);
+  const lifetimeMinutes = Math.max(
+    1,
+    Math.round(Math.max(1, toInt(sourceType.lifetimeMinutes, 960)) *
+      Math.max(0.0001, toFiniteNumber(config.wormholeLifetimeScale, 1))),
+  );
+  const totalMass = Math.max(1, toInt(sourceType.maxStableMass, 1));
+  const pair = {
+    pairID,
+    kind: "random",
+    managedSlotKey: slotKey,
+    estateConnectionRole: "random",
+    persistent: false,
+    unlimitedMass: false,
+    unrestrictedShipMass: false,
+    randomProfileKey: "family-estate-random",
+    state: "active",
+    createdAtMs: nowMs,
+    expiresAtMs: nowMs + lifetimeMinutes * 60 * 1000,
+    collapseAtMs: 0,
+    collapseReason: null,
+    totalMass,
+    remainingMass: totalMass,
+    massRegeneration: Math.max(0, toInt(sourceType.massRegeneration, 0)),
+    maxJumpMass: Math.max(1, toInt(sourceType.maxJumpMass, 1)),
+    lifetimeMinutes,
+    lastMassStateAtMs: nowMs,
+    massRegenRemainder: 0,
+    lastPassiveRevealCheckAtMs: 0,
+    staticSlotKey: slotKey,
+    source: buildEndpointRecord(profile.homeSystemID, sourceType, {
+      endpointID: allocateEndpointID(table),
+      code: sourceType.code,
+      discovered: true,
+      seed: `${slotKey}:${generation}:source`,
+      slotKey,
+    }),
+    destination: buildEndpointRecord(destinationSystemID, k162Type, {
+      endpointID: allocateEndpointID(table),
+      code: K162_CODE,
+      discovered: false,
+      seed: `${slotKey}:${generation}:destination`,
+      slotKey,
+    }),
+  };
+  slotState.generation = generation;
+  slotState.activePairID = pairID;
+  slotState.nextRespawnAtMs = 0;
+  table.staticSlotsByKey[slotKey] = slotState;
+  table.pairsByID[String(pairID)] = pair;
+  return pair;
+}
+
+function suppressFamilyEstateUnmanagedConnections(table, profile, nowMs, changedPairs) {
+  if (!profile.suppressNativeHomeStatics) {
+    return;
+  }
+  for (const pair of Object.values(table.pairsByID || {})) {
+    if (
+      getPairState(pair) !== "active" ||
+      String(pair.managedSlotKey || "").startsWith("family-estate:") ||
+      toInt(pair.source && pair.source.systemID, 0) !== toInt(profile.homeSystemID, 0)
+    ) {
       continue;
     }
-    if (pairNeedsStateAdvance(pair, nowMs)) {
+    collapsePairInTable(table, pair, nowMs, "estate-managed-home");
+    changedPairs.push(pair);
+  }
+}
+
+function ensureFamilyEstateConnectionsInTable(table, nowMs, options = {}) {
+  const profile = options.profile || getFamilyEstateProfile();
+  const createdPairs = [];
+  const changedPairs = [];
+  if (profile.enabled !== true) {
+    return { success: true, enabled: false, createdPairs, changedPairs, profile };
+  }
+  if (options.validate !== false) {
+    const validation = validateFamilyEstateProfile(profile);
+    if (!validation.success) {
+      return {
+        success: false,
+        errorMsg: validation.errorMsg,
+        createdPairs,
+        changedPairs,
+        profile,
+      };
+    }
+  }
+
+  suppressFamilyEstateUnmanagedConnections(table, profile, nowMs, changedPairs);
+
+  for (const connection of profile.permanentConnections || []) {
+    const activePair = findActiveManagedPair(table, connection.slotKey);
+    if (activePair && !isConfiguredPermanentPair(activePair, connection)) {
+      collapsePairInTable(table, activePair, nowMs, "estate-configuration-changed");
+      changedPairs.push(activePair);
+    }
+    const currentPair = findActiveManagedPair(table, connection.slotKey);
+    if (currentPair) {
+      let changed = false;
+      const totalMass = Math.max(1, toInt(currentPair.totalMass, 1));
+      if (toInt(currentPair.remainingMass, 0) !== totalMass) {
+        currentPair.remainingMass = totalMass;
+        changed = true;
+      }
+      if (toInt(currentPair.expiresAtMs, 0) !== 0) {
+        currentPair.expiresAtMs = 0;
+        changed = true;
+      }
+      if (!isEndpointVisible(currentPair.source)) {
+        setEndpointVisibilityState(currentPair.source, "visible");
+        changed = true;
+      }
+      if (!isEndpointVisible(currentPair.destination)) {
+        setEndpointVisibilityState(currentPair.destination, "visible");
+        changed = true;
+      }
+      if (changed) {
+        changedPairs.push(currentPair);
+      }
+      continue;
+    }
+    const created = createFamilyEstatePermanentPair(table, connection, nowMs);
+    if (created) {
+      createdPairs.push(created);
+    }
+  }
+
+  const desiredRandomCount = Math.max(0, toInt(profile.randomConnectionCount, 0));
+  for (let index = 0; index < desiredRandomCount; index += 1) {
+    const slotKey = `${profile.randomSlotPrefix}${index + 1}`;
+    if (findActiveManagedPair(table, slotKey)) {
+      continue;
+    }
+    const slotState = getManagedSlotState(table, slotKey, profile.homeSystemID);
+    if (toInt(slotState.nextRespawnAtMs, 0) > nowMs) {
+      table.staticSlotsByKey[slotKey] = slotState;
+      continue;
+    }
+    const created = createFamilyEstateRandomPair(table, profile, index, nowMs + index);
+    if (created) {
+      createdPairs.push(created);
+    }
+  }
+  for (const pair of Object.values(table.pairsByID || {})) {
+    const slotKey = String(pair && pair.managedSlotKey || "").trim();
+    if (
+      getPairState(pair) !== "active" ||
+      !slotKey.startsWith(profile.randomSlotPrefix)
+    ) {
+      continue;
+    }
+    const slotNumber = toInt(slotKey.slice(profile.randomSlotPrefix.length), 0);
+    if (slotNumber <= desiredRandomCount) {
+      continue;
+    }
+    collapsePairInTable(table, pair, nowMs, "estate-random-slot-disabled");
+    changedPairs.push(pair);
+  }
+  return { success: true, enabled: true, createdPairs, changedPairs, profile };
+}
+
+function familyEstateConnectionsNeedEnsure(table, nowMs, profile = getFamilyEstateProfile()) {
+  if (profile.enabled !== true) {
+    return false;
+  }
+  for (const connection of profile.permanentConnections || []) {
+    if (!isConfiguredPermanentPair(findActiveManagedPair(table, connection.slotKey), connection)) {
       return true;
     }
-    if (toInt(pair.expiresAtMs, 0) > 0 && toInt(pair.expiresAtMs, 0) <= nowMs) {
+  }
+  for (let index = 0; index < Math.max(0, toInt(profile.randomConnectionCount, 0)); index += 1) {
+    const slotKey = `${profile.randomSlotPrefix}${index + 1}`;
+    if (findActiveManagedPair(table, slotKey)) {
+      continue;
+    }
+    const slotState = getManagedSlotState(table, slotKey, profile.homeSystemID);
+    if (toInt(slotState.nextRespawnAtMs, 0) <= nowMs) {
       return true;
     }
   }
   return false;
+}
+
+function listFamilyEstateConnectionViews(options = {}) {
+  const profile = getFamilyEstateProfile();
+  if (profile.enabled !== true) {
+    return [];
+  }
+  return listPairViews({
+    systemID: profile.homeSystemID,
+    includeCollapsed: options.includeCollapsed === true,
+    includeUndiscovered: options.includeUndiscovered !== false,
+    nowMs: options.nowMs,
+  }).filter((entry) => String(entry.managedSlotKey || "").startsWith("family-estate:"));
+}
+
+function ensureFamilyEstateConnections(nowMs = Date.now(), options = {}) {
+  const profile = options.profile || getFamilyEstateProfile();
+  const validation = validateFamilyEstateProfile(profile);
+  if (!validation.success || validation.enabled === false) {
+    return validation;
+  }
+
+  let estateResult = null;
+  const changedSystemIDs = new Set();
+  const result = mutateStateRows((transaction) => {
+    const table = getStateSnapshot();
+    const nextPairSequence = toInt(table.nextPairSequence, 1);
+    const nextEndpointSequence = toInt(table.nextEndpointSequence, 1);
+    estateResult = ensureFamilyEstateConnectionsInTable(table, nowMs, {
+      profile,
+      validate: false,
+    });
+    if (!estateResult.success) {
+      return estateResult;
+    }
+
+    const changedPairs = new Map();
+    for (const pair of [
+      ...(estateResult.createdPairs || []),
+      ...(estateResult.changedPairs || []),
+    ]) {
+      const pairID = toInt(pair && pair.pairID, 0);
+      if (pairID <= 0) {
+        continue;
+      }
+      const storedPair = table.pairsByID[String(pairID)] || pair;
+      changedPairs.set(pairID, storedPair);
+      for (const systemID of collectVisibleSignatureSystemIDsForPair(storedPair, {
+        includeHiddenDestination: true,
+      })) {
+        changedSystemIDs.add(systemID);
+      }
+    }
+
+    for (const [pairID, pair] of changedPairs) {
+      transaction.setPair(pair);
+      const slotKey = String(pair.staticSlotKey || pair.managedSlotKey || "").trim();
+      const slotState = table.staticSlotsByKey && table.staticSlotsByKey[slotKey];
+      if (slotKey && slotState) {
+        transaction.setStaticSlot(slotKey, slotState);
+      }
+    }
+    if (toInt(table.nextPairSequence, 1) !== nextPairSequence) {
+      transaction.setScalar("nextPairSequence", table.nextPairSequence);
+    }
+    if (toInt(table.nextEndpointSequence, 1) !== nextEndpointSequence) {
+      transaction.setScalar("nextEndpointSequence", table.nextEndpointSequence);
+    }
+    return estateResult;
+  });
+  if (!result.success || !estateResult || estateResult.success !== true) {
+    return {
+      success: false,
+      errorMsg: estateResult && estateResult.errorMsg || "FAMILY_ESTATE_WORMHOLE_WRITE_FAILED",
+    };
+  }
+  if (changedSystemIDs.size > 0) {
+    notifySignatureStateChanged([...changedSystemIDs]);
+  }
+  return {
+    success: true,
+    enabled: true,
+    data: {
+      profile,
+      createdPairs: estateResult.createdPairs.map(cloneValue),
+      changedPairs: estateResult.changedPairs.map(cloneValue),
+      connections: listFamilyEstateConnectionViews({
+        includeCollapsed: false,
+        includeUndiscovered: true,
+        nowMs,
+      }),
+    },
+  };
 }
 
 function ensureSystemStatics(systemID, nowMs = Date.now()) {
@@ -1750,16 +1959,15 @@ function ensureSystemStatics(systemID, nowMs = Date.now()) {
     };
   }
   const numericSystemID = toInt(systemID, 0);
-  const currentTable = getStateView();
   const estateProfile = getFamilyEstateProfile();
+  const currentTable = getStateView();
   const needsEstateEnsure =
     isFamilyEstateRelevantSystem(numericSystemID, estateProfile) &&
     familyEstateConnectionsNeedEnsure(currentTable, nowMs, estateProfile);
-  if (
-    toInt(currentTable.universeSeededAtMs, 0) > 0 &&
-    !systemNeedsStaticEnsure(currentTable, numericSystemID, nowMs) &&
-    !needsEstateEnsure
-  ) {
+  const needsStaticEnsure =
+    !isFamilyEstateHomeSystem(numericSystemID, estateProfile) &&
+    systemNeedsStaticEnsure(currentTable, numericSystemID, nowMs);
+  if (!needsStaticEnsure && !needsEstateEnsure) {
     return {
       success: true,
       unchanged: true,
@@ -1768,33 +1976,34 @@ function ensureSystemStatics(systemID, nowMs = Date.now()) {
       },
     };
   }
-  let createdPairs = [];
-  const result = mutateState((table) => {
-    prunePolarizations(table, nowMs);
-    if (toInt(table.universeSeededAtMs, 0) <= 0) {
-      const seededPairs = seedUniverseStaticsInTable(table, nowMs);
-      createdPairs = seededPairs
-        .filter((pair) =>
-          toInt(pair && pair.source && pair.source.systemID, 0) === numericSystemID ||
-          toInt(pair && pair.destination && pair.destination.systemID, 0) === numericSystemID,
-        )
-        .map(cloneValue);
-      return table;
+
+  const createdPairs = [];
+  for (const slot of needsStaticEnsure ? listStaticSlotsForSystem(numericSystemID) : []) {
+    const createdPair = ensureStaticSlotWithRows(numericSystemID, slot, nowMs);
+    if (createdPair) {
+      createdPairs.push(cloneValue(createdPair));
     }
-    const ensuredStatics = ensureStaticPairsInTable(table, numericSystemID, nowMs);
-    const estateResult = needsEstateEnsure
-      ? ensureFamilyEstateConnectionsInTable(table, nowMs, { profile: estateProfile })
-      : { createdPairs: [] };
-    createdPairs = [...ensuredStatics, ...estateResult.createdPairs].map(cloneValue);
-    return table;
-  });
-  if (result.success === true && createdPairs.length > 0) {
+  }
+
+  if (needsEstateEnsure) {
+    const estateResult = ensureFamilyEstateConnections(nowMs, { profile: estateProfile });
+    if (!estateResult.success) {
+      return {
+        success: false,
+        errorMsg: estateResult.errorMsg,
+        data: { createdPairs },
+      };
+    }
+    createdPairs.push(...(estateResult.data.createdPairs || []).map(cloneValue));
+  }
+
+  if (createdPairs.length > 0) {
     notifySignatureStateChanged(
       createdPairs.flatMap((pair) => collectVisibleSignatureSystemIDsForPair(pair)),
     );
   }
   return {
-    success: result.success,
+    success: true,
     data: {
       createdPairs,
     },
@@ -1816,13 +2025,30 @@ function ensureUniverseStatics(nowMs = Date.now()) {
     createdPairs = seedUniverseStaticsInTable(table, nowMs).map(cloneValue);
     return table;
   });
-  if (result.success === true && createdPairs.length > 0) {
+  if (result.success !== true) {
+    return {
+      success: false,
+      data: { createdPairs },
+    };
+  }
+
+  const estateResult = ensureFamilyEstateConnections(nowMs);
+  if (!estateResult.success) {
+    return {
+      success: false,
+      errorMsg: estateResult.errorMsg,
+      data: { createdPairs },
+    };
+  }
+  createdPairs.push(...(estateResult.data.createdPairs || []).map(cloneValue));
+
+  if (createdPairs.length > 0) {
     notifySignatureStateChanged(
       createdPairs.flatMap((pair) => collectVisibleSignatureSystemIDsForPair(pair)),
     );
   }
   return {
-    success: result.success,
+    success: true,
     data: {
       createdPairs,
     },
@@ -1835,12 +2061,7 @@ function handleSceneCreated(scene) {
   }
   const nowMs = Date.now();
   const startedAtMs = Date.now();
-  const ensureStartedAtMs = Date.now();
-  if (toInt(getStateView().universeSeededAtMs, 0) <= 0) {
-    ensureUniverseStatics(nowMs);
-  }
-  ensureSystemStatics(scene.systemID, nowMs);
-  const ensureElapsedMs = Date.now() - ensureStartedAtMs;
+  const ensureElapsedMs = 0;
   const syncStartedAtMs = Date.now();
   syncSceneEntities(scene, nowMs);
   const syncElapsedMs = Date.now() - syncStartedAtMs;
@@ -1858,6 +2079,57 @@ function handleSceneCreated(scene) {
   }
 }
 
+function maintainPairByID(pairID, nowMs) {
+  const current = getStateView().pairsByID[String(toInt(pairID, 0))];
+  if (!current || getPairState(current) !== "active") {
+    return [];
+  }
+  const shouldAdvance = pairNeedsStateAdvance(current, nowMs);
+  const shouldCollapse =
+    toInt(current.expiresAtMs, 0) > 0 &&
+    toInt(current.expiresAtMs, 0) <= nowMs;
+  const collapseReserved = shouldCollapse &&
+    isPairReservedForPreparedJump(pairID, nowMs);
+  if (!shouldAdvance && (!shouldCollapse || collapseReserved)) {
+    return [];
+  }
+  const changedSystemIDs = new Set();
+  const result = mutateStateRows((transaction) => {
+    const pair = transaction.getPairByID(pairID);
+    if (!pair || getPairState(pair) !== "active") {
+      return null;
+    }
+    const beforeSourceVisible = isEndpointVisible(pair.source);
+    const beforeDestinationVisible = isEndpointVisible(pair.destination);
+    const beforeState = getPairState(pair);
+    if (pairNeedsStateAdvance(pair, nowMs)) {
+      advancePairState(pair, nowMs);
+    }
+    if (
+      toInt(pair.expiresAtMs, 0) > 0 &&
+      toInt(pair.expiresAtMs, 0) <= nowMs &&
+      !isPairReservedForPreparedJump(pairID, nowMs)
+    ) {
+      collapsePairInRowTransaction(transaction, pair, nowMs, "expired");
+    } else {
+      transaction.setPair(pair);
+    }
+    if (
+      beforeState !== getPairState(pair) ||
+      beforeSourceVisible !== isEndpointVisible(pair.source) ||
+      beforeDestinationVisible !== isEndpointVisible(pair.destination)
+    ) {
+      for (const systemID of collectVisibleSignatureSystemIDsForPair(pair, {
+        includeHiddenDestination: beforeDestinationVisible,
+      })) {
+        changedSystemIDs.add(systemID);
+      }
+    }
+    return null;
+  });
+  return result.success === true ? [...changedSystemIDs] : [];
+}
+
 function tickScene(scene, nowMs = Date.now()) {
   if (!scene || config.wormholesEnabled !== true) {
     return;
@@ -1867,130 +2139,442 @@ function tickScene(scene, nowMs = Date.now()) {
     return;
   }
   scene._wormholeLastTickAtMs = nowMs;
-  const tableView = getStateView();
-  const needsUniverseSeed = toInt(tableView.universeSeededAtMs, 0) <= 0;
-  const scenePairs = collectPairsForSystem(tableView, scene.systemID);
-  const needsStaticEnsure = systemNeedsStaticEnsure(tableView, scene.systemID, nowMs);
+  syncSceneEntities(scene, nowMs);
+}
+
+function buildStaticMaintenanceItems() {
+  if (staticMaintenanceItemsCache) {
+    return staticMaintenanceItemsCache;
+  }
   const estateProfile = getFamilyEstateProfile();
-  const needsEstateEnsure =
-    isFamilyEstateRelevantSystem(scene.systemID, estateProfile) &&
-    familyEstateConnectionsNeedEnsure(tableView, nowMs, estateProfile);
-  const needsPairMaintenance = pairsNeedSceneMaintenance(scenePairs, nowMs);
-  if (!needsUniverseSeed && !needsStaticEnsure && !needsEstateEnsure && !needsPairMaintenance) {
-    if (scenePairs.length > 0) {
-      syncSceneEntities(scene, nowMs);
+  const items = [];
+  for (const system of listSystems()) {
+    const systemID = toInt(system && system.solarSystemID, 0);
+    if (isFamilyEstateHomeSystem(systemID, estateProfile)) {
+      continue;
     }
+    for (const slot of Array.isArray(system && system.staticSlots) ? system.staticSlots : []) {
+      if (systemID > 0 && slot && slot.slotKey) {
+        items.push({ systemID, slot });
+      }
+    }
+  }
+  staticMaintenanceItemsCache = items;
+  return staticMaintenanceItemsCache;
+}
+
+function createLifecycleMaintenanceCycle(nowMs, options = {}) {
+  const table = getStateView();
+  return {
+    epochMs: Math.max(0, toInt(nowMs, Date.now())),
+    generationOrdinal: 0,
+    phase: "statics",
+    staticItems: Array.isArray(options.staticItems)
+      ? options.staticItems
+      : buildStaticMaintenanceItems(),
+    staticCursor: 0,
+    pairIDs: Object.keys(table.pairsByID || {}),
+    pairCursor: 0,
+    polarizationCharacterIDs: Object.keys(table.polarizationByCharacter || {}),
+    polarizationCursor: 0,
+    profiles: Array.isArray(options.profiles)
+      ? options.profiles
+      : listWanderingProfiles(),
+    profileCursor: 0,
+    profilePending: null,
+    randomCountsByProfileKey: new Map(),
+    occupiedSourceSystemIDsByProfileKey: new Map(),
+  };
+}
+
+function removeCollapsedPairByID(pairID) {
+  const result = mutateStateRows((transaction) => {
+    const pair = transaction.getPairByID(pairID);
+    if (!pair || getPairState(pair) === "active") {
+      return false;
+    }
+    transaction.removePair(pairID);
+    return true;
+  });
+  return result.success === true && result.data === true;
+}
+
+function recordRandomPairForCycle(cycle, pair) {
+  if (String(pair && pair.kind || "").toLowerCase() !== "random") {
     return;
   }
+  const profileKey = String(pair && pair.randomProfileKey || "").trim();
+  if (!profileKey) {
+    return;
+  }
+  const state = getPairState(pair);
+  if (state === "active") {
+    cycle.randomCountsByProfileKey.set(
+      profileKey,
+      (cycle.randomCountsByProfileKey.get(profileKey) || 0) + 1,
+    );
+    const occupied = cycle.occupiedSourceSystemIDsByProfileKey.get(profileKey) || new Set();
+    const sourceSystemID = toInt(pair && pair.source && pair.source.systemID, 0);
+    if (sourceSystemID > 0) {
+      occupied.add(sourceSystemID);
+    }
+    cycle.occupiedSourceSystemIDsByProfileKey.set(profileKey, occupied);
+    return;
+  }
+  const respawnDelayMs = Math.max(
+    0,
+    toInt(config.wormholeWanderingRespawnDelaySeconds, 60),
+  ) * 1000;
+  const collapseAtMs = Math.max(0, toInt(pair && pair.collapseAtMs, 0));
+  if (
+    respawnDelayMs > 0 &&
+    collapseAtMs > 0 &&
+    (collapseAtMs + respawnDelayMs) > cycle.epochMs
+  ) {
+    cycle.randomCountsByProfileKey.set(
+      profileKey,
+      (cycle.randomCountsByProfileKey.get(profileKey) || 0) + 1,
+    );
+  }
+}
 
-  const signatureChangedSystemIDs = new Set();
-  mutateState((table) => {
-    prunePolarizations(table, nowMs);
-    if (needsUniverseSeed) {
-      const seededPairs = seedUniverseStaticsInTable(table, nowMs);
-      for (const pair of seededPairs) {
-        for (const systemID of collectVisibleSignatureSystemIDsForPair(pair)) {
-          signatureChangedSystemIDs.add(systemID);
-        }
+function pruneCharacterPolarizationsByID(characterID, nowMs) {
+  const result = mutateStateRows((transaction) => {
+    const endpoints = transaction.getPolarizations(characterID);
+    let changed = false;
+    for (const [endpointID, record] of Object.entries(endpoints)) {
+      if (toInt(record && record.endAtMs, 0) <= nowMs) {
+        delete endpoints[endpointID];
+        changed = true;
       }
     }
-    for (const pair of Object.values(table.pairsByID || {})) {
-      if (String(pair.state || "").toLowerCase() !== "active") {
-        continue;
-      }
-      const shouldAdvance = pairNeedsStateAdvance(pair, nowMs);
-      const shouldCollapse =
-        toInt(pair.expiresAtMs, 0) > 0 &&
-        toInt(pair.expiresAtMs, 0) <= nowMs;
-      if (!shouldAdvance && !shouldCollapse) {
-        continue;
-      }
-      const beforeSourceVisible = isEndpointVisible(pair.source);
-      const beforeDestinationVisible = isEndpointVisible(pair.destination);
-      const beforeState = String(pair.state || "").toLowerCase();
-      if (shouldAdvance) {
-        advancePairState(pair, nowMs);
-      }
-      if (shouldCollapse) {
-        collapsePairInTable(table, pair, nowMs, "expired");
-      }
-      if (
-        beforeState !== String(pair.state || "").toLowerCase() ||
-        beforeSourceVisible !== isEndpointVisible(pair.source) ||
-        beforeDestinationVisible !== isEndpointVisible(pair.destination)
-      ) {
-        for (const systemID of collectVisibleSignatureSystemIDsForPair(pair, {
-          includeHiddenDestination: beforeDestinationVisible,
-        })) {
-          signatureChangedSystemIDs.add(systemID);
-        }
-      }
+    if (!changed) {
+      return false;
     }
-    const staticPairs = needsStaticEnsure
-      ? ensureStaticPairsInTable(table, scene.systemID, nowMs)
-      : [];
-    for (const pair of staticPairs) {
-      for (const systemID of collectVisibleSignatureSystemIDsForPair(pair)) {
-        signatureChangedSystemIDs.add(systemID);
-      }
+    if (Object.keys(endpoints).length > 0) {
+      transaction.setPolarizations(characterID, endpoints);
+    } else {
+      transaction.removePolarizations(characterID);
     }
-    if (needsEstateEnsure) {
-      const estateResult = ensureFamilyEstateConnectionsInTable(table, nowMs, {
-        profile: estateProfile,
-      });
-      for (const pair of [...estateResult.createdPairs, ...estateResult.changedPairs]) {
-        for (const systemID of collectVisibleSignatureSystemIDsForPair(pair, {
-          includeHiddenDestination: true,
-        })) {
-          signatureChangedSystemIDs.add(systemID);
-        }
-      }
-    }
-    return table;
+    return true;
   });
-  notifySignatureStateChanged([...signatureChangedSystemIDs]);
-  syncSceneEntities(scene, nowMs);
+  return result.success === true && result.data === true;
+}
+
+function createRandomPairForCycle(cycle, profile) {
+  const profileKey = String(profile && profile.profileKey || "").trim();
+  const occupiedSystemIDs =
+    cycle.occupiedSourceSystemIDsByProfileKey.get(profileKey) || new Set();
+  const createdAtMs = cycle.epochMs + cycle.generationOrdinal;
+  cycle.generationOrdinal += 1;
+  const result = mutateStateRows((transaction) =>
+    createRandomPairInRowTransaction(transaction, profile, createdAtMs, {
+      occupiedSystemIDs,
+      seed: `${profileKey}:${cycle.epochMs}:${cycle.generationOrdinal}`,
+    }));
+  const pair = result.success === true ? result.data : null;
+  if (pair) {
+    cycle.occupiedSourceSystemIDsByProfileKey.set(profileKey, occupiedSystemIDs);
+    cycle.randomCountsByProfileKey.set(
+      profileKey,
+      (cycle.randomCountsByProfileKey.get(profileKey) || 0) + 1,
+    );
+  }
+  return pair;
+}
+
+function elapsedSliceMs(startedAt) {
+  return Number(process.hrtime.bigint() - startedAt) / 1e6;
+}
+
+function runLifecycleMaintenanceSlice(options = {}) {
+  const startedAt = process.hrtime.bigint();
+  if (config.wormholesEnabled !== true) {
+    lifecycleMaintenanceCycle = null;
+    return { complete: true, enabled: false, processedItems: 0, elapsedMs: 0 };
+  }
+  if (options.resetCycle === true) {
+    lifecycleMaintenanceCycle = null;
+  }
+  if (!lifecycleMaintenanceCycle) {
+    lifecycleMaintenanceCycle = createLifecycleMaintenanceCycle(
+      options.nowMs === undefined ? Date.now() : options.nowMs,
+      options,
+    );
+  }
+  const cycle = lifecycleMaintenanceCycle;
+  const maxItems = Math.max(
+    1,
+    toInt(
+      options.maxItems,
+      config.wormholeMaintenanceMaxItemsPerSlice ||
+        WORMHOLE_MAINTENANCE_DEFAULT_MAX_ITEMS_PER_SLICE,
+    ),
+  );
+  const maxSliceMs = Math.max(
+    1,
+    toFiniteNumber(
+      options.maxSliceMs,
+      config.wormholeMaintenanceMaxSliceMs ||
+        WORMHOLE_MAINTENANCE_DEFAULT_MAX_SLICE_MS,
+    ),
+  );
+  const changedSystemIDs = new Set();
+  let processedItems = 0;
+
+  while (processedItems < maxItems && elapsedSliceMs(startedAt) < maxSliceMs) {
+    if (cycle.phase === "statics") {
+      if (cycle.staticCursor >= cycle.staticItems.length) {
+        cycle.phase = "pairs";
+        continue;
+      }
+      const item = cycle.staticItems[cycle.staticCursor];
+      cycle.staticCursor += 1;
+      processedItems += 1;
+      const pair = ensureStaticSlotWithRows(item.systemID, item.slot, cycle.epochMs);
+      if (pair) {
+        for (const systemID of collectVisibleSignatureSystemIDsForPair(pair)) {
+          changedSystemIDs.add(systemID);
+        }
+      }
+      continue;
+    }
+
+    if (cycle.phase === "pairs") {
+      if (cycle.pairCursor >= cycle.pairIDs.length) {
+        cycle.phase = "polarizations";
+        continue;
+      }
+      const pairID = toInt(cycle.pairIDs[cycle.pairCursor], 0);
+      cycle.pairCursor += 1;
+      processedItems += 1;
+      const before = getStateView().pairsByID[String(pairID)];
+      if (!before) {
+        continue;
+      }
+      if (getPairState(before) === "active") {
+        for (const systemID of maintainPairByID(pairID, cycle.epochMs)) {
+          changedSystemIDs.add(systemID);
+        }
+      }
+      const pair = getStateView().pairsByID[String(pairID)];
+      if (!pair) {
+        continue;
+      }
+      recordRandomPairForCycle(cycle, pair);
+      if (getPairState(pair) !== "active") {
+        const randomCooldownMs = Math.max(
+          0,
+          toInt(config.wormholeWanderingRespawnDelaySeconds, 60),
+        ) * 1000;
+        const keepForRandomCooldown =
+          String(pair.kind || "").toLowerCase() === "random" &&
+          toInt(pair.collapseAtMs, 0) > 0 &&
+          (toInt(pair.collapseAtMs, 0) + randomCooldownMs) > cycle.epochMs;
+        if (!keepForRandomCooldown) {
+          removeCollapsedPairByID(pairID);
+        }
+      }
+      continue;
+    }
+
+    if (cycle.phase === "polarizations") {
+      if (cycle.polarizationCursor >= cycle.polarizationCharacterIDs.length) {
+        cycle.phase = "profiles";
+        continue;
+      }
+      const characterID = toInt(
+        cycle.polarizationCharacterIDs[cycle.polarizationCursor],
+        0,
+      );
+      cycle.polarizationCursor += 1;
+      processedItems += 1;
+      if (characterID > 0) {
+        pruneCharacterPolarizationsByID(characterID, cycle.epochMs);
+      }
+      continue;
+    }
+
+    if (cycle.phase === "profiles") {
+      if (cycle.profilePending && cycle.profilePending.remaining > 0) {
+        processedItems += 1;
+        const pair = createRandomPairForCycle(cycle, cycle.profilePending.profile);
+        if (pair) {
+          cycle.profilePending.remaining -= 1;
+          for (const systemID of collectVisibleSignatureSystemIDsForPair(pair)) {
+            changedSystemIDs.add(systemID);
+          }
+        } else {
+          cycle.profilePending.remaining = 0;
+        }
+        continue;
+      }
+      cycle.profilePending = null;
+      if (cycle.profileCursor >= cycle.profiles.length) {
+        cycle.phase = "finish";
+        continue;
+      }
+      const profile = cycle.profiles[cycle.profileCursor];
+      cycle.profileCursor += 1;
+      const profileKey = String(profile && profile.profileKey || "").trim();
+      const desiredCount = resolveDesiredRandomProfileCount(profile);
+      const currentCount = cycle.randomCountsByProfileKey.get(profileKey) || 0;
+      const remaining = Math.max(0, desiredCount - currentCount);
+      if (remaining > 0) {
+        cycle.profilePending = { profile, remaining };
+      }
+      continue;
+    }
+
+    if (cycle.phase === "finish") {
+      if (toInt(getStateView().universeSeededAtMs, 0) <= 0) {
+        mutateStateRows((transaction) => {
+          transaction.setScalar("universeSeededAtMs", cycle.epochMs);
+          return null;
+        });
+      }
+      lifecycleMaintenanceCycle = null;
+      notifySignatureStateChanged([...changedSystemIDs]);
+      return {
+        complete: true,
+        enabled: true,
+        processedItems,
+        elapsedMs: elapsedSliceMs(startedAt),
+      };
+    }
+  }
+
+  notifySignatureStateChanged([...changedSystemIDs]);
+  return {
+    complete: false,
+    enabled: true,
+    phase: cycle.phase,
+    processedItems,
+    elapsedMs: elapsedSliceMs(startedAt),
+  };
+}
+
+function clearLifecycleSchedulerHandle() {
+  if (!lifecycleSchedulerHandle) {
+    return;
+  }
+  if (lifecycleSchedulerHandle.kind === "immediate") {
+    clearImmediate(lifecycleSchedulerHandle.handle);
+  } else {
+    clearTimeout(lifecycleSchedulerHandle.handle);
+  }
+  lifecycleSchedulerHandle = null;
+}
+
+function scheduleLifecycleSchedulerPump(delayMs = 0) {
+  if (!lifecycleSchedulerRunning || lifecycleSchedulerHandle) {
+    return;
+  }
+  const callback = () => {
+    lifecycleSchedulerHandle = null;
+    if (!lifecycleSchedulerRunning) {
+      return;
+    }
+    const result = runLifecycleMaintenanceSlice();
+    if (toFiniteNumber(result && result.elapsedMs, 0) >= 25) {
+      log.warn(
+        `[Wormholes] Lifecycle slice exceeded hard budget: ` +
+        `elapsedMs=${toFiniteNumber(result.elapsedMs, 0).toFixed(2)} ` +
+        `items=${toInt(result.processedItems, 0)} phase=${String(result.phase || "complete")}`,
+      );
+    }
+    const delay = result.complete === true
+      ? Math.max(
+          50,
+          toInt(
+            config.wormholeMaintenanceIntervalMs,
+            WORMHOLE_MAINTENANCE_DEFAULT_INTERVAL_MS,
+          ),
+        )
+      : 0;
+    scheduleLifecycleSchedulerPump(delay);
+  };
+  if (delayMs > 0) {
+    const handle = setTimeout(callback, delayMs);
+    if (handle && typeof handle.unref === "function") {
+      handle.unref();
+    }
+    lifecycleSchedulerHandle = { kind: "timeout", handle };
+  } else {
+    const handle = setImmediate(callback);
+    if (handle && typeof handle.unref === "function") {
+      handle.unref();
+    }
+    lifecycleSchedulerHandle = { kind: "immediate", handle };
+  }
+}
+
+function startLifecycleScheduler() {
+  if (lifecycleSchedulerRunning || config.wormholesEnabled !== true) {
+    return false;
+  }
+  lifecycleSchedulerRunning = true;
+  scheduleLifecycleSchedulerPump(0);
+  return true;
+}
+
+function stopLifecycleScheduler() {
+  lifecycleSchedulerRunning = false;
+  lifecycleMaintenanceCycle = null;
+  clearLifecycleSchedulerHandle();
+}
+
+function getLifecycleSchedulerStatus() {
+  prunePreparedJumpReservations(Date.now());
+  return {
+    running: lifecycleSchedulerRunning,
+    phase: lifecycleMaintenanceCycle ? lifecycleMaintenanceCycle.phase : "idle",
+    scheduled: Boolean(lifecycleSchedulerHandle),
+    reservedPairCount: preparedJumpReservationsByPairID.size,
+  };
 }
 
 function markWarpInitiated(endpointID, nowMs = Date.now()) {
   const numericEndpointID = toInt(endpointID, 0);
-  return mutateState((table) => {
-    const pair = getPairByEndpoint(table, numericEndpointID);
+  return mutateStateRows((transaction) => {
+    const pair = transaction.getPairByEndpoint(numericEndpointID);
     if (!pair || String(pair.state || "").toLowerCase() !== "active") {
-      return table;
+      return null;
     }
     advancePairState(pair, nowMs);
     const role = getPairRole(pair, numericEndpointID);
     if (role !== "source") {
-      return table;
+      transaction.setPair(pair);
+      return null;
     }
     if (String(pair.destination.visibilityState || "").toLowerCase() === "hidden") {
       setEndpointVisibilityState(pair.destination, "invisible");
     }
-    prunePolarizations(table, nowMs);
-    return table;
+    transaction.setPair(pair);
+    return null;
   });
 }
 
 function revealOppositeEndpoint(endpointID, nowMs = Date.now()) {
   const numericEndpointID = toInt(endpointID, 0);
   const changedSystemIDs = new Set();
-  const result = mutateState((table) => {
-    const pair = getPairByEndpoint(table, numericEndpointID);
+  const result = mutateStateRows((transaction) => {
+    const pair = transaction.getPairByEndpoint(numericEndpointID);
     if (!pair || String(pair.state || "").toLowerCase() !== "active") {
-      return table;
+      return null;
     }
     advancePairState(pair, nowMs);
     const role = getPairRole(pair, numericEndpointID);
     if (role !== "source") {
-      return table;
+      transaction.setPair(pair);
+      return null;
     }
     if (!isEndpointVisible(pair.destination)) {
       setEndpointVisibilityState(pair.destination, "visible");
       changedSystemIDs.add(toInt(pair.destination && pair.destination.systemID, 0));
     }
-    prunePolarizations(table, nowMs);
-    return table;
+    transaction.setPair(pair);
+    return null;
   });
   notifySignatureStateChanged([...changedSystemIDs]);
   return result;
@@ -2002,48 +2586,63 @@ function prepareJump(endpointID, characterID, shipMass, nowMs = Date.now()) {
   const numericShipMass = Math.max(0, toInt(shipMass, 0));
   let prepareJumpResult = null;
   const changedSystemIDs = new Set();
-  const result = mutateState((table) => {
-    prunePolarizations(table, nowMs);
-    const pair = getPairByEndpoint(table, numericEndpointID);
+  const result = mutateStateRows((transaction) => {
+    const pair = transaction.getPairByEndpoint(numericEndpointID);
     if (!pair) {
       prepareJumpResult = { success: false, errorMsg: "WORMHOLE_NOT_FOUND" };
-      return table;
+      return prepareJumpResult;
     }
     advancePairState(pair, nowMs);
     if (String(pair.state || "").toLowerCase() !== "active") {
       prepareJumpResult = { success: false, errorMsg: "WORMHOLE_COLLAPSED" };
-      return table;
+      transaction.setPair(pair);
+      return prepareJumpResult;
     }
     if (toInt(pair.expiresAtMs, 0) > 0 && toInt(pair.expiresAtMs, 0) <= nowMs) {
-      collapsePairInTable(table, pair, nowMs, "expired");
+      collapsePairInRowTransaction(transaction, pair, nowMs, "expired");
       prepareJumpResult = { success: false, errorMsg: "WORMHOLE_COLLAPSED" };
-      return table;
+      return prepareJumpResult;
     }
     const role = getPairRole(pair, numericEndpointID);
     const endpoint = getEndpoint(pair, role);
     const otherEndpoint = getEndpoint(pair, getOtherRole(role));
     if (!isEndpointVisible(endpoint)) {
       prepareJumpResult = { success: false, errorMsg: "WORMHOLE_NOT_DISCOVERED" };
-      return table;
+      transaction.setPair(pair);
+      return prepareJumpResult;
+    }
+    const characterPolarizations = transaction.getPolarizations(numericCharacterID);
+    for (const [polarizedEndpointID, record] of Object.entries(characterPolarizations)) {
+      if (toInt(record && record.endAtMs, 0) <= nowMs) {
+        delete characterPolarizations[polarizedEndpointID];
+      }
     }
     const existingPolarization =
-      table.polarizationByCharacter[String(numericCharacterID)] &&
-      table.polarizationByCharacter[String(numericCharacterID)][String(numericEndpointID)];
+      characterPolarizations[String(numericEndpointID)];
     if (existingPolarization && toInt(existingPolarization.endAtMs, 0) > nowMs) {
       prepareJumpResult = { success: false, errorMsg: "WORMHOLE_POLARIZED" };
-      return table;
+      transaction.setPair(pair);
+      transaction.setPolarizations(numericCharacterID, characterPolarizations);
+      return prepareJumpResult;
     }
-    if (exceedsShipMassLimit(pair, numericShipMass)) {
+    if (
+      pair.unrestrictedShipMass !== true &&
+      pair.maxJumpMass > 0 &&
+      numericShipMass > pair.maxJumpMass
+    ) {
       prepareJumpResult = { success: false, errorMsg: "SHIP_TOO_MASSIVE" };
-      return table;
+      transaction.setPair(pair);
+      transaction.setPolarizations(numericCharacterID, characterPolarizations);
+      return prepareJumpResult;
     }
     if (role === "source" && !isEndpointVisible(otherEndpoint)) {
       setEndpointVisibilityState(otherEndpoint, "visible");
       changedSystemIDs.add(toInt(otherEndpoint && otherEndpoint.systemID, 0));
     }
-    const projectedRemainingMassAfterJump = hasUnlimitedMass(pair)
-      ? projectRemainingMass(pair, nowMs)
-      : Math.max(0, projectRemainingMass(pair, nowMs) - numericShipMass);
+    const currentRemainingMass = projectRemainingMass(pair, nowMs);
+    const projectedRemainingMassAfterJump = pair.unlimitedMass === true
+      ? currentRemainingMass
+      : Math.max(0, currentRemainingMass - numericShipMass);
     prepareJumpResult = {
       success: true,
       data: {
@@ -2055,13 +2654,15 @@ function prepareJump(endpointID, characterID, shipMass, nowMs = Date.now()) {
         destinationEndpointID: toInt(otherEndpoint.endpointID, 0),
         projectedRemainingMassAfterJump,
         willCollapseAfterJump:
-          (!hasUnlimitedMass(pair) &&
-            projectRemainingMass(pair, nowMs) > 0 &&
+          (pair.unlimitedMass !== true &&
+            currentRemainingMass > 0 &&
             projectedRemainingMassAfterJump <= 0) ||
           (pair.expiresAtMs > 0 && pair.expiresAtMs <= nowMs),
       },
     };
-    return table;
+    transaction.setPair(pair);
+    transaction.setPolarizations(numericCharacterID, characterPolarizations);
+    return prepareJumpResult;
   });
   notifySignatureStateChanged([...changedSystemIDs]);
   return result.success === true && prepareJumpResult
@@ -2074,32 +2675,54 @@ function commitJump(endpointID, characterID, shipMass, nowMs = Date.now()) {
   const numericCharacterID = toInt(characterID, 0);
   const numericShipMass = Math.max(0, toInt(shipMass, 0));
   const changedSystemIDs = new Set();
-  const result = mutateState((table) => {
-    prunePolarizations(table, nowMs);
-    const pair = getPairByEndpoint(table, numericEndpointID);
+  const result = mutateStateRows((transaction) => {
+    const pair = transaction.getPairByEndpoint(numericEndpointID);
     if (!pair || String(pair.state || "").toLowerCase() !== "active") {
-      return table;
+      return null;
     }
     const beforeSourceVisible = isEndpointVisible(pair.source);
     const beforeDestinationVisible = isEndpointVisible(pair.destination);
     advancePairState(pair, nowMs);
-    applyJumpMassConsumption(pair, numericShipMass, nowMs);
-    if (!table.polarizationByCharacter[String(numericCharacterID)]) {
-      table.polarizationByCharacter[String(numericCharacterID)] = {};
+    if (pair.unlimitedMass !== true) {
+      pair.remainingMass = Math.max(0, toInt(pair.remainingMass, 0) - numericShipMass);
+      pair.lastMassStateAtMs = Math.max(0, toInt(nowMs, pair.lastMassStateAtMs));
+      pair.massRegenRemainder = Math.max(0, toFiniteNumber(pair.massRegenRemainder, 0));
     }
-    table.polarizationByCharacter[String(numericCharacterID)][String(numericEndpointID)] = {
+    const characterPolarizations = transaction.getPolarizations(numericCharacterID);
+    for (const [polarizedEndpointID, record] of Object.entries(characterPolarizations)) {
+      if (toInt(record && record.endAtMs, 0) <= nowMs) {
+        delete characterPolarizations[polarizedEndpointID];
+      }
+    }
+    // Polarization applies to the hole, not to the mouth you happened to use.
+    // Recording it only against the end jumped from left the pilot standing at
+    // the other end un-polarized, so the immediate jump back -- the one thing
+    // polarization exists to prevent -- was allowed.
+    const polarizationRecord = {
       endAtMs: nowMs + POLARIZATION_DURATION_SECONDS * 1000,
       durationSeconds: POLARIZATION_DURATION_SECONDS,
     };
+    for (const polarizedEndpointID of [
+      numericEndpointID,
+      toInt(pair.source && pair.source.endpointID, 0),
+      toInt(pair.destination && pair.destination.endpointID, 0),
+    ]) {
+      if (polarizedEndpointID > 0) {
+        characterPolarizations[String(polarizedEndpointID)] = { ...polarizationRecord };
+      }
+    }
+    transaction.setPolarizations(numericCharacterID, characterPolarizations);
     if (
-      (!hasUnlimitedMass(pair) && toInt(pair.remainingMass, 0) <= 0) ||
+      (pair.unlimitedMass !== true && toInt(pair.remainingMass, 0) <= 0) ||
       (toInt(pair.expiresAtMs, 0) > 0 && toInt(pair.expiresAtMs, 0) <= nowMs)
     ) {
-      collapsePairInTable(
-        table,
+      collapsePairInRowTransaction(
+        transaction,
         pair,
         nowMs,
-        !hasUnlimitedMass(pair) && toInt(pair.remainingMass, 0) <= 0 ? "mass" : "expired",
+        pair.unlimitedMass !== true && toInt(pair.remainingMass, 0) <= 0
+          ? "mass"
+          : "expired",
       );
       for (const systemID of collectVisibleSignatureSystemIDsForPair(pair, {
         includeHiddenDestination: beforeDestinationVisible,
@@ -2107,7 +2730,8 @@ function commitJump(endpointID, characterID, shipMass, nowMs = Date.now()) {
         changedSystemIDs.add(systemID);
       }
     }
-    return table;
+    transaction.setPair(pair);
+    return null;
   });
   notifySignatureStateChanged([...changedSystemIDs]);
   return result;
@@ -2214,7 +2838,7 @@ function listPairViewsFromTable(table, options = {}) {
         otherSolarSystemClass: toInt(pair.destination && pair.destination.wormholeClassID, 0),
         wormholeAge: ageState,
         wormholeSize: sizeRatio,
-        maxShipJumpMass: hasUnrestrictedShipMass(pair)
+        maxShipJumpMass: pair.unrestrictedShipMass === true
           ? WORMHOLE_MAX_SHIP_MASS_VERY_LARGE
           : resolveMaxShipMassCategory(pair.maxJumpMass),
       });
@@ -2222,28 +2846,21 @@ function listPairViewsFromTable(table, options = {}) {
         presentation,
         pairID: pair.pairID,
         kind: pair.kind,
-        managedSlotKey: pair.managedSlotKey || null,
-        estateConnectionRole: pair.estateConnectionRole || null,
-        persistent: isPersistentPair(pair),
-        unlimitedMass: hasUnlimitedMass(pair),
-        unrestrictedShipMass: hasUnrestrictedShipMass(pair),
         state: pair.state,
         sourceSystemID: toInt(pair.source && pair.source.systemID, 0),
         sourceSystemName: getSystemName(pair.source && pair.source.systemID),
         sourceEndpointID: toInt(pair.source && pair.source.endpointID, 0),
-        sourcePosition: cloneVector(pair.source && pair.source.position),
-        sourceRadius: Math.max(1, toFiniteNumber(pair.source && pair.source.radius, 3000)),
         sourceCode: pair.source && pair.source.code,
         sourceDiscovered: isEndpointVisible(pair.source),
         randomProfileKey: pair.randomProfileKey || null,
+        managedSlotKey: pair.managedSlotKey || null,
+        estateConnectionRole: pair.estateConnectionRole || null,
+        persistent: pair.persistent === true,
+        unlimitedMass: pair.unlimitedMass === true,
+        unrestrictedShipMass: pair.unrestrictedShipMass === true,
         destinationSystemID: toInt(pair.destination && pair.destination.systemID, 0),
         destinationSystemName: getSystemName(pair.destination && pair.destination.systemID),
         destinationEndpointID: toInt(pair.destination && pair.destination.endpointID, 0),
-        destinationPosition: cloneVector(pair.destination && pair.destination.position),
-        destinationRadius: Math.max(
-          1,
-          toFiniteNumber(pair.destination && pair.destination.radius, 3000),
-        ),
         destinationCode: pair.destination && pair.destination.code,
         destinationDiscovered: isEndpointVisible(pair.destination),
         destinationVisibilityState: String(pair.destination && pair.destination.visibilityState || "hidden"),
@@ -2316,7 +2933,6 @@ function buildSystemSummaryViewsFromTable(table, options = {}) {
         activePairCount: 0,
         staticPairCount: 0,
         randomPairCount: 0,
-        estatePairCount: 0,
         discoveredEndpointCount: 0,
         hiddenEndpointCount: 0,
         environmentFamily: String((getSystemAuthority(systemID) || {}).environmentFamily || "").trim() || null,
@@ -2333,8 +2949,6 @@ function buildSystemSummaryViewsFromTable(table, options = {}) {
           existing.staticPairCount += 1;
         } else if (entry.kind === "random") {
           existing.randomPairCount += 1;
-        } else if (entry.kind === "estate") {
-          existing.estatePairCount += 1;
         }
       }
       if (touchpoint.code) {
@@ -2373,7 +2987,6 @@ function buildUniverseSummary(options = {}) {
   });
   let staticPairCount = 0;
   let randomPairCount = 0;
-  let estatePairCount = 0;
   let revealedExitCount = 0;
   let hiddenExitCount = 0;
   let environmentSystemCount = 0;
@@ -2382,8 +2995,6 @@ function buildUniverseSummary(options = {}) {
       staticPairCount += 1;
     } else if (entry.kind === "random") {
       randomPairCount += 1;
-    } else if (entry.kind === "estate") {
-      estatePairCount += 1;
     }
     if (entry.destinationDiscovered === true) {
       revealedExitCount += 1;
@@ -2400,7 +3011,6 @@ function buildUniverseSummary(options = {}) {
     activePairCount: entries.length,
     staticPairCount,
     randomPairCount,
-    estatePairCount,
     revealedExitCount,
     hiddenExitCount,
     systemCount: systemSummaries.length,
@@ -2423,7 +3033,7 @@ function logSceneSummary(scene, nowMs = Date.now()) {
     return;
   }
   log.info(
-    `[Wormholes] ${summary.systemName} (${summary.systemID}) loaded: ${summary.activePairCount} pair(s) | static ${summary.staticPairCount} | random ${summary.randomPairCount} | estate ${summary.estatePairCount} | discovered ${summary.discoveredEndpointCount} | hidden ${summary.hiddenEndpointCount} | env ${summary.environmentFamily || "-"} | codes ${summary.codes.join(",") || "-"}`,
+    `[Wormholes] ${summary.systemName} (${summary.systemID}) loaded: ${summary.activePairCount} pair(s) | static ${summary.staticPairCount} | random ${summary.randomPairCount} | discovered ${summary.discoveredEndpointCount} | hidden ${summary.hiddenEndpointCount} | env ${summary.environmentFamily || "-"} | codes ${summary.codes.join(",") || "-"}`,
   );
 }
 
@@ -2485,69 +3095,6 @@ function spawnRandomPairs(systemID, count = 1, nowMs = Date.now()) {
   return createdPairs;
 }
 
-function ensureFamilyEstateConnections(nowMs = Date.now()) {
-  const profile = getFamilyEstateProfile();
-  const validation = validateFamilyEstateProfile(profile);
-  if (!validation.success || validation.enabled === false) {
-    return validation;
-  }
-  const changedSystemIDs = new Set();
-  let estateResult = null;
-  const result = mutateState((table) => {
-    prunePolarizations(table, nowMs);
-    estateResult = ensureFamilyEstateConnectionsInTable(table, nowMs, {
-      profile,
-      validate: false,
-    });
-    for (const pair of [
-      ...(estateResult.createdPairs || []),
-      ...(estateResult.changedPairs || []),
-    ]) {
-      for (const systemID of collectVisibleSignatureSystemIDsForPair(pair, {
-        includeHiddenDestination: true,
-      })) {
-        changedSystemIDs.add(systemID);
-      }
-    }
-    return table;
-  });
-  if (!result.success || !estateResult || estateResult.success !== true) {
-    return {
-      success: false,
-      errorMsg: estateResult && estateResult.errorMsg || "FAMILY_ESTATE_WORMHOLE_WRITE_FAILED",
-    };
-  }
-  notifySignatureStateChanged([...changedSystemIDs]);
-  return {
-    success: true,
-    enabled: true,
-    data: {
-      profile,
-      createdPairs: estateResult.createdPairs.map(cloneValue),
-      changedPairs: estateResult.changedPairs.map(cloneValue),
-      connections: listPairViews({
-        systemID: profile.homeSystemID,
-        includeCollapsed: false,
-        includeUndiscovered: true,
-        nowMs,
-      }).filter((entry) => String(entry.managedSlotKey || "").startsWith("family-estate:")),
-    },
-  };
-}
-
-function listFamilyEstateConnectionViews(options = {}) {
-  const profile = getFamilyEstateProfile();
-  if (profile.enabled !== true) {
-    return [];
-  }
-  return listPairViews({
-    systemID: profile.homeSystemID,
-    includeCollapsed: options.includeCollapsed === true,
-    includeUndiscovered: options.includeUndiscovered !== false,
-    nowMs: options.nowMs,
-  }).filter((entry) => String(entry.managedSlotKey || "").startsWith("family-estate:"));
-}
-
 function clearPairs(systemID = 0, nowMs = Date.now()) {
   const targetSystemID = toInt(systemID, 0);
   const changedSystemIDs = new Set();
@@ -2582,40 +3129,42 @@ module.exports = {
   clearPairs,
   commitJump,
   ensureFamilyEstateConnections,
+  listFamilyEstateConnectionViews,
   ensureSystemStatics,
   ensureUniverseStatics,
-  getEndpointEntityByID,
+  getLifecycleSchedulerStatus,
   getPolarization,
   handleSceneCreated,
-  listFamilyEstateConnectionViews,
   listPairViews,
   logSceneSummary,
   markWarpInitiated,
   prepareJump,
   registerSignatureStateChangeListener,
+  releasePreparedJump,
+  reservePreparedJump,
   revealOppositeEndpoint,
+  runLifecycleMaintenanceSlice,
   spawnRandomPairs,
+  startLifecycleScheduler,
+  stopLifecycleScheduler,
   syncSceneEntities,
   tickScene,
   unregisterSignatureStateChangeListener,
   warmRuntimeCache,
   _testing: {
-    applyJumpMassConsumption,
     applyMassRegeneration,
     buildEndpointPose,
     collapsePairInTable,
     createFamilyEstatePermanentPair,
     createFamilyEstateRandomPair,
     createRandomPair,
+    createRandomPairInRowTransaction,
     createStaticPair,
+    createStaticPairInRowTransaction,
     ensureFamilyEstateConnectionsInTable,
     familyEstateConnectionsNeedEnsure,
     getPairByEndpoint,
     getPairRole,
-    hasUnlimitedMass,
-    hasUnrestrictedShipMass,
-    exceedsShipMassLimit,
-    isPersistentPair,
     maybePassivelyRevealDestination,
     projectRemainingMass,
     resolveDestinationSystemID,
@@ -2625,3 +3174,4 @@ module.exports = {
     setEndpointVisibilityState,
   },
 };
+

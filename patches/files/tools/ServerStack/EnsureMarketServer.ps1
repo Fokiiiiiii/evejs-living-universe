@@ -14,8 +14,8 @@ $script:MarketExe = Join-Path $script:MarketRoot "target\release\market-server.e
 $script:MarketBuildStamp = Join-Path $script:MarketRoot "target\release\market-server.sources.sha256"
 $script:MarketConfig = Join-Path $script:MarketRoot "config\market-server.local.toml"
 $script:MarketDatabase = Join-Path $script:MarketRoot "data\generated\market.sqlite"
-$script:MarketBuildLauncher = Join-Path $script:RepoRoot "StartMarketServer.bat"
-$script:MarketSeedLauncher = Join-Path $script:RepoRoot "tools\market-seed\BuildMarketSeed.bat"
+$script:MarketBuildLauncher = Join-Path $script:MarketRoot "StartMarketServer.ps1"
+$script:MarketSeedRoot = Join-Path $script:RepoRoot "tools\market-seed"
 $script:MarketTopologySync = Join-Path $script:RepoRoot "server\scripts\syncLivingEconomyMarketTopology.js"
 
 function Test-TcpPort {
@@ -84,6 +84,20 @@ function Invoke-BatchFile {
     if ($exitCode -ne 0) {
         throw "$([System.IO.Path]::GetFileName($Path)) exited with code $exitCode."
     }
+}
+
+function Resolve-CargoPath {
+    $preferred = Join-Path $env:USERPROFILE ".cargo\bin\cargo.exe"
+    if (Test-Path -LiteralPath $preferred -PathType Leaf) {
+        return $preferred
+    }
+
+    $resolved = Get-Command cargo.exe -ErrorAction SilentlyContinue
+    if ($resolved -and $resolved.Source) {
+        return $resolved.Source
+    }
+
+    throw "Rust cargo.exe was not found. Install Rust with: winget install -e --id Rustlang.Rustup"
 }
 
 function Get-MarketSourceDigest {
@@ -185,7 +199,17 @@ if (-not (Test-Path -LiteralPath $script:MarketDatabase -PathType Leaf)) {
     Write-Host "  First Living Universe launch: building the Jita + New Caldari market seed."
     Write-Host "  This one-time setup can take several minutes."
     Write-Host ""
-    Invoke-BatchFile -Path $script:MarketSeedLauncher -Arguments @("jita")
+    $cargoPath = Resolve-CargoPath
+    Push-Location -LiteralPath $script:MarketSeedRoot
+    try {
+        & $cargoPath run --locked --release -- --config config/market-seed.local.toml build --preset jita_new_caldari --force
+        $seedExitCode = $LASTEXITCODE
+    } finally {
+        Pop-Location
+    }
+    if ($seedExitCode -ne 0) {
+        throw "Market seed build exited with code $seedExitCode."
+    }
 }
 
 if (-not (Test-Path -LiteralPath $script:MarketTopologySync -PathType Leaf)) {
@@ -204,7 +228,15 @@ if ($marketBuildRequired) {
     Write-Host "  Compiling the Living Universe market service."
     Write-Host "  Later launches reuse this build until its sources change."
     Write-Host ""
-    Invoke-BatchFile -Path $script:MarketBuildLauncher -Arguments @("build-release")
+    $powerShell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+    if (-not (Test-Path -LiteralPath $powerShell -PathType Leaf)) {
+        throw "Windows PowerShell was not found at $powerShell"
+    }
+    & $powerShell -NoLogo -NoProfile -ExecutionPolicy Bypass -File $script:MarketBuildLauncher -Mode build-release
+    $buildExitCode = $LASTEXITCODE
+    if ($buildExitCode -ne 0) {
+        throw "Market build launcher exited with code $buildExitCode."
+    }
     if (-not (Test-Path -LiteralPath $script:MarketExe -PathType Leaf)) {
         throw "The market build completed without creating $script:MarketExe"
     }

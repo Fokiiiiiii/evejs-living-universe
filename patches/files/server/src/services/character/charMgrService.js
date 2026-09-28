@@ -1,3 +1,5 @@
+"use strict";
+
 /**
  * Character Manager Service (charMgr)
  *
@@ -6,6 +8,10 @@
  */
 
 const path = require("path");
+
+const {
+  toPublicSolarSystemID,
+} = require("../../abyssal").engineSupport.hostLocation;
 const BaseService = require(path.join(__dirname, "../baseService"));
 const log = require(path.join(__dirname, "../../utils/logger"));
 const {
@@ -13,10 +19,6 @@ const {
   resolveHomeStationInfo,
   updateCharacterRecord,
 } = require(path.join(__dirname, "./characterState"));
-const livingUniversePilotDirectory = require(path.join(
-  __dirname,
-  "../../space/npc/ambientTraffic/livingUniversePilotDirectory",
-));
 const {
   resolvePaperDollState,
 } = require(path.join(__dirname, "./paperDollPayloads"));
@@ -40,6 +42,10 @@ const {
   extractDictEntries,
   unwrapMarshalValue,
 } = require(path.join(__dirname, "../_shared/serviceHelpers"));
+const { strVal } = require(path.join(
+  __dirname,
+  "../../network/tcp/utils/marshal",
+));
 const {
   CharMgrGlobalAssets,
 } = require(path.join(__dirname, "./charMgrGlobalAssets"));
@@ -73,25 +79,13 @@ const {
   setEntityNote,
 } = require(path.join(__dirname, "./characterNoteState"));
 
-function resolvePublicCharacterRecord(characterID) {
-  return (
-    getCharacterRecord(characterID) ||
-    (
-      typeof livingUniversePilotDirectory.getPilotRecord === "function"
-        ? livingUniversePilotDirectory.getPilotRecord(characterID)
-        : null
-    ) ||
-    {}
-  );
-}
-
 function resolveCharacterInfo(args, session) {
   const charId =
     args && args.length > 0 ? args[0] : session ? session.characterID : 0;
 
   return {
     charId,
-    charData: resolvePublicCharacterRecord(charId),
+    charData: getCharacterRecord(charId) || {},
   };
 }
 
@@ -132,7 +126,12 @@ function normalizeBoolean(value, fallback = false) {
 }
 
 function extractKwarg(kwargs, key) {
-  return extractDictEntries(kwargs).find(([entryKey]) => entryKey === key)?.[1];
+  // A decoded dict key keeps the form the wire used, and `extraInfo` and `status` sit outside
+  // the marshal string table, so they arrive as raw Buffers and a raw comparison
+  // drops them. See the note on accountService.extractKwarg.
+  return extractDictEntries(kwargs).find(
+    ([entryKey]) => strVal(entryKey) === key,
+  )?.[1];
 }
 
 function normalizePersonalContacts(record = {}) {
@@ -161,92 +160,6 @@ function normalizePersonalContacts(record = {}) {
   }
 
   return contacts;
-}
-
-const INDUSTRIAL_CREW_RELATIONSHIP_ID = 10;
-const INDUSTRIAL_CREW_PILOT_SOURCE_ID = "industrial_hirelings";
-const ACTIVE_INDUSTRIAL_CREW_CONTRACT_STATES = new Set([
-  "active",
-  "paused",
-]);
-
-function listOwnedIndustrialCrewContracts(characterID) {
-  const normalizedCharacterID = normalizeInteger(characterID, 0);
-  if (!(normalizedCharacterID > 0)) {
-    return [];
-  }
-  try {
-    const contractService = require(path.join(
-      __dirname,
-      "../industrialHirelings/industrialHirelingContracts",
-    )).getDefaultContractService();
-    const result = contractService.listForCharacter(normalizedCharacterID);
-    return result &&
-      result.success === true &&
-      result.data &&
-      Array.isArray(result.data.contracts)
-      ? result.data.contracts
-      : [];
-  } catch (_error) {
-    return [];
-  }
-}
-
-function listIndustrialCrewPilotIDs(contract) {
-  const memberPilotIDs = Array.isArray(contract && contract.members)
-    ? contract.members.map((member) =>
-        normalizeInteger(member && member.pilotIdentityID, 0),
-      )
-    : [];
-  const legacyPilotID = normalizeInteger(
-    contract && contract.pilotIdentityID,
-    0,
-  );
-  return [...new Set([
-    ...memberPilotIDs,
-    legacyPilotID,
-  ].filter((characterID) => characterID > 0))];
-}
-
-function mergeOwnedIndustrialCrewContacts(
-  contacts,
-  contracts,
-  ownerCharacterID,
-) {
-  const normalizedOwnerCharacterID = normalizeInteger(ownerCharacterID, 0);
-  const merged = {
-    ...(contacts && typeof contacts === "object" ? contacts : {}),
-  };
-  for (const contract of Array.isArray(contracts) ? contracts : []) {
-    if (
-      normalizeInteger(contract && contract.ownerCharacterID, 0) !==
-        normalizedOwnerCharacterID ||
-      !ACTIVE_INDUSTRIAL_CREW_CONTRACT_STATES.has(
-        String(contract && contract.state || ""),
-      )
-    ) {
-      continue;
-    }
-    for (const contactID of listIndustrialCrewPilotIDs(contract)) {
-      const pilot = livingUniversePilotDirectory.getPilotRecord(contactID);
-      if (
-        !pilot ||
-        String(pilot.pilotSourceID || "") !==
-          INDUSTRIAL_CREW_PILOT_SOURCE_ID
-      ) {
-        continue;
-      }
-      const existing = merged[String(contactID)] || {};
-      merged[String(contactID)] = {
-        ...existing,
-        contactID,
-        inWatchlist: normalizeBoolean(existing.inWatchlist, false),
-        relationshipID: INDUSTRIAL_CREW_RELATIONSHIP_ID,
-        labelMask: toStoredMaskValue(existing.labelMask),
-      };
-    }
-  }
-  return merged;
 }
 
 function normalizePersonalContactLabels(record = {}) {
@@ -460,18 +373,14 @@ function buildPublicInfoEntries(charId, charData, session) {
   const factionID = charData.factionID ?? null;
   const empireID = charData.empireID ?? factionID;
   const corporationID =
-    Number(charData.corporationID) ||
-    Number(session && (session.corporationID || session.corpid)) ||
-    1000009;
-  const allianceID =
-    Number(charData.allianceID) ||
-    Number(session && (session.allianceID || session.allianceid)) ||
-    null;
+    charData.corporationID || (session ? session.corporationID : 1000009);
+  const allianceID = charData.allianceID || (session ? session.allianceID : null);
   const stationID =
     charData.stationID ??
     (session ? (session.stationID ?? session.stationid ?? null) : null);
   const solarSystemID =
     charData.solarSystemID || (session ? session.solarsystemid2 : 30000142);
+  const publicSolarSystemID = toPublicSolarSystemID(solarSystemID, null);
   const createDateTime = buildFiletimeLong(charData.createDateTime);
   const startDateTime = buildFiletimeLong(
     charData.startDateTime || charData.createDateTime,
@@ -505,11 +414,8 @@ function buildPublicInfoEntries(charId, charData, session) {
     ["title", charData.title || ""],
     ["shortName", charData.shortName || "none"],
     ["stationID", stationID],
-    ["solarSystemID", solarSystemID],
-    [
-      "militiaFactionID",
-      charData.militiaFactionID ?? charData.warFactionID ?? null,
-    ],
+    ["solarSystemID", publicSolarSystemID],
+    ["militiaFactionID", charData.militiaFactionID ?? null],
     ["medal1GraphicID", charData.medal1GraphicID ?? null],
   ];
 }
@@ -639,7 +545,7 @@ class CharMgrService extends BaseService {
     log.debug(`[CharMgr] GetOrganizationInfoForCharacters(${characterIDs.length})`);
     return buildDict(
       characterIDs.map((characterID) => {
-        const character = resolvePublicCharacterRecord(characterID);
+        const character = getCharacterRecord(characterID) || {};
         return [
           characterID,
           buildKeyVal([
@@ -841,11 +747,7 @@ class CharMgrService extends BaseService {
     log.debug("[CharMgr] GetContactList called");
     const characterID = sessionCharacterID(session);
     const character = getCharacterRecord(characterID) || {};
-    const contacts = Object.values(mergeOwnedIndustrialCrewContacts(
-      normalizePersonalContacts(character),
-      listOwnedIndustrialCrewContracts(characterID),
-      characterID,
-    )).sort(
+    const contacts = Object.values(normalizePersonalContacts(character)).sort(
       (left, right) => Number(left.contactID) - Number(right.contactID),
     );
     const blockedOwners = Object.values(normalizeBlockedOwners(character)).sort(
@@ -1181,9 +1083,8 @@ class CharMgrService extends BaseService {
   }
 }
 
-module.exports = CharMgrService;
-module.exports._testing = {
-  INDUSTRIAL_CREW_RELATIONSHIP_ID,
-  listIndustrialCrewPilotIDs,
-  mergeOwnedIndustrialCrewContacts,
+CharMgrService._testing = {
+  buildPublicInfoEntries,
 };
+
+module.exports = CharMgrService;

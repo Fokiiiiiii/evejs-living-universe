@@ -1,4 +1,11 @@
+"use strict";
+
+const {
+  toFiniteNumber,
+} = require("../../common/numbers");
+
 const path = require("path");
+const { resolveDataRootPath } = require(path.join(__dirname, "../../config/dataRoot"));
 
 // Phase 0 / 0.C: characterState owns the `characters` table; access flows
 // through a strict ownership-scoped repository.
@@ -8,7 +15,11 @@ const {
 const repo = createTableRepository("service:character", { strict: true });
 const log = require(path.join(__dirname, "../../utils/logger"));
 const rotatingLog = require(path.join(__dirname, "../../utils/rotatingLog"));
+const config = require(path.join(__dirname, "../../config"));
 const worldData = require(path.join(__dirname, "../../space/worldData"));
+const {
+  isAbyssalHostLocationID,
+} = require("../../abyssal").engineSupport.hostLocation;
 const { resolveShipByTypeID } = require(path.join(
   __dirname,
   "../chat/shipTypeRegistry",
@@ -26,6 +37,7 @@ const {
   getItemMutationVersion,
   ITEM_FLAGS,
   isCapsuleTypeID,
+  dockShipToLocation,
   grantItemToCharacterStationHangar,
   removeInventoryItem,
   setActiveShipForCharacter,
@@ -85,6 +97,7 @@ const {
   getFactionIDForCorporation,
 } = require(path.join(__dirname, "../faction/factionState"));
 const {
+  getDockedLocationID,
   getDockedLocationKind,
   isDockedSession,
 } = require(path.join(__dirname, "../structure/structureLocation"));
@@ -99,10 +112,6 @@ const {
   resolveCharacterCreationSchoolIDForRace,
   resolveCharacterCreationSchoolProfile,
 } = require(path.join(__dirname, "./characterCreationData"));
-const livingPilotDirectory = require(path.join(
-  __dirname,
-  "../../space/npc/ambientTraffic/livingUniversePilotDirectory",
-));
 
 function getStructureState() {
   return require(path.join(__dirname, "../structure/structureState"));
@@ -118,8 +127,14 @@ const INV_UPDATE_SINGLETON = 10;
 const ATTRIBUTE_QUANTITY = getAttributeIDByNames("quantity") || 805;
 const ATTRIBUTE_DAMAGE = getAttributeIDByNames("damage") || 3;
 const ATTRIBUTE_SHIELD_CHARGE = getAttributeIDByNames("shieldCharge") || 264;
+const livingPilotDirectory = require(path.join(__dirname, "../../space/npc/ambientTraffic/livingUniversePilotDirectory"));
+
 const ATTRIBUTE_ARMOR_DAMAGE = getAttributeIDByNames("armorDamage") || 266;
 const ATTRIBUTE_RELOAD_TIME = getAttributeIDByNames("reloadTime") || 1795;
+const ATTRIBUTE_MASS = getAttributeIDByNames("mass") || 4;
+const ATTRIBUTE_CAPACITY = getAttributeIDByNames("capacity") || 38;
+const ATTRIBUTE_VOLUME = getAttributeIDByNames("volume") || 161;
+const ATTRIBUTE_RADIUS = getAttributeIDByNames("radius") || 162;
 const EFFECT_ONLINE = getEffectIDByNames("online") || 16;
 const EFFECT_STRIP_CLOAKING_PASSIVE = 854;
 const ATTRIBUTE_IS_ONLINE = getAttributeIDByNames("isOnline") || 2;
@@ -180,13 +195,20 @@ const DEFAULT_RESPEC_INFO = Object.freeze({
 const DEFAULT_MCT_EXPIRY_FILETIME = "157469184000000000";
 const CHARGE_BOOTSTRAP_REPAIR_DELAY_MS = 100;
 const CHARGE_TRANSITION_FINALIZE_DELAY_MS = 125;
-const MISSILE_DEBUG_PATH = path.join(__dirname, "../../logs/space-missile-debug.log");
+const MISSILE_DEBUG_PATH = resolveDataRootPath("logs", "space-missile-debug.log");
 const ATTRIBUTE_MAX_VELOCITY = getAttributeIDByNames("maxVelocity") || 37;
 const ATTRIBUTE_EXPLOSION_DELAY = getAttributeIDByNames("explosionDelay") || 281;
 const ATTRIBUTE_DETONATION_RANGE = getAttributeIDByNames("detonationRange") || 108;
 
+function isMissileDebugEnabled() {
+  return (
+    config.spaceMissileDebugEnabled === true &&
+    log.isVerboseDebugEnabled()
+  );
+}
+
 function appendMissileDebug(entry) {
-  if (!log.isVerboseDebugEnabled()) {
+  if (!isMissileDebugEnabled()) {
     return;
   }
   try {
@@ -199,11 +221,6 @@ function appendMissileDebug(entry) {
 function roundMissileTraceNumber(value, digits = 6) {
   const numeric = Number(value);
   return Number.isFinite(numeric) ? Number(numeric.toFixed(digits)) : 0;
-}
-
-function toFiniteNumber(value, fallback = 0) {
-  const numeric = Number(value);
-  return Number.isFinite(numeric) ? numeric : fallback;
 }
 
 function clamp01(value, fallback = 0) {
@@ -301,6 +318,9 @@ function summarizeMissileDogmaSnapshot(snapshot) {
 }
 
 function logMissileChargeDebug(event, details = {}) {
+  if (!isMissileDebugEnabled()) {
+    return;
+  }
   appendMissileDebug(JSON.stringify({
     event,
     atMs: Date.now(),
@@ -310,6 +330,27 @@ function logMissileChargeDebug(event, details = {}) {
 const characterRecordCache = new Map();
 const invalidCharacterRowWarnings = new Set();
 const characterLocationReconcileWarnings = new Set();
+const MAX_CHARACTER_LOCATION_RECONCILE_WARNINGS = 512;
+
+function rememberCharacterLocationWarning(key) {
+  const normalizedKey = String(key || "");
+  if (characterLocationReconcileWarnings.has(normalizedKey)) return false;
+  characterLocationReconcileWarnings.add(normalizedKey);
+  while (
+    characterLocationReconcileWarnings.size >
+    MAX_CHARACTER_LOCATION_RECONCILE_WARNINGS
+  ) {
+    const oldestKey = characterLocationReconcileWarnings.values().next().value;
+    characterLocationReconcileWarnings.delete(oldestKey);
+  }
+  return true;
+}
+
+function warnCharacterLocationOnce(key, message) {
+  if (!rememberCharacterLocationWarning(key)) return false;
+  log.warn(message);
+  return true;
+}
 
 function cloneValue(value) {
   return JSON.parse(JSON.stringify(value));
@@ -477,6 +518,11 @@ const INITIAL_SPACE_CHARACTER_SESSION_CHANGE_KEYS = [
   "raceID",
   "corprole",
   "corpid",
+  // The corporation window gates all alliance panels on session.allianceid
+  // (tools/ClientCodeGrabber/Latest/eve/client/script/ui/shared/neocom/
+  // corporation/corporationWindow.py:383-403). Preserve a positive persisted
+  // affiliation when the character's first session change is sent in space.
+  "allianceid",
   "regionid",
   "rolesAtAll",
   "rolesAtBase",
@@ -826,7 +872,12 @@ function resolveHomeStationInfo(charData = {}, session = null) {
   };
 }
 
-function reconcileCharacterLocationFromActiveShip(charId, record = {}, activeShip = null) {
+function reconcileCharacterLocationFromActiveShip(
+  charId,
+  record = {},
+  activeShip = null,
+  options = {},
+) {
   if (!record || typeof record !== "object" || !activeShip) {
     return record;
   }
@@ -845,25 +896,89 @@ function reconcileCharacterLocationFromActiveShip(charId, record = {}, activeShi
   const shipSpaceSystemID = hasLocationID(activeShip.spaceState && activeShip.spaceState.systemID)
     ? Number(activeShip.spaceState.systemID)
     : null;
+  const expectedTransitionReason = String(
+    options.expectedLocationTransitionReason || "",
+  ).trim();
+
+  function warnAuthorityIssue(reason, details) {
+    const warningKey = [
+      "authority",
+      reason,
+      charId,
+      activeShip.itemID,
+      shipFlagID,
+      shipLocationID,
+    ].join(":");
+    warnCharacterLocationOnce(
+      warningKey,
+      `[CharacterState] Active ship location authority unresolved ` +
+        `reason=${reason} char=${charId} ship=${activeShip.itemID} ` +
+        `flag=${shipFlagID} location=${shipLocationID} ${details}`.trim(),
+    );
+  }
+
+  if (
+    shipFlagID === 0 &&
+    (
+      isAbyssalHostLocationID(currentSolarSystemID) ||
+      isAbyssalHostLocationID(shipLocationID) ||
+      isAbyssalHostLocationID(shipSpaceSystemID)
+    )
+  ) {
+    const abyssalHostLocationID =
+      (isAbyssalHostLocationID(shipLocationID) && shipLocationID) ||
+      (isAbyssalHostLocationID(shipSpaceSystemID) && shipSpaceSystemID) ||
+      currentSolarSystemID;
+    if (currentSolarSystemID === abyssalHostLocationID) {
+      return record;
+    }
+    return {
+      ...record,
+      stationID: null,
+      structureID: null,
+      solarSystemID: abyssalHostLocationID,
+    };
+  }
 
   let repairedStationID = currentStationID;
   let repairedStructureID = currentStructureID;
   let repairedSolarSystemID = currentSolarSystemID;
 
-  if (shipFlagID === ITEM_FLAGS.HANGAR && shipLocationID) {
+  if (shipFlagID === ITEM_FLAGS.HANGAR) {
+    if (!shipLocationID) {
+      warnAuthorityIssue("hangar-location-missing", "");
+      return record;
+    }
     const station = worldData.getStationByID(shipLocationID);
     if (station) {
+      const stationSolarSystemID = hasLocationID(station.solarSystemID)
+        ? Number(station.solarSystemID)
+        : null;
+      if (!stationSolarSystemID) {
+        warnAuthorityIssue("station-system-missing", `station=${shipLocationID}`);
+        return record;
+      }
       repairedStationID = station.stationID;
       repairedStructureID = null;
-      repairedSolarSystemID = Number(station.solarSystemID || currentSolarSystemID || 0) || 30000142;
+      repairedSolarSystemID = stationSolarSystemID;
     } else {
       const structure = getStructureState().getStructureByID(shipLocationID, {
         refresh: false,
       });
       if (structure) {
+        const structureSolarSystemID = hasLocationID(structure.solarSystemID)
+          ? Number(structure.solarSystemID)
+          : null;
+        if (!structureSolarSystemID) {
+          warnAuthorityIssue("structure-system-missing", `structure=${shipLocationID}`);
+          return record;
+        }
         repairedStationID = null;
         repairedStructureID = structure.structureID;
-        repairedSolarSystemID = Number(structure.solarSystemID || currentSolarSystemID || 0) || 30000142;
+        repairedSolarSystemID = structureSolarSystemID;
+      } else {
+        warnAuthorityIssue("hangar-location-unknown", "");
+        return record;
       }
     }
   } else if (shipFlagID === 0) {
@@ -874,7 +989,13 @@ function reconcileCharacterLocationFromActiveShip(charId, record = {}, activeShi
       repairedStationID = null;
       repairedStructureID = null;
       repairedSolarSystemID = inferredSolarSystemID;
+    } else {
+      warnAuthorityIssue("space-system-missing", "");
+      return record;
     }
+  } else {
+    warnAuthorityIssue("active-ship-flag-unsupported", "");
+    return record;
   }
 
   if (
@@ -889,7 +1010,7 @@ function reconcileCharacterLocationFromActiveShip(charId, record = {}, activeShi
     ...record,
     stationID: repairedStationID,
     structureID: repairedStructureID,
-    solarSystemID: repairedSolarSystemID || currentSolarSystemID || 30000142,
+    solarSystemID: repairedSolarSystemID,
   };
   const systemIdentity = resolveSystemIdentity(nextRecord.solarSystemID, nextRecord);
   nextRecord.constellationID = systemIdentity.constellationID;
@@ -905,17 +1026,27 @@ function reconcileCharacterLocationFromActiveShip(charId, record = {}, activeShi
     currentSolarSystemID,
     nextRecord.solarSystemID,
   ].join(":");
-  if (!characterLocationReconcileWarnings.has(warningKey)) {
-    characterLocationReconcileWarnings.add(warningKey);
-    log.warn(
-      `[CharacterState] Reconciled location from active ship for char=${charId} ship=${activeShip.itemID} station=${currentStationID}=>${nextRecord.stationID} structure=${currentStructureID}=>${nextRecord.structureID} system=${currentSolarSystemID}=>${nextRecord.solarSystemID}`,
+  const reconciliationMessage =
+    `char=${charId} ship=${activeShip.itemID} ` +
+    `station=${currentStationID}=>${nextRecord.stationID} ` +
+    `structure=${currentStructureID}=>${nextRecord.structureID} ` +
+    `system=${currentSolarSystemID}=>${nextRecord.solarSystemID}`;
+  if (expectedTransitionReason) {
+    log.debug(
+      `[CharacterState] Reconciled expected location transition ` +
+        `reason=${expectedTransitionReason} ${reconciliationMessage}`,
+    );
+  } else {
+    warnCharacterLocationOnce(
+      warningKey,
+      `[CharacterState] Reconciled location from active ship for ${reconciliationMessage}`,
     );
   }
 
   return nextRecord;
 }
 
-function normalizeCharacterRecord(charId, record) {
+function normalizeCharacterRecord(charId, record, options = {}) {
   if (!record || typeof record !== "object") {
     return null;
   }
@@ -938,7 +1069,12 @@ function normalizeCharacterRecord(charId, record) {
     normalized.shipName = activeShip.itemName;
     Object.assign(
       normalized,
-      reconcileCharacterLocationFromActiveShip(charId, normalized, activeShip),
+      reconcileCharacterLocationFromActiveShip(
+        charId,
+        normalized,
+        activeShip,
+        options,
+      ),
     );
   }
 
@@ -1006,7 +1142,7 @@ function normalizeCharacterRecord(charId, record) {
   return normalized;
 }
 
-function getCharacterRecord(charId) {
+function getCharacterRecord(charId, options = {}) {
   const syntheticPilot = livingPilotDirectory.getPilotRecord(charId);
   if (syntheticPilot) {
     return syntheticPilot;
@@ -1031,7 +1167,7 @@ function getCharacterRecord(charId) {
     return cloneValue(cachedEntry.record);
   }
 
-  const normalizedRecord = normalizeCharacterRecord(charId, rawRecord);
+  const normalizedRecord = normalizeCharacterRecord(charId, rawRecord, options);
   if (!normalizedRecord) {
     return null;
   }
@@ -1069,14 +1205,17 @@ function peekCharacterRecord(charId) {
   return readCharacters()[String(charId)] || null;
 }
 
-function updateCharacterRecord(charId, updater) {
+function updateCharacterRecord(charId, updater, options = {}) {
   if (livingPilotDirectory.getPilotRecord(charId)) {
     return {
       success: false,
       errorMsg: "SYNTHETIC_PILOT_READ_ONLY",
     };
   }
-  const currentRecord = getCharacterRecord(charId);
+  const currentRecord = getCharacterRecord(charId, {
+    expectedLocationTransitionReason:
+      options.expectedLocationTransitionReason,
+  });
   if (!currentRecord) {
     return {
       success: false,
@@ -1329,18 +1468,41 @@ function normalizeDogmaNumericAttributeMap(attributes = {}) {
 }
 
 function buildChargeDogmaPrimeAttributes(item, options = {}) {
+  const numericTypeID = Number(item && item.typeID) || 0;
   const normalizedChargeQuantity = Math.max(
     0,
     Number(item && (item.stacksize ?? item.quantity ?? 0)) || 0,
   );
   const attributes = Object.fromEntries(
-    Object.entries(getTypeDogmaAttributes(Number(item && item.typeID) || 0))
+    Object.entries(getTypeDogmaAttributes(numericTypeID))
       .map(([attributeID, value]) => [Number(attributeID), Number(value)])
       .filter(
         ([attributeID, value]) =>
           Number.isInteger(attributeID) && Number.isFinite(value),
       ),
   );
+  // invTypes metadata is not part of dgmTypeAttributes, so a prime built only
+  // from type dogma leaves volume/mass/radius/capacity unset and the client
+  // falls back to the attribute defaults (all 0). Godma's UpdateAttribute
+  // REPLACES the whole per-item attribute map, so a runtime re-prime would
+  // otherwise erase the values GetAllInfo already delivered. The client divides
+  // by charge volume when sizing a reload (shipfitting/fittingDogmaLocationUtil
+  // _GetReloadInfo: moduleCapacity / float(chargeVolume)), which is a hard
+  // ZeroDivisionError on the capacitor-booster branch of its cap simulator.
+  const typeRow = numericTypeID > 0 ? resolveItemByTypeID(numericTypeID) : null;
+  for (const [attributeID, ...candidates] of [
+    [ATTRIBUTE_MASS, item && item.mass, typeRow && typeRow.mass],
+    [ATTRIBUTE_CAPACITY, item && item.capacity, typeRow && typeRow.capacity],
+    [ATTRIBUTE_VOLUME, item && item.volume, typeRow && typeRow.volume],
+    [ATTRIBUTE_RADIUS, item && item.radius, typeRow && typeRow.radius],
+  ]) {
+    const resolved = candidates
+      .map((candidate) => Number(candidate))
+      .find((candidate) => Number.isFinite(candidate));
+    if (resolved !== undefined) {
+      attributes[attributeID] = resolved;
+    }
+  }
   Object.assign(
     attributes,
     normalizeDogmaNumericAttributeMap(options.attributeOverrides),
@@ -1451,14 +1613,12 @@ function syncChargeGodmaPrimeForSession(
     return;
   }
 
-  // Docked fitting uses real loaded charge inventory rows. Re-priming tuple
-  // sublocations while docked is not safe: the retail client can reconstruct
-  // malformed invCache DBRows for fitting consumers. Tuple primes are reserved
-  // for live in-space charge transitions.
-  if (isDockedSession(session)) {
-    return;
-  }
-
+  // Tuple charge primes are required in both docked and space sessions — a
+  // docked godma that has never seen (shipID, flagID, typeID) cannot apply the
+  // 805 quantity delta that follows it. Golden "Topping Up Ammo from cargo
+  // direct to fitting while docked.txt" line 357 shows the docked client
+  // resolving the delta against a value it ALREADY held for the tuple
+  // ("value I had was 57"), which only works if the key was primed first.
   session.sendNotification("OnGodmaPrimeItem", "clientID", [
     Number(locationID) || 0,
     buildChargeDogmaPrimeEntry(item, options),
@@ -1638,7 +1798,26 @@ function buildScannerProbeLauncherBootstrapChanges(session, moduleItem) {
     );
   }
 
-  const reloadTime = Number(moduleAttributes[ATTRIBUTE_RELOAD_TIME]);
+  // Same preference as the three attributes above: the ship-composed map first,
+  // the module's own map only when there is no host to compose against. This is
+  // the third site to read attribute 1795 off the module's own attributes -
+  // `09baab96` fixed `runtime.js#resolveEffectiveModuleReloadTimeMs` and
+  // `f6e82910` fixed `dogmaService.js#_getModuleReloadTimeMs`, both of which
+  // were publishing a hull's reload bonus as if it did not exist. This one never
+  // published a wrong number: the gate at the top of this function admits only
+  // group 481, and no effect in the SDE writes 1795 to a scan probe launcher -
+  // every writer keys on skill 3319, skill 3348 or group 55, and all eleven
+  // group-481 types require only Astrometrics. Measured 10,000 from both maps on
+  // a Heron, on a Machariel (the group-55 carrier) and on a Jackdaw at Caldari
+  // Tactical Destroyer V. It reads the composed map so that widening the gate
+  // cannot make it the same defect a third time.
+  const reloadTime = Number(
+    runtimeAttributes &&
+    runtimeAttributes.attributeOverrides &&
+    Number.isFinite(Number(runtimeAttributes.attributeOverrides[ATTRIBUTE_RELOAD_TIME]))
+      ? runtimeAttributes.attributeOverrides[ATTRIBUTE_RELOAD_TIME]
+      : moduleAttributes[ATTRIBUTE_RELOAD_TIME],
+  );
   if (Number.isFinite(reloadTime) && reloadTime > 0) {
     changes.push(
       buildModuleAttributeChangePayload(
@@ -2466,6 +2645,50 @@ function isTrainedSkillInventoryRecord(item) {
   );
 }
 
+const BLUEPRINT_INVENTORY_CATEGORY_ID = 9;
+
+// The client memoizes an owner's blueprint list for 15 minutes
+// (blueprintSvc.GetAllBlueprintsForOwner, @Memoize(15) — minutes, not seconds)
+// and only drops it on OnBlueprintsUpdated. Without this, moving a blueprint
+// between a ship and a hangar leaves the industry browser holding the old
+// facilityID for the rest of that window.
+function notifyBlueprintRelocation(item, previousState = {}) {
+  if (Number(item && item.categoryID) !== BLUEPRINT_INVENTORY_CATEGORY_ID) {
+    return;
+  }
+  const relocated =
+    (previousState.locationID !== undefined &&
+      previousState.locationID !== item.locationID) ||
+    (previousState.flagID !== undefined && previousState.flagID !== item.flagID) ||
+    (previousState.ownerID !== undefined && previousState.ownerID !== item.ownerID);
+  if (!relocated) {
+    return;
+  }
+  const ownerID = Number(item.ownerID) || 0;
+  if (ownerID <= 0) {
+    return;
+  }
+  try {
+    // Required lazily: industryNotifications reaches the chat session registry,
+    // and characterState is loaded early enough that a top-level require risks
+    // an import cycle.
+    const {
+      notifyBlueprintsUpdated,
+    } = require(path.join(__dirname, "../industry/industryNotifications"));
+    notifyBlueprintsUpdated(ownerID);
+    if (previousState.ownerID !== undefined && previousState.ownerID !== ownerID) {
+      const previousOwnerID = Number(previousState.ownerID) || 0;
+      if (previousOwnerID > 0) {
+        notifyBlueprintsUpdated(previousOwnerID);
+      }
+    }
+  } catch (error) {
+    log.warn(
+      `[CharacterState] Could not notify blueprint relocation for item ${Number(item.itemID) || 0}: ${error && error.message}`,
+    );
+  }
+}
+
 function syncInventoryItemForSession(session, item, previousState = {}, options = {}) {
   if (
     !session ||
@@ -2483,11 +2706,31 @@ function syncInventoryItemForSession(session, item, previousState = {}, options 
     return;
   }
 
-  session.sendNotification(
-    "OnItemChange",
-    "clientID",
-    buildItemChangePayload(item, previousState),
-  );
+  const itemChangePayload = buildItemChangePayload(item, previousState);
+  const itemChangeEntries =
+    itemChangePayload &&
+    itemChangePayload[1] &&
+    itemChangePayload[1].type === "dict" &&
+    Array.isArray(itemChangePayload[1].entries)
+      ? itemChangePayload[1].entries
+      : null;
+  const suppressNoOpItemChange =
+    options.suppressNoOpItemChanges === true &&
+    Array.isArray(itemChangeEntries) &&
+    itemChangeEntries.length === 0;
+  if (suppressNoOpItemChange) {
+    log.debug(
+      `[CharacterState] Suppressed no-op inventory sync for item ${Number(item.itemID) || 0} (${item.itemName || item.typeID})`,
+    );
+  } else if (options.emitItemsChangedBatch === true) {
+    // invCache.OnItemsChanged updates item caches, then emits the local
+    // OnMultipleItemChange event used by inventory footer count/value labels.
+    emitItemsChangedBatchForSession(session, [{ item, previousData: previousState }]);
+  } else {
+    session.sendNotification("OnItemChange", "clientID", itemChangePayload);
+  }
+
+  notifyBlueprintRelocation(item, previousState);
 
   if (
     options.emitCfgLocation !== false &&
@@ -2515,29 +2758,6 @@ function emitItemsChangedBatchForSession(session, changes = [], options = {}) {
     return false;
   }
 
-  const rows = [];
-  let changeDict = options && options.changeDict ? options.changeDict : null;
-  for (const change of Array.isArray(changes) ? changes : []) {
-    const item = change && change.item ? change.item : null;
-    if (!item) {
-      continue;
-    }
-    const payload = buildItemChangePayload(item, change.previousData || {});
-    const row = Array.isArray(payload) ? payload[0] : null;
-    const rowChangeDict = Array.isArray(payload) ? payload[1] : null;
-    if (!row) {
-      continue;
-    }
-    rows.push(row);
-    if (!changeDict && rowChangeDict) {
-      changeDict = rowChangeDict;
-    }
-  }
-
-  if (rows.length <= 0) {
-    return false;
-  }
-
   const locationContext =
     options && Object.prototype.hasOwnProperty.call(options, "locationContext")
       ? options.locationContext
@@ -2546,12 +2766,73 @@ function emitItemsChangedBatchForSession(session, changes = [], options = {}) {
     options && typeof options.idType === "string" && options.idType.trim() !== ""
       ? options.idType
       : "charid";
-  session.sendNotification("OnItemsChanged", idType, [
-    { type: "list", items: rows },
+  const maxRowsPerNotification = Number.isFinite(
+    Number(options && options.maxRowsPerNotification),
+  ) && Number(options.maxRowsPerNotification) > 0
+    ? Math.max(1, Math.trunc(Number(options.maxRowsPerNotification)))
+    : Number.MAX_SAFE_INTEGER;
+  const explicitChangeDict = options && options.changeDict
+    ? options.changeDict
+    : null;
+  const signatureFor = (changeDict) => JSON.stringify(
     changeDict || { type: "dict", entries: [] },
-    locationContext,
-  ]);
-  return true;
+    (_key, value) => (typeof value === "bigint" ? `bigint:${value}` : value),
+  );
+
+  let currentRows = [];
+  let currentChangeDict = null;
+  let currentSignature = null;
+  let notificationCount = 0;
+  const flushRows = () => {
+    if (currentRows.length === 0) {
+      return;
+    }
+    session.sendNotification("OnItemsChanged", idType, [
+      { type: "list", items: currentRows },
+      currentChangeDict || { type: "dict", entries: [] },
+      locationContext,
+    ]);
+    notificationCount += 1;
+    currentRows = [];
+    currentChangeDict = null;
+    currentSignature = null;
+  };
+
+  for (const change of Array.isArray(changes) ? changes : []) {
+    const item = change && change.item ? change.item : null;
+    if (!item) {
+      continue;
+    }
+    const payload = buildItemChangePayload(item, change.previousData || {});
+    const row = Array.isArray(payload) ? payload[0] : null;
+    const rowChangeDict = explicitChangeDict ||
+      (Array.isArray(payload) ? payload[1] : null) ||
+      { type: "dict", entries: [] };
+    if (!row) {
+      continue;
+    }
+    const rowSignature = signatureFor(rowChangeDict);
+    // One plural payload carries one old-value dictionary. Preserve the
+    // child-before-parent change order by splitting only at contiguous context
+    // boundaries, and cap homogeneous runs so a mass delete cannot produce a
+    // multi-megabyte client frame.
+    if (
+      currentRows.length > 0 &&
+      (
+        currentSignature !== rowSignature ||
+        currentRows.length >= maxRowsPerNotification
+      )
+    ) {
+      flushRows();
+    }
+    if (currentRows.length === 0) {
+      currentChangeDict = rowChangeDict;
+      currentSignature = rowSignature;
+    }
+    currentRows.push(row);
+  }
+  flushRows();
+  return notificationCount > 0;
 }
 
 function emitItemsChangedForSession(session, item, previousState = {}, options = {}) {
@@ -2922,6 +3203,32 @@ function emitFittingTransactionForSession(session, shipID, changes, options = {}
         );
       }
     }
+    for (const attrChange of Array.isArray(options.dependentModuleAttributeDiffs)
+      ? options.dependentModuleAttributeDiffs
+      : []) {
+      const moduleID = Number(attrChange && attrChange.moduleID) || 0;
+      const attributeID = Number(attrChange && attrChange.attributeID) || 0;
+      const nextValue = Number(attrChange && attrChange.newValue);
+      const previousValue = Number(attrChange && attrChange.oldValue);
+      if (
+        moduleID <= 0 ||
+        attributeID <= 0 ||
+        !Number.isFinite(nextValue) ||
+        !Number.isFinite(previousValue)
+      ) {
+        continue;
+      }
+      subEvents.push(
+        buildModuleAttributeChangeEvent(
+          charID,
+          moduleID,
+          attributeID,
+          nextValue,
+          previousValue,
+          time,
+        ),
+      );
+    }
     for (const change of fittingMoves) {
       const item = change.item;
       const previous = change.previousData || change.previousState || {};
@@ -3162,12 +3469,17 @@ function syncFittedModulesForSession(session, shipID = null, options = {}) {
       session._space &&
       !isDockedSession(session),
   );
+  // Default OFF in both states. Retail identifies a fitted charge by the
+  // (shipID, flagID, chargeTypeID) tuple whether the character is docked or in
+  // space — the docked golden trace "Topping Up Ammo from cargo direct to
+  // fitting while docked.txt" carries no real itemID for the loaded ammo at
+  // all — so a fitting refresh must not mint real fitted-charge inventory rows
+  // the client's invCache and godma were never given.
   const emitChargeInventoryRows =
-    options.emitChargeInventoryRows === undefined
-      ? !isInSpaceSession
-      : options.emitChargeInventoryRows === true &&
-        (!isInSpaceSession || allowInSpaceChargeInventoryRows);
+    options.emitChargeInventoryRows === true &&
+    (!isInSpaceSession || allowInSpaceChargeInventoryRows);
   const emitOnlineEffects = options.emitOnlineEffects === true;
+  const suppressNoOpItemChanges = options.suppressNoOpItemChanges === true;
   const preferSyntheticHardpointOnlineBounce =
     emitOnlineEffects &&
     isInSpaceSession &&
@@ -3272,6 +3584,7 @@ function syncFittedModulesForSession(session, shipID = null, options = {}) {
     `allowInSpaceChargeInventoryRows=${allowInSpaceChargeInventoryRows} ` +
     `emitChargeInventoryRows=${emitChargeInventoryRows} ` +
     `emitOnlineEffects=${emitOnlineEffects} ` +
+    `suppressNoOpItemChanges=${suppressNoOpItemChanges} ` +
     `syntheticFit=${options.syntheticFitTransition === true} ` +
     `items=${JSON.stringify(
       syncItems.map((item) => summarizeMissileDebugItem(item)),
@@ -3338,6 +3651,7 @@ function syncFittedModulesForSession(session, shipID = null, options = {}) {
         previousState,
         {
           emitCfgLocation: false,
+          suppressNoOpItemChanges,
         },
       );
     }
@@ -3385,6 +3699,7 @@ function syncShipFittingStateForSession(session, shipID = null, options = {}) {
           onlyCharges: options.onlyCharges === true,
           onlyScannerProbeLaunchers: options.onlyScannerProbeLaunchers === true,
           emitOnlineEffects: options.emitOnlineEffects === true,
+          suppressNoOpItemChanges: options.suppressNoOpItemChanges,
           emitChargeInventoryRows: options.emitChargeInventoryRows,
           allowInSpaceChargeInventoryRows:
             options.allowInSpaceChargeInventoryRows === true,
@@ -4083,8 +4398,12 @@ function applyCharacterToSession(session, charId, options = {}) {
     session._characterControlDisconnected = false;
   }
   session._localChatDeparted = false;
-  // Keep the session registry's characterID index in sync (O(1) presence lookups).
-  require("../chat/sessionRegistry").indexCharacterSession(session);
+  // Keep the session registry's characterID index in sync (O(1) presence
+  // lookups). A headless Abyssal combat owner is intentionally not an online
+  // player session; indexing it would leak presence and could block relog.
+  if (session._abyssalOfflineSession !== true) {
+    require("../chat/sessionRegistry").indexCharacterSession(session);
+  }
   session.characterName = charData.characterName || "Unknown";
   session.characterTypeID = charData.typeID || 1373;
   session.genderID = normalizeCharacterGender(charData.gender, 1);
@@ -4145,7 +4464,7 @@ function applyCharacterToSession(session, charId, options = {}) {
     charData.plexBalance,
     DEFAULT_PLEX_BALANCE,
   );
-  session.hqID = charData.hqID || corporationRoleState.baseID || null;
+  session.hqID = corporationRoleState.hqID || charData.hqID || null;
   session.baseID = charData.baseID || corporationRoleState.baseID || null;
   session.warFactionID = charData.warFactionID || null;
   session.warfactionid = session.warFactionID || null;
@@ -4185,9 +4504,6 @@ function applyCharacterToSession(session, charId, options = {}) {
   const isInitialCharacterSelection =
     isCharacterSelection &&
     (oldCharID === undefined || oldCharID === null || oldCharID === 0);
-  session._loginInventoryBootstrapPending =
-    !isDocked && isCharacterSelection;
-
   if (options.prewarmSkillCache !== false && isCharacterSelection) {
     try {
       getCachedCharacterSkillMap(charId);
@@ -4198,11 +4514,30 @@ function applyCharacterToSession(session, charId, options = {}) {
     }
   }
 
+  if (typeof options.beforeNotificationPlan === "function") {
+    options.beforeNotificationPlan(session, {
+      characterID: charId,
+      isCharacterSelection,
+      isInitialCharacterSelection,
+    });
+  }
+  const notificationIsDocked = Boolean(
+    session.stationid ||
+      session.stationID ||
+      session.structureid ||
+      session.structureID,
+  );
+  const notificationShipID = normalizeSessionShipValue(
+    session.shipID ?? session.shipid ?? shipID,
+  );
+  session._loginInventoryBootstrapPending =
+    !notificationIsDocked && isCharacterSelection;
+
   const notificationPlan = buildCharacterSessionNotificationPlan(session, {
     ...options,
     charID: charId,
-    shipID,
-    isDocked,
+    shipID: notificationShipID,
+    isDocked: notificationIsDocked,
     isCharacterSelection,
     isInitialCharacterSelection,
     oldCharID,
@@ -4247,7 +4582,7 @@ function applyCharacterToSession(session, charId, options = {}) {
 
   if (options.logSelection !== false) {
     log.info(
-      `[CharState] Applied ${session.characterName}(${charId}) ship=${session.shipName}(${session.shipTypeID}) activeShipID=${session.activeShipID} docked=${isDocked} station=${session.stationid} structure=${session.structureid} system=${solarSystemID}`,
+      `[CharState] Applied ${session.characterName}(${charId}) ship=${session.shipName}(${session.shipTypeID}) activeShipID=${session.activeShipID} docked=${notificationIsDocked} station=${session.stationid} structure=${session.structureid} system=${Number(session.solarsystemid2 || solarSystemID) || solarSystemID}`,
     );
   }
 
@@ -4255,6 +4590,70 @@ function applyCharacterToSession(session, charId, options = {}) {
     success: true,
     data: charData,
     notificationPlan,
+  };
+}
+
+function prepareDockedShipForActivation(session, charId, targetShip) {
+  const dockedLocationID = getDockedLocationID(session);
+  const targetLocationID = Number(targetShip && targetShip.locationID) || 0;
+  const targetFlagID = Number(targetShip && targetShip.flagID) || 0;
+
+  if (
+    dockedLocationID > 0 &&
+    targetLocationID === dockedLocationID &&
+    targetFlagID === ITEM_FLAGS.HANGAR
+  ) {
+    return {
+      success: true,
+      targetShip,
+      extractedFromMaintenanceBay: false,
+    };
+  }
+
+  // Client authority: tools/ClientCodeGrabber/Latest/eve/client/script/ui/
+  // services/menuSvcExtras/menuFunctions.py:190-218 and
+  // tools/ClientCodeGrabber/Latest/menucheckers/itemCheckers.py:136-152.
+  // A docked double-click on a ship inside another docked ship's maintenance
+  // bay can arrive as ship.Board; BoardStoredShip is the in-space SMA/SMB path.
+  // The target cannot be made active while it retains flagShipHangar:
+  // active-ship recovery correctly treats that as an unsupported active
+  // location and may select an unrelated hull elsewhere. Only unwrap the one
+  // retail-reachable case: an owned ship in the SMB of another owned ship that
+  // is directly in this dock's hangar.
+  if (targetFlagID !== ITEM_FLAGS.SHIP_HANGAR) {
+    return {
+      success: false,
+      errorMsg: "SHIP_NOT_IN_DOCKED_LOCATION",
+    };
+  }
+
+  const maintenanceShip = findCharacterShipItem(charId, targetLocationID);
+  if (
+    !maintenanceShip ||
+    Number(maintenanceShip.ownerID) !== Number(charId) ||
+    Number(maintenanceShip.locationID) !== dockedLocationID ||
+    Number(maintenanceShip.flagID) !== ITEM_FLAGS.HANGAR
+  ) {
+    return {
+      success: false,
+      errorMsg: "SHIP_NOT_IN_DOCKED_LOCATION",
+    };
+  }
+
+  const dockResult = dockShipToLocation(targetShip.itemID, dockedLocationID);
+  if (!dockResult.success || !dockResult.data) {
+    return {
+      success: false,
+      errorMsg: dockResult.errorMsg || "SHIP_MAINTENANCE_BAY_EXTRACTION_FAILED",
+    };
+  }
+
+  return {
+    success: true,
+    targetShip: dockResult.data,
+    previousData: dockResult.previousData || targetShip,
+    maintenanceShipID: maintenanceShip.itemID,
+    extractedFromMaintenanceBay: true,
   };
 }
 
@@ -4276,7 +4675,7 @@ function activateShipForSession(session, shipId, options = {}) {
 
   const charId = session.characterID;
   const currentShip = getActiveShipRecord(charId);
-  const targetShip = findCharacterShip(charId, shipId);
+  let targetShip = findCharacterShip(charId, shipId);
   if (!targetShip) {
     return {
       success: false,
@@ -4284,9 +4683,34 @@ function activateShipForSession(session, shipId, options = {}) {
     };
   }
 
+  const preparationResult = prepareDockedShipForActivation(
+    session,
+    charId,
+    targetShip,
+  );
+  if (!preparationResult.success) {
+    return preparationResult;
+  }
+  targetShip = preparationResult.targetShip;
+
   const updateResult = setActiveShipForCharacter(charId, targetShip.itemID);
   if (!updateResult.success) {
     return updateResult;
+  }
+
+  if (
+    preparationResult.extractedFromMaintenanceBay === true &&
+    options.emitNotifications !== false
+  ) {
+    // Publish the flag/location transition before the shipid session change.
+    // The client can then remove the hull from the carrier's SMB and resolve it
+    // from the station hangar while processing ProcessActiveShipChanged.
+    syncInventoryItemForSession(
+      session,
+      targetShip,
+      preparationResult.previousData,
+      { emitCfgLocation: true },
+    );
   }
 
   const shouldConsumePreviousCapsule =
@@ -4295,38 +4719,15 @@ function activateShipForSession(session, shipId, options = {}) {
     isCapsuleTypeID(currentShip.typeID) &&
     !isCapsuleTypeID(targetShip.typeID);
 
-  if (
-    options.emitNotifications !== false &&
-    currentShip &&
-    currentShip.itemID !== targetShip.itemID
-  ) {
-    // Docked boarding mirrors the leave-ship capsule path: the target hull
-    // must exist in invCache before the shipid session change lands, otherwise
-    // hangar/dogma can race on large hulls and resolve the new active ship as
-    // missing during _MakeShipActive / ProcessActiveShipChanged.
-    syncInventoryItemForSession(
-      session,
-      targetShip,
-      {
-        locationID: 0,
-        flagID: 0,
-        quantity: 0,
-        singleton: 0,
-        stacksize: 0,
-      },
-      {
-        emitCfgLocation: true,
-      },
-    );
-  }
-
+  // Neither hull moves containers during ordinary docked boarding. The client
+  // loads the new active hull from the shipid session change; replaying either
+  // unchanged hull through invCache races that load and can duplicate its row.
   const applyResult = applyCharacterToSession(session, charId, {
     emitNotifications: options.emitNotifications !== false,
     logSelection: options.logSelection !== false,
     selectionEvent: false,
   });
 
-  let previousCapsuleRemoved = false;
   let previousCapsuleRemovalChanges = [];
   if (shouldConsumePreviousCapsule) {
     const removeResult = removeInventoryItem(currentShip.itemID, {
@@ -4337,7 +4738,6 @@ function activateShipForSession(session, shipId, options = {}) {
         `[CharState] Failed to consume docked capsule ${currentShip.itemID} for char=${charId}: ${removeResult.errorMsg}`,
       );
     } else {
-      previousCapsuleRemoved = true;
       previousCapsuleRemovalChanges = Array.isArray(removeResult.data && removeResult.data.changes)
         ? removeResult.data.changes
         : [];
@@ -4368,46 +4768,6 @@ function activateShipForSession(session, shipId, options = {}) {
       );
     }
 
-    // Docked boarding does not move the hull between containers, so the client
-    // only sees a shipid session change unless we explicitly refresh the item
-    // cache entries that back the hangar/active-ship presentation.
-    const refreshedTargetShip = getActiveShipRecord(charId) || targetShip;
-    const refreshQueue = [];
-    const seenItemIds = new Set();
-
-    if (
-      currentShip &&
-      currentShip.itemID !== targetShip.itemID &&
-      !previousCapsuleRemoved
-    ) {
-      refreshQueue.push(currentShip);
-    }
-    refreshQueue.push(refreshedTargetShip);
-
-    for (const shipItem of refreshQueue) {
-      if (
-        !shipItem ||
-        seenItemIds.has(shipItem.itemID)
-      ) {
-        continue;
-      }
-
-      seenItemIds.add(shipItem.itemID);
-      syncInventoryItemForSession(
-        session,
-        shipItem,
-        {
-          locationID: shipItem.locationID,
-          flagID: shipItem.flagID,
-          quantity: shipItem.quantity,
-          singleton: shipItem.singleton,
-          stacksize: shipItem.stacksize,
-        },
-        {
-          emitCfgLocation: true,
-        },
-      );
-    }
   }
 
   return {
@@ -4727,6 +5087,15 @@ module.exports._testing = {
   buildChargeSublocationRow,
   buildCharacterSessionNotificationPlan,
   INITIAL_SPACE_CHARACTER_SESSION_CHANGE_KEYS,
+  MAX_CHARACTER_LOCATION_RECONCILE_WARNINGS,
+  getCharacterLocationReconcileWarningKeysForTests() {
+    return [...characterLocationReconcileWarnings];
+  },
+  reconcileCharacterLocationFromActiveShip,
+  rememberCharacterLocationWarning,
+  resetCharacterLocationReconcileWarningsForTests() {
+    characterLocationReconcileWarnings.clear();
+  },
   resetCharacterRecordCacheForTests() {
     characterRecordCache.clear();
   },

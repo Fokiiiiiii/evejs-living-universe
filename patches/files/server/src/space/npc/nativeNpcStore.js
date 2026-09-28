@@ -1,3 +1,5 @@
+"use strict";
+
 const path = require("path");
 
 const database = require(path.join(__dirname, "../../gameStore"));
@@ -5,6 +7,10 @@ const {
   normalizePersistentEntityID,
   toJSONSafeEntityID,
 } = require(path.join(__dirname, "../destiny/identity/entityID"));
+const {
+  buildChildEntityScopeMetadata,
+  resolveEntityInteractionScope,
+} = require(path.join(__dirname, "../destiny/identity/interactionScope"));
 
 const TABLE = Object.freeze({
   ENTITIES: "npcEntities",
@@ -39,6 +45,22 @@ const ROOT = Object.freeze({
     nextWreckItemID: 980400000000,
     items: {},
   },
+});
+
+// Each table owns a 100M-wide block of IDs beginning at its ROOT counter, and
+// the two allocation modes split that block in half. Durable IDs advance from
+// the persisted counter in the lower half. Transient IDs restart at the fixed
+// upper-half base below on every process and are never written back to the
+// store, so the two sequences can never mint the same ID: a table would need
+// fifty million durable rows before the halves could meet. Reissuing transient
+// IDs each boot is deliberate; consumers scope their idempotency keys to the
+// boot that issued the ID.
+const TRANSIENT_ID_BASES = Object.freeze({
+  [TABLE.ENTITIES]: 980050000000,
+  [TABLE.MODULES]: 980150000000,
+  [TABLE.CARGO]: 980250000000,
+  [TABLE.WRECKS]: 980350000000,
+  [TABLE.WRECK_ITEMS]: 980450000000,
 });
 
 const transientCounters = {
@@ -91,6 +113,7 @@ const NATIVE_SCOPE_BOOLEAN_FIELDS = Object.freeze([
 const NATIVE_SCOPE_TEXT_FIELDS = Object.freeze([
   "airNpeHostileWave",
   "dungeonEncounterKey",
+  "dungeonEncounterMemberKey",
   "dungeonSiteContentKey",
   "dungeonSiteContentRole",
   "dungeonSiteContentAnalyzer",
@@ -111,6 +134,7 @@ const NATIVE_DUNGEON_BOOLEAN_MARKERS = new Set([
 ]);
 const NATIVE_DUNGEON_TEXT_MARKERS = new Set([
   "dungeonEncounterKey",
+  "dungeonEncounterMemberKey",
   "dungeonSiteContentKey",
   "dungeonSiteContentRole",
   "dungeonSiteContentAnalyzer",
@@ -260,21 +284,38 @@ function readRoot(tableName) {
   return root;
 }
 
+// Roots whose shape has already been verified, keyed by the store's live object.
+//
+// Verifying cost a deep clone of the table plus two full JSON.stringify of it,
+// and every collection read, row write and row removal paid it. The store hands
+// back its live root and mutates it in place for nested writes, so that object's
+// identity is a precise marker: while it is the same object the shape it was
+// given still holds. Replacing the root wholesale yields a new object and the
+// check runs again.
+const shapedRootsByTable = new WeakMap();
+
 function ensureRootShape(tableName) {
-  const currentRoot = readRoot(tableName);
   const result = database.read(tableName, "/");
   const existingRoot = result.success && result.data && typeof result.data === "object"
     ? result.data
     : null;
-  const normalizedRoot = cloneValue(currentRoot);
+  if (existingRoot && shapedRootsByTable.get(existingRoot) === tableName) {
+    return existingRoot;
+  }
+
+  const normalizedRoot = cloneValue(readRoot(tableName));
   if (!existingRoot || JSON.stringify(existingRoot) !== JSON.stringify(normalizedRoot)) {
     database.write(tableName, "/", normalizedRoot);
+    const written = database.read(tableName, "/");
+    const writtenRoot = written.success && written.data && typeof written.data === "object"
+      ? written.data
+      : normalizedRoot;
+    shapedRootsByTable.set(writtenRoot, tableName);
+    return writtenRoot;
   }
-  return normalizedRoot;
-}
 
-function writeRoot(tableName, root, options = {}) {
-  return database.write(tableName, "/", root, options);
+  shapedRootsByTable.set(existingRoot, tableName);
+  return existingRoot;
 }
 
 function readCollection(tableName, key) {
@@ -303,11 +344,7 @@ function removeCollectionRow(tableName, collectionKey, rowID) {
 function allocateID(tableName, counterKey, options = {}) {
   if (options.transient === true) {
     if (!Number.isInteger(transientCounters[tableName])) {
-      const root = ensureRootShape(tableName);
-      transientCounters[tableName] = Math.max(
-        toPositiveInt(root && root[counterKey], 0),
-        toPositiveInt(ROOT[tableName] && ROOT[tableName][counterKey], 0),
-      );
+      transientCounters[tableName] = TRANSIENT_ID_BASES[tableName];
     }
     const nextID = transientCounters[tableName];
     transientCounters[tableName] += 1;
@@ -322,14 +359,19 @@ function allocateID(tableName, counterKey, options = {}) {
     toPositiveInt(root && root[counterKey], 0),
     toPositiveInt(ROOT[tableName] && ROOT[tableName][counterKey], 0),
   );
-  const updatedRoot = {
-    ...root,
-    [counterKey]: nextID + 1,
-  };
   // ID counters are authoritative store metadata, not transient runtime rows.
   // Persisting them avoids collisions without ever transient-marking the whole
   // table snapshot.
-  const writeResult = writeRoot(tableName, updatedRoot);
+  //
+  // Written at its own path rather than by replacing the root: a whole-root write
+  // installs a new object, which both deep-compares the table and discards the
+  // verified-shape marker, so allocating an ID would re-verify the shape on the
+  // next access.
+  const writeResult = database.write(
+    tableName,
+    `/${counterKey}`,
+    nextID + 1,
+  );
   if (!writeResult.success) {
     return {
       success: false,
@@ -554,102 +596,46 @@ function removeNativeEntityCascade(entityID) {
   }
 
   for (const moduleRecord of listNativeModulesForEntity(normalizedEntityID)) {
-    removeNativeModule(moduleRecord.moduleID);
+    const removeResult = removeNativeModule(moduleRecord.moduleID);
+    if (!removeResult || removeResult.success !== true) {
+      return removeResult || {
+        success: false,
+        errorMsg: "NPC_NATIVE_MODULE_REMOVE_FAILED",
+      };
+    }
   }
   for (const cargoRecord of listNativeCargoForEntity(normalizedEntityID)) {
-    removeNativeCargo(cargoRecord.cargoID);
+    const removeResult = removeNativeCargo(cargoRecord.cargoID);
+    if (!removeResult || removeResult.success !== true) {
+      return removeResult || {
+        success: false,
+        errorMsg: "NPC_NATIVE_CARGO_REMOVE_FAILED",
+      };
+    }
   }
-  removeNativeController(normalizedEntityID);
-  removeNativeEntity(normalizedEntityID);
+  if (getNativeController(normalizedEntityID)) {
+    const controllerRemoveResult = removeNativeController(normalizedEntityID);
+    if (!controllerRemoveResult || controllerRemoveResult.success !== true) {
+      return controllerRemoveResult || {
+        success: false,
+        errorMsg: "NPC_NATIVE_CONTROLLER_REMOVE_FAILED",
+      };
+    }
+  }
+  if (getNativeEntity(normalizedEntityID)) {
+    const entityRemoveResult = removeNativeEntity(normalizedEntityID);
+    if (!entityRemoveResult || entityRemoveResult.success !== true) {
+      return entityRemoveResult || {
+        success: false,
+        errorMsg: "NPC_NATIVE_ENTITY_REMOVE_FAILED",
+      };
+    }
+  }
 
   return {
     success: true,
     data: {
       entityID: normalizedEntityID,
-    },
-  };
-}
-
-function removeNativeEntitiesCascade(entityIDs) {
-  const normalizedEntityIDs = Array.from(new Set(
-    (Array.isArray(entityIDs) ? entityIDs : [])
-      .map((entityID) => toPositiveInt(entityID, 0))
-      .filter(Boolean),
-  ));
-  if (normalizedEntityIDs.length === 0) {
-    return {
-      success: true,
-      data: {
-        entityIDs: [],
-        removedEntities: 0,
-        removedControllers: 0,
-        removedModules: 0,
-        removedCargo: 0,
-      },
-    };
-  }
-
-  const entityIDSet = new Set(normalizedEntityIDs.map(String));
-  const entityRoot = ensureRootShape(TABLE.ENTITIES);
-  const controllerRoot = ensureRootShape(TABLE.CONTROLLERS);
-  const moduleRoot = ensureRootShape(TABLE.MODULES);
-  const cargoRoot = ensureRootShape(TABLE.CARGO);
-  let removedEntities = 0;
-  let removedControllers = 0;
-  let removedModules = 0;
-  let removedCargo = 0;
-
-  for (const entityID of normalizedEntityIDs) {
-    const key = String(entityID);
-    if (entityRoot.entities && entityRoot.entities[key]) {
-      delete entityRoot.entities[key];
-      removedEntities += 1;
-    }
-    if (controllerRoot.controllers && controllerRoot.controllers[key]) {
-      delete controllerRoot.controllers[key];
-      removedControllers += 1;
-    }
-  }
-  for (const [moduleID, moduleRecord] of Object.entries(moduleRoot.modules || {})) {
-    if (entityIDSet.has(String(toPositiveInt(moduleRecord && moduleRecord.entityID, 0)))) {
-      delete moduleRoot.modules[moduleID];
-      removedModules += 1;
-    }
-  }
-  for (const [cargoID, cargoRecord] of Object.entries(cargoRoot.cargo || {})) {
-    if (entityIDSet.has(String(toPositiveInt(cargoRecord && cargoRecord.entityID, 0)))) {
-      delete cargoRoot.cargo[cargoID];
-      removedCargo += 1;
-    }
-  }
-
-  for (const [tableName, root] of [
-    [TABLE.MODULES, moduleRoot],
-    [TABLE.CARGO, cargoRoot],
-    [TABLE.CONTROLLERS, controllerRoot],
-    [TABLE.ENTITIES, entityRoot],
-  ]) {
-    const writeResult = writeRoot(tableName, root);
-    if (!writeResult.success) {
-      invalidateControllerCache();
-      return {
-        success: false,
-        errorMsg: writeResult.errorMsg || "NPC_NATIVE_BULK_REMOVE_FAILED",
-        data: {
-          tableName,
-        },
-      };
-    }
-  }
-  invalidateControllerCache();
-  return {
-    success: true,
-    data: {
-      entityIDs: normalizedEntityIDs,
-      removedEntities,
-      removedControllers,
-      removedModules,
-      removedCargo,
     },
   };
 }
@@ -691,6 +677,117 @@ function upsertNativeWreck(wreckRecord, options = {}) {
     },
     options,
   );
+}
+
+// Abandonment changes loot authority, so the native wreck record must become
+// authoritative before its live ball is updated or broadcast. Durable wrecks
+// cross a synchronous persistence boundary; transient wrecks still retain the
+// marker in their service-owned record for scene rematerialization.
+function setNativeWreckLootAbandoned(wreckID, abandoned = true) {
+  const normalizedWreckID = toPositiveInt(wreckID, 0);
+  const wreckRecord = getNativeWreck(normalizedWreckID);
+  if (!normalizedWreckID || !wreckRecord) {
+    return {
+      success: false,
+      errorMsg: "WRECK_NOT_FOUND",
+    };
+  }
+
+  const nextLootAbandoned = abandoned === true;
+  if ((wreckRecord.lootAbandoned === true) === nextLootAbandoned) {
+    return {
+      success: true,
+      errorMsg: null,
+      changed: false,
+      durable: wreckRecord.transient !== true,
+      data: wreckRecord,
+    };
+  }
+
+  const transient = wreckRecord.transient === true;
+  let writeResult = null;
+  try {
+    writeResult = upsertNativeWreck(
+      {
+        ...wreckRecord,
+        lootAbandoned: nextLootAbandoned,
+      },
+      { transient },
+    );
+  } catch (error) {
+    return {
+      success: false,
+      errorMsg:
+        String(error && error.message || "").trim() ||
+        "NPC_NATIVE_WRECK_ABANDON_WRITE_FAILED",
+    };
+  }
+  if (!writeResult || writeResult.success !== true) {
+    return {
+      success: false,
+      errorMsg:
+        writeResult && writeResult.errorMsg ||
+        "NPC_NATIVE_WRECK_ABANDON_WRITE_FAILED",
+    };
+  }
+
+  if (transient) {
+    return {
+      success: true,
+      errorMsg: null,
+      changed: true,
+      durable: false,
+      data: getNativeWreck(normalizedWreckID),
+    };
+  }
+
+  let flushResult = null;
+  try {
+    flushResult = database.flushTableSync(TABLE.WRECKS);
+  } catch (error) {
+    flushResult = {
+      success: false,
+      errorMsg:
+        String(error && error.message || "").trim() ||
+        "NPC_NATIVE_WRECK_ABANDON_FLUSH_FAILED",
+    };
+  }
+  if (flushResult && flushResult.success === true) {
+    return {
+      success: true,
+      errorMsg: null,
+      changed: true,
+      durable: true,
+      data: getNativeWreck(normalizedWreckID),
+    };
+  }
+
+  // A failed durability boundary must not leave the in-memory authority ahead
+  // of disk. Restore the prior row and make a best-effort synchronous rollback
+  // before the caller considers changing the live entity.
+  let rollbackWriteResult = null;
+  let rollbackFlushResult = null;
+  try {
+    rollbackWriteResult = upsertNativeWreck(wreckRecord);
+    if (rollbackWriteResult && rollbackWriteResult.success === true) {
+      rollbackFlushResult = database.flushTableSync(TABLE.WRECKS);
+    }
+  } catch (_error) {
+    rollbackWriteResult = rollbackWriteResult || { success: false };
+    rollbackFlushResult = rollbackFlushResult || { success: false };
+  }
+  return {
+    success: false,
+    errorMsg:
+      flushResult && flushResult.errorMsg ||
+      "NPC_NATIVE_WRECK_ABANDON_FLUSH_FAILED",
+    rollbackSuccess: Boolean(
+      rollbackWriteResult &&
+      rollbackWriteResult.success === true &&
+      rollbackFlushResult &&
+      rollbackFlushResult.success === true
+    ),
+  };
 }
 
 function removeNativeWreck(wreckID) {
@@ -735,6 +832,10 @@ function removeNativeWreckItem(wreckItemID) {
   return removeCollectionRow(TABLE.WRECK_ITEMS, "items", wreckItemID);
 }
 
+function flushNativeWreckItemsSync() {
+  return database.flushTableSync(TABLE.WRECK_ITEMS);
+}
+
 function removeNativeWreckCascade(wreckID) {
   const normalizedWreckID = toPositiveInt(wreckID, 0);
   if (!normalizedWreckID) {
@@ -745,9 +846,23 @@ function removeNativeWreckCascade(wreckID) {
   }
 
   for (const itemRecord of listNativeWreckItemsForWreck(normalizedWreckID)) {
-    removeNativeWreckItem(itemRecord.wreckItemID);
+    const removeResult = removeNativeWreckItem(itemRecord.wreckItemID);
+    if (!removeResult || removeResult.success !== true) {
+      return removeResult || {
+        success: false,
+        errorMsg: "NPC_NATIVE_WRECK_ITEM_REMOVE_FAILED",
+      };
+    }
   }
-  removeNativeWreck(normalizedWreckID);
+  if (getNativeWreck(normalizedWreckID)) {
+    const wreckRemoveResult = removeNativeWreck(normalizedWreckID);
+    if (!wreckRemoveResult || wreckRemoveResult.success !== true) {
+      return wreckRemoveResult || {
+        success: false,
+        errorMsg: "NPC_NATIVE_WRECK_REMOVE_FAILED",
+      };
+    }
+  }
   return {
     success: true,
     data: {
@@ -816,6 +931,29 @@ function buildNativeWreckInventoryItem(wreckID) {
   const entityScopeMetadata = buildStoredEntityScopeMetadata(wreckRecord, {
     projectAirInstanceToDungeonSite: true,
   });
+  const hasAbyssalScopeSignal = Boolean(
+    String(wreckRecord.sceneKind || "").trim().toLowerCase() === "abyssal" ||
+    String(wreckRecord.sceneKey || "").trim().startsWith("abyssal-run:") ||
+    [
+      "abyssalRunID",
+      "evejsAbyssalInstanceID",
+      "evejsAbyssalPocketInstanceID",
+      "abyssalRoomIndex",
+      "evejsAbyssalRoomIndex",
+    ].some((fieldName) => Object.prototype.hasOwnProperty.call(wreckRecord, fieldName))
+  );
+  const interactionScope = hasAbyssalScopeSignal
+    ? resolveEntityInteractionScope(wreckRecord)
+    : null;
+  if (interactionScope && !interactionScope.valid) {
+    return null;
+  }
+  const completeScopeMetadata = hasAbyssalScopeSignal
+    ? {
+        ...entityScopeMetadata,
+        ...buildChildEntityScopeMetadata(wreckRecord),
+      }
+    : entityScopeMetadata;
 
   return {
     itemID: toPositiveInt(wreckRecord.wreckID, 0),
@@ -840,9 +978,9 @@ function buildNativeWreckInventoryItem(wreckID) {
       targetPoint,
       mode: String(wreckRecord.mode || "STOP"),
       speedFraction: Number(wreckRecord.speedFraction || 0),
-      ...entityScopeMetadata,
+      ...completeScopeMetadata,
     },
-    ...entityScopeMetadata,
+    ...completeScopeMetadata,
     conditionState: cloneValue(wreckRecord.conditionState || null),
     createdAtMs: Number(wreckRecord.createdAtMs || 0) || null,
     expiresAtMs: Number(wreckRecord.expiresAtMs || 0) || null,
@@ -882,6 +1020,7 @@ function buildNativeWreckContents(wreckID) {
 
 module.exports = {
   TABLE,
+  TRANSIENT_ID_BASES,
   INVALID_PERSISTENT_IDENTITY,
   buildStoredEntityScopeMetadata,
   resolveStoredEntityScopeMetadata,
@@ -899,6 +1038,7 @@ module.exports = {
   listNativeModulesForEntity,
   upsertNativeModule,
   removeNativeModule,
+  listNativeCargo,
   listNativeCargoForEntity,
   upsertNativeCargo,
   removeNativeCargo,
@@ -908,16 +1048,17 @@ module.exports = {
   upsertNativeController,
   removeNativeController,
   removeNativeEntityCascade,
-  removeNativeEntitiesCascade,
   listNativeWrecks,
   getNativeWreck,
   upsertNativeWreck,
+  setNativeWreckLootAbandoned,
   removeNativeWreck,
   listNativeWreckItems,
   getNativeWreckItem,
   listNativeWreckItemsForWreck,
   upsertNativeWreckItem,
   removeNativeWreckItem,
+  flushNativeWreckItemsSync,
   removeNativeWreckCascade,
   buildNativeSlimModuleTuples,
   buildNativeFittedItems,

@@ -10,7 +10,7 @@
 //     later in the same logs are mission-COMPLETION rewards, a separate mechanic.) So we apply the
 //     direct hit only, with { disableDerived: true }.
 //   - The applied raw modification is a FIXED per-entity base value. CCP's true per-entity table is
-//     unpublished and not in the SDE; we use config.factionStandingLossPerKillRaw uniformly. Both
+//     unpublished and not in the SDE; we use one golden-log-calibrated value uniformly. Both
 //     golden kills reproduce -0.00006875 exactly via new = S + (10 + S) * base:
 //       Alluring:    (10 - 1.6405272743884327) * -0.00006875 -> -1.6411019881383184  (log match)
 //       GoneBerserk: (10 - 1.6416766623766341) * -0.00006875 -> -1.6422512971060956  (log match)
@@ -23,57 +23,24 @@
 const path = require("path");
 
 const config = require(path.join(__dirname, "../../config"));
+const log = require(path.join(__dirname, "../../utils/logger"));
 const standingRuntime = require(path.join(__dirname, "./standingRuntime"));
 const npcStandingsAuthority = require(path.join(__dirname, "./npcStandingsAuthority"));
 const factionState = require(path.join(__dirname, "../faction/factionState"));
+const {
+  resolveExactAbyssalNpcOutcomeContext,
+  shouldSuppressResolvedAbyssalNpcOutcome,
+} = require(path.join(__dirname, "../_shared/abyssalNpcOutcomePolicy"));
 
 const EVENT_STANDING_COMBAT_AGGRESSION = 76;
 const DEBOUNCE_WINDOW_MS = 10 * 60 * 1000;
-// Resident track R1 gain path: a "designated enemy" is a faction the victim faction's own
-// authored relations mark at or below this standing. The shipped npcStandingsAuthority payload
-// expresses enmity as exactly -1 (sources executiveEnemyFaction / enemyID; global minimum is -1),
-// so the threshold MUST be -1 — anything stronger filters every relation out and kills the gain
-// path silently. At most ENEMY_FACTION_GAIN_LIMIT enemies receive the gain, ordered by strongest
-// enmity, then executiveEnemyFaction (the designated arch-enemy) ahead of ordinary enemy rows,
-// then lowest toID — a total order, so ties never pick nondeterministically.
+const FACTION_STANDING_LOSS_PER_KILL_RAW = -0.00006875;
 const ENEMY_RELATION_MAX_STANDING = -1;
 const ENEMY_FACTION_GAIN_LIMIT = 2;
 
-function enemySourceRank(relation) {
-  return String(relation && relation.source || "") === "executiveEnemyFaction" ? 0 : 1;
-}
-
-// (characterID:factionID:systemID) -> { appliedAtMs, wallMs }. appliedAtMs is the CALLER's
-// clock (the destruction pipeline passes per-scene sim time, which lags wall clock under
-// dilation) and is only ever compared against the same caller's later timestamps, so the
-// per-key debounce stays consistent. wallMs is a Date.now() stamp used exclusively by the
-// sweep: sweeping on a caller clock would delete other scenes' still-valid entries whenever
-// their clocks disagree. Retention is 12x the window — at the 0.1 dilation floor a 10-minute
-// sim window spans up to 100 wall-minutes, so nothing debounce-valid is ever swept early.
-// In-memory: a restart clears the debounce (worst case one extra hit lands), which is harmless.
-// Without the sweep, roaming hunters would accrete keys (loss + "gain:" namespaces) for every
-// system visited, forever.
+// (characterID:factionID:systemID) -> last-applied wall-clock ms. In-memory: a restart clears the
+// debounce (worst case one extra hit lands), which is harmless for a 10-minute window.
 const lastAppliedByKey = new Map();
-const DEBOUNCE_SWEEP_INTERVAL_MS = 60 * 1000;
-const DEBOUNCE_RETENTION_MS = 12 * DEBOUNCE_WINDOW_MS;
-let lastDebounceSweepAtWallMs = 0;
-
-function sweepExpiredDebounce() {
-  const nowWallMs = Date.now();
-  if (nowWallMs - lastDebounceSweepAtWallMs < DEBOUNCE_SWEEP_INTERVAL_MS) {
-    return;
-  }
-  lastDebounceSweepAtWallMs = nowWallMs;
-  for (const [key, entry] of lastAppliedByKey) {
-    if (
-      !entry ||
-      !Number.isFinite(entry.wallMs) ||
-      nowWallMs - entry.wallMs >= DEBOUNCE_RETENTION_MS
-    ) {
-      lastAppliedByKey.delete(key);
-    }
-  }
-}
 
 function toPositiveInt(value, fallback = 0) {
   const numeric = Math.trunc(Number(value));
@@ -105,6 +72,22 @@ function recordNpcFactionStandingLoss(victimEntity = {}, killerCharacterID, opti
   if (!characterID) {
     return null;
   }
+  const abyssalContext = resolveExactAbyssalNpcOutcomeContext(victimEntity);
+  if (shouldSuppressResolvedAbyssalNpcOutcome(
+    abyssalContext,
+    "suppressStandings",
+  )) {
+    return {
+      applied: false,
+      suppressed: true,
+      reason: abyssalContext.invalidAbyssalOutcomeAuthority
+        ? "ABYSSAL_NPC_AUTHORITY_INVALID"
+        : "ABYSSAL_NPC_POLICY",
+      characterID,
+      abyssalRunID: abyssalContext.runID,
+      abyssalRoomIndex: abyssalContext.roomIndex,
+    };
+  }
   const factionID = resolveVictimFactionID(victimEntity);
   if (!factionID) {
     return null;
@@ -114,20 +97,15 @@ function recordNpcFactionStandingLoss(victimEntity = {}, killerCharacterID, opti
     toPositiveInt(victimEntity && victimEntity.systemID, 0),
   );
   const nowMs = Number.isFinite(Number(options.nowMs)) ? Math.trunc(Number(options.nowMs)) : Date.now();
-  sweepExpiredDebounce();
 
   // Debounce per (character, faction, system) on a 10-minute window.
   const key = `${characterID}:${factionID}:${systemID}`;
-  const lastEntry = lastAppliedByKey.get(key);
-  const lastMs = lastEntry ? lastEntry.appliedAtMs : NaN;
+  const lastMs = lastAppliedByKey.get(key);
   if (Number.isFinite(lastMs) && nowMs - lastMs < DEBOUNCE_WINDOW_MS) {
     return { applied: false, debounced: true, characterID, factionID, systemID };
   }
 
-  const rawChange = Number(config.factionStandingLossPerKillRaw);
-  if (!Number.isFinite(rawChange) || rawChange >= 0) {
-    return null;
-  }
+  const rawChange = FACTION_STANDING_LOSS_PER_KILL_RAW;
 
   let result;
   try {
@@ -148,13 +126,14 @@ function recordNpcFactionStandingLoss(victimEntity = {}, killerCharacterID, opti
     );
   } catch (error) {
     // Best-effort: a standing-apply failure must never break the kill pipeline.
+    log.debug(`[FactionKillStanding] standing loss for character ${characterID} with faction ${factionID} failed: ${error && error.message}`);
     return null;
   }
 
   if (!result || result.success !== true) {
     return null;
   }
-  lastAppliedByKey.set(key, { appliedAtMs: nowMs, wallMs: Date.now() });
+  lastAppliedByKey.set(key, nowMs);
   return {
     applied: true,
     characterID,
@@ -165,11 +144,10 @@ function recordNpcFactionStandingLoss(victimEntity = {}, killerCharacterID, opti
   };
 }
 
-// Resident track R1 (config-gated, NOT TQ parity): the same kill grants a small standing gain
-// with the victim faction's designated enemies, giving residents a combat path to repair or build
-// empire standing by hunting pirates. Applied per enemy faction with the same 10-minute
-// (character, faction, system) debounce idiom as the loss path, using a "gain:"-prefixed key so
-// gain and loss windows never suppress each other. Returns applied results, or null.
+function enemySourceRank(relation) {
+  return String(relation && relation.source || "") === "executiveEnemyFaction" ? 0 : 1;
+}
+
 function recordNpcFactionStandingGains(victimEntity = {}, killerCharacterID, options = {}) {
   if (config.factionStandingGainOnKillEnabled !== true) {
     return null;
@@ -177,6 +155,19 @@ function recordNpcFactionStandingGains(victimEntity = {}, killerCharacterID, opt
   const characterID = toPositiveInt(killerCharacterID, 0);
   if (!characterID) {
     return null;
+  }
+  const abyssalContext = resolveExactAbyssalNpcOutcomeContext(victimEntity);
+  if (shouldSuppressResolvedAbyssalNpcOutcome(abyssalContext, "suppressStandings")) {
+    return {
+      applied: false,
+      suppressed: true,
+      reason: abyssalContext.invalidAbyssalOutcomeAuthority
+        ? "ABYSSAL_NPC_AUTHORITY_INVALID"
+        : "ABYSSAL_NPC_POLICY",
+      characterID,
+      abyssalRunID: abyssalContext.runID,
+      abyssalRoomIndex: abyssalContext.roomIndex,
+    };
   }
   const victimFactionID = resolveVictimFactionID(victimEntity);
   if (!victimFactionID) {
@@ -190,26 +181,31 @@ function recordNpcFactionStandingGains(victimEntity = {}, killerCharacterID, opt
     options.systemID,
     toPositiveInt(victimEntity && victimEntity.systemID, 0),
   );
-  const nowMs = Number.isFinite(Number(options.nowMs)) ? Math.trunc(Number(options.nowMs)) : Date.now();
-  sweepExpiredDebounce();
+  const nowMs = Number.isFinite(Number(options.nowMs))
+    ? Math.trunc(Number(options.nowMs))
+    : Date.now();
 
   let enemyFactionIDs;
   try {
-    enemyFactionIDs = npcStandingsAuthority.getRelationsForOwner(victimFactionID)
-      .filter((relation) => (
+    const relations = npcStandingsAuthority.getRelationsForOwner(victimFactionID);
+    if (!Array.isArray(relations)) {
+      return null;
+    }
+    enemyFactionIDs = relations
+      .filter((relation) =>
         Number.isFinite(relation && relation.standing) &&
         relation.standing <= ENEMY_RELATION_MAX_STANDING &&
-        factionState.isFactionID(toPositiveInt(relation && relation.toID, 0))
-      ))
-      .sort((left, right) => (
+        factionState.isFactionID(toPositiveInt(relation && relation.toID, 0)),
+      )
+      .sort((left, right) =>
         (left.standing - right.standing) ||
         (enemySourceRank(left) - enemySourceRank(right)) ||
-        (toPositiveInt(left.toID, 0) - toPositiveInt(right.toID, 0))
-      ))
+        (toPositiveInt(left.toID, 0) - toPositiveInt(right.toID, 0)),
+      )
       .slice(0, ENEMY_FACTION_GAIN_LIMIT)
       .map((relation) => toPositiveInt(relation.toID, 0))
       .filter(Boolean);
-  } catch (error) {
+  } catch (_error) {
     return null;
   }
   if (!enemyFactionIDs.length) {
@@ -219,8 +215,7 @@ function recordNpcFactionStandingGains(victimEntity = {}, killerCharacterID, opt
   const applied = [];
   for (const enemyFactionID of enemyFactionIDs) {
     const key = `gain:${characterID}:${enemyFactionID}:${systemID}`;
-    const lastEntry = lastAppliedByKey.get(key);
-    const lastMs = lastEntry ? lastEntry.appliedAtMs : NaN;
+    const lastMs = lastAppliedByKey.get(key);
     if (Number.isFinite(lastMs) && nowMs - lastMs < DEBOUNCE_WINDOW_MS) {
       continue;
     }
@@ -228,48 +223,37 @@ function recordNpcFactionStandingGains(victimEntity = {}, killerCharacterID, opt
     try {
       result = standingRuntime.applyStandingChanges(
         characterID,
-        [
-          {
-            ownerID: enemyFactionID,
-            rawChange,
-            eventTypeID: EVENT_STANDING_COMBAT_AGGRESSION,
-            applySocial: false,
-            msg: "Combat assistance",
-            int_1: toPositiveInt(victimEntity && victimEntity.typeID, null),
-          },
-        ],
+        [{
+          ownerID: enemyFactionID,
+          rawChange,
+          eventTypeID: EVENT_STANDING_COMBAT_AGGRESSION,
+          applySocial: false,
+          msg: "Combat assistance",
+          int_1: toPositiveInt(victimEntity && victimEntity.typeID, null),
+        }],
         { disableDerived: true },
       );
-    } catch (error) {
-      // Best-effort: a standing-apply failure must never break the kill pipeline.
+    } catch (_error) {
       continue;
     }
     if (!result || result.success !== true) {
       continue;
     }
-    lastAppliedByKey.set(key, { appliedAtMs: nowMs, wallMs: Date.now() });
+    lastAppliedByKey.set(key, nowMs);
     applied.push({
       factionID: enemyFactionID,
       rawChange,
       changes: result.appliedChanges || result.data || null,
     });
   }
-  if (!applied.length) {
-    return null;
-  }
-  return {
-    applied: true,
-    characterID,
-    victimFactionID,
-    systemID,
-    gains: applied,
-  };
+  return applied.length
+    ? { applied: true, characterID, victimFactionID, systemID, gains: applied }
+    : null;
 }
 
 // Test/maintenance hook.
 function _resetDebounce() {
   lastAppliedByKey.clear();
-  lastDebounceSweepAtWallMs = 0;
 }
 
 module.exports = {

@@ -1,8 +1,12 @@
+"use strict";
+
 const net = require("net");
 const path = require("path");
 
 const config = require(path.join(__dirname, "../../config"));
 const log = require(path.join(__dirname, "../../utils/logger"));
+
+const REQUIRED_MARKET_DAEMON_CAPABILITY = "idempotent-fill-v1";
 
 function normalizePositiveInteger(value, fallback) {
   const numericValue = Number(value);
@@ -10,6 +14,21 @@ function normalizePositiveInteger(value, fallback) {
     return Math.trunc(numericValue);
   }
   return fallback;
+}
+
+function annotateMarketDaemonError(error, details = {}) {
+  const annotated = error instanceof Error
+    ? error
+    : new Error(String(error || "market daemon RPC request failed"));
+  if (details.code) annotated.code = details.code;
+  if (details.method) annotated.marketDaemonMethod = String(details.method);
+  if (details.requestSent !== undefined) {
+    annotated.marketDaemonRequestSent = details.requestSent === true;
+  }
+  if (details.outcomeUnknown !== undefined) {
+    annotated.marketDaemonOutcomeUnknown = details.outcomeUnknown === true;
+  }
+  return annotated;
 }
 
 class MarketDaemonClient {
@@ -41,6 +60,8 @@ class MarketDaemonClient {
     this._backgroundReconnectEnabled = false;
     this._reconnectTimer = null;
     this._lastConnectFailureLogAt = 0;
+    this._compatibilityVerified = false;
+    this._compatibilityPromise = null;
   }
 
   getStatus() {
@@ -59,18 +80,40 @@ class MarketDaemonClient {
   }
 
   async startupCheck() {
-    await this.call("StartupCheck", {});
+    await this.ensureConnected();
+    await this._ensureCompatible();
     return null;
   }
 
   async call(method, params = {}, options = {}) {
+    try {
+      await this.ensureConnected(options);
+    } catch (error) {
+      throw annotateMarketDaemonError(error, {
+        code: error && error.code || "MARKET_DAEMON_CONNECT_FAILED",
+        method,
+        requestSent: false,
+        outcomeUnknown: false,
+      });
+    }
+    if (method !== "Health") {
+      try {
+        await this._ensureCompatible();
+      } catch (error) {
+        throw annotateMarketDaemonError(error, {
+          code: error && error.code || "MARKET_DAEMON_INCOMPATIBLE",
+          method,
+          requestSent: false,
+          outcomeUnknown: false,
+        });
+      }
+    }
     const maximumAttempts = Math.max(
       1,
       normalizePositiveInteger(options.maximumAttempts, 4),
     );
     for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
       try {
-        await this.ensureConnected(options);
         return await this._sendRequest(method, params);
       } catch (error) {
         const transientDatabaseLock = String(error && error.message || "")
@@ -87,7 +130,41 @@ class MarketDaemonClient {
         });
       }
     }
-    return null;
+  }
+
+  async _ensureCompatible() {
+    if (this._compatibilityVerified) {
+      return true;
+    }
+    if (this._compatibilityPromise) {
+      return this._compatibilityPromise;
+    }
+    this._compatibilityPromise = this._sendRequest("Health", {})
+      .then((health) => {
+        const capabilities = Array.isArray(health && health.capabilities)
+          ? health.capabilities.map(String)
+          : [];
+        if (!capabilities.includes(REQUIRED_MARKET_DAEMON_CAPABILITY)) {
+          throw annotateMarketDaemonError(
+            new Error(
+              `market daemon is incompatible: missing ` +
+                `${REQUIRED_MARKET_DAEMON_CAPABILITY}; rebuild the Docker image`,
+            ),
+            {
+              code: "MARKET_DAEMON_INCOMPATIBLE",
+              method: "Health",
+              requestSent: false,
+              outcomeUnknown: false,
+            },
+          );
+        }
+        this._compatibilityVerified = true;
+        return true;
+      })
+      .finally(() => {
+        this._compatibilityPromise = null;
+      });
+    return this._compatibilityPromise;
   }
 
   async ensureConnected(options = {}) {
@@ -131,7 +208,7 @@ class MarketDaemonClient {
         try {
           socket.destroy();
         } catch (destroyError) {
-          // ignore
+          // ignored: the connection already failed; destroying the socket is cleanup
         }
         this._logConnectFailure(error, options);
         reject(error);
@@ -148,6 +225,7 @@ class MarketDaemonClient {
         this._buffer = "";
         this._socket = socket;
         this._connected = true;
+        this._compatibilityVerified = false;
         this._attachSocket(socket);
         log.info(
           `[MarketDaemonClient] Connected to market daemon RPC at ${this.host}:${this.port}`,
@@ -227,6 +305,8 @@ class MarketDaemonClient {
       }
       const wasConnected = this._connected;
       this._connected = false;
+      this._compatibilityVerified = false;
+      this._compatibilityPromise = null;
       this._buffer = "";
       this._failPendingRequests(
         new Error("market daemon RPC connection closed"),
@@ -266,7 +346,15 @@ class MarketDaemonClient {
 
     if (response.ok === false) {
       pendingRequest.reject(
-        new Error(response.error || "market daemon RPC request failed"),
+        annotateMarketDaemonError(
+          new Error(response.error || "market daemon RPC request failed"),
+          {
+            code: "MARKET_DAEMON_RPC_REJECTED",
+            method: pendingRequest.method,
+            requestSent: true,
+            outcomeUnknown: false,
+          },
+        ),
       );
       return;
     }
@@ -294,13 +382,22 @@ class MarketDaemonClient {
       const timeoutHandle = setTimeout(() => {
         this._pendingRequests.delete(requestId);
         reject(
-          new Error(
-            `market daemon RPC request timed out after ${this.requestTimeoutMs} ms`,
+          annotateMarketDaemonError(
+            new Error(
+              `market daemon RPC request timed out after ${this.requestTimeoutMs} ms`,
+            ),
+            {
+              code: "MARKET_DAEMON_RPC_TIMEOUT",
+              method,
+              requestSent: true,
+              outcomeUnknown: true,
+            },
           ),
         );
       }, this.requestTimeoutMs);
 
       this._pendingRequests.set(requestId, {
+        method,
         resolve,
         reject,
         timeoutHandle,
@@ -318,7 +415,12 @@ class MarketDaemonClient {
 
         clearTimeout(timeoutHandle);
         this._pendingRequests.delete(requestId);
-        reject(error);
+        reject(annotateMarketDaemonError(error, {
+          code: error && error.code || "MARKET_DAEMON_RPC_WRITE_FAILED",
+          method,
+          requestSent: true,
+          outcomeUnknown: true,
+        }));
       });
     });
   }
@@ -326,7 +428,15 @@ class MarketDaemonClient {
   _failPendingRequests(error) {
     for (const [requestId, pendingRequest] of this._pendingRequests.entries()) {
       clearTimeout(pendingRequest.timeoutHandle);
-      pendingRequest.reject(error);
+      pendingRequest.reject(annotateMarketDaemonError(
+        new Error(error && error.message || "market daemon RPC connection closed"),
+        {
+          code: error && error.code || "MARKET_DAEMON_RPC_CONNECTION_CLOSED",
+          method: pendingRequest.method,
+          requestSent: true,
+          outcomeUnknown: true,
+        },
+      ));
       this._pendingRequests.delete(requestId);
     }
   }

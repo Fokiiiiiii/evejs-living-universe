@@ -96,24 +96,6 @@ define(["npcControlState"], {
   domain: "in-space",
   confidence: CONFIDENCE.SCANNER,
 });
-define(["liveEventRuntime"], {
-  tier: TIERS.RUNTIME,
-  domain: "in-space",
-  confidence: CONFIDENCE.SCANNER,
-  note: "Persistent live-event lifecycle, transaction journal, and bounded archive state.",
-});
-define(["livingEconomyEventJournal"], {
-  tier: TIERS.RUNTIME,
-  domain: "in-space",
-  confidence: CONFIDENCE.SCANNER,
-  note: "Durable row-scoped source journal feeding the X-Eve event inbox.",
-});
-define(["xEveRuntime"], {
-  tier: TIERS.RUNTIME,
-  domain: "service:x-eve",
-  confidence: CONFIDENCE.SCANNER,
-  note: "X-Eve accounts, balanced transaction journal, event inbox/outbox, and bounded work orders.",
-});
 define(
   [
     "npcEntities",
@@ -152,25 +134,97 @@ define(["calendarEvents", "calendarResponses"], {
 define(["contractRuntime"], {
   tier: TIERS.RUNTIME, domain: "service:contracts", confidence: CONFIDENCE.SCANNER,
 });
+define(["liveEventRuntime"], {
+  tier: TIERS.RUNTIME,
+  domain: "in-space",
+  confidence: CONFIDENCE.SCANNER,
+  note: "Persistent live-event lifecycle, transaction journal, and bounded archive state.",
+});
+define(["livingEconomyEventJournal"], {
+  tier: TIERS.RUNTIME,
+  domain: "in-space",
+  confidence: CONFIDENCE.SCANNER,
+  note: "Durable row-scoped source journal feeding the X-Eve event inbox.",
+});
+define(["xEveRuntime"], {
+  tier: TIERS.RUNTIME,
+  domain: "service:x-eve",
+  confidence: CONFIDENCE.SCANNER,
+  note: "X-Eve accounts, transaction journal, event inbox/outbox, and work orders.",
+});
 define(["industrialHirelingContracts"], {
   tier: TIERS.RUNTIME,
   domain: "service:industrialHirelings",
   confidence: CONFIDENCE.SCANNER,
-  note: "Persistent player-to-NPC industrial employment contracts, orders, and bounded history.",
+  note: "Persistent player-to-NPC industrial employment contracts and orders.",
 });
 define(["corporationBills"], {
   tier: TIERS.RUNTIME, domain: "service:account", confidence: CONFIDENCE.SCANNER,
 });
-define(["corporationGoals", "corporationVotes", "lpWallets"], {
+define(["walletAuthorityState"], {
+  tier: TIERS.RUNTIME,
+  domain: "service:account",
+  confidence: CONFIDENCE.INFERRED,
+  note: "Process-owned durable character and corporation wallet projections and command receipts.",
+});
+define(["allianceDepartures", "allianceFoundings", "corporationFoundings", "corporationGoals", "corporationLiquidations", "corporationVotes", "lpWallets"], {
   tier: TIERS.RUNTIME, domain: "service:corporation", confidence: CONFIDENCE.SCANNER,
 });
 define(["dailyGoals"], {
   tier: TIERS.RUNTIME, domain: "service:dailyGoals", confidence: CONFIDENCE.SCANNER,
 });
+define(["achievements"], {
+  tier: TIERS.RUNTIME, domain: "service:achievement", confidence: CONFIDENCE.SCANNER,
+  note: "Native achievement progress, reward claim receipts, and character titles.",
+});
+define(["contrabandPenalties"], {
+  tier: TIERS.RUNTIME, domain: "service:security", confidence: CONFIDENCE.INFERRED,
+  note: "Durable confiscation, wallet-fine, and standing penalty settlements.",
+});
+define(["crimewatchRuntime"], {
+  tier: TIERS.RUNTIME,
+  domain: "service:security",
+  confidence: CONFIDENCE.INFERRED,
+  note: "Durable Crimewatch safety, combat-timer, and criminal/suspect flag state.",
+});
+define(["contractSettlements"], {
+  tier: TIERS.RUNTIME,
+  domain: "service:contracts",
+  confidence: CONFIDENCE.INFERRED,
+  note: "Durable contract creation and lifecycle wallet/custody settlements.",
+});
+define(["reprocessingSettlements"], {
+  tier: TIERS.RUNTIME, domain: "service:reprocessing", confidence: CONFIDENCE.INFERRED,
+  note: "Durable input/output escrow and wallet settlement for reprocessing.",
+});
+define(["missionRewardSettlements"], {
+  tier: TIERS.RUNTIME, domain: "service:agent", confidence: CONFIDENCE.INFERRED,
+  note: "Durable mission cargo, reward, wallet, LP, standing, and completion settlements.",
+});
+define(["planetaryCustomsSettlements"], {
+  tier: TIERS.RUNTIME, domain: "service:planet", confidence: CONFIDENCE.INFERRED,
+  note: "Durable planetary customs tax, import, export, and escrow settlements.",
+});
+define(["abyssalFilamentCompensations"], {
+  tier: TIERS.RUNTIME,
+  domain: "service:activity",
+  confidence: CONFIDENCE.INFERRED,
+  note: "Durable Abyssal filament compensation claims keyed by deployment token.",
+});
+define(["abyssalRecoveryTombstones"], {
+  tier: TIERS.RUNTIME,
+  domain: "service:activity",
+  confidence: CONFIDENCE.INFERRED,
+  note:
+    "Durable Abyssal run-recovery tombstones, indexed by character, ship, and host " +
+    "location, used to evacuate a stranded pilot after a crash or restart. Written " +
+    "by abyssalMgrService via raw database.ensureTable/read/write and persisted in " +
+    "SQLite.",
+});
 define(["dungeonRuntimeState"], {
   tier: TIERS.RUNTIME, domain: "service:dungeon", confidence: CONFIDENCE.SCANNER,
 });
-define(["evermarkEntitlements"], {
+define(["evermarkEntitlements", "evermarkPurchases", "lpStorePurchases"], {
   tier: TIERS.RUNTIME, domain: "service:evermarks", confidence: CONFIDENCE.SCANNER,
 });
 define(["identityState"], {
@@ -195,21 +249,24 @@ define(["mapTelemetry", "solarSystemInterferenceState"], {
 define(["marketEscrow", "marketRuntime"], {
   tier: TIERS.RUNTIME, domain: "service:market", confidence: CONFIDENCE.SCANNER,
 });
+define(["tradeRuntime"], {
+  tier: TIERS.RUNTIME, domain: "service:trade", confidence: CONFIDENCE.SCANNER,
+});
 define(["miningLedger", "miningRuntimeState"], {
   tier: TIERS.RUNTIME, domain: "service:mining", confidence: CONFIDENCE.SCANNER,
 });
-define(["missionRuntimeState"], {
+define(["missionRuntimeState", "researchRuntimeState"], {
   tier: TIERS.RUNTIME, domain: "service:agent", confidence: CONFIDENCE.SCANNER,
 });
 define(["moduleGroupingState"], {
   tier: TIERS.RUNTIME, domain: "service:moduleGrouping", confidence: CONFIDENCE.SCANNER,
 });
-define(["moonExtractions", "structureAssetSafety", "structurePaintwork", "structureProfiles", "structureTetherRestrictions"], {
+define(["moonExtractions", "moonMiningFields", "structureAssetSafety", "structureDeliveryRuntime", "structurePaintwork", "structureProfiles", "structureTetherRestrictions"], {
   tier: TIERS.RUNTIME, domain: "service:structure", confidence: CONFIDENCE.SCANNER,
 });
-define(["newEdenStoreRuntime", "newEdenStore"], {
+define(["newEdenStoreRuntime", "newEdenStore", "newEdenStorePurchaseSettlements"], {
   tier: TIERS.RUNTIME, domain: "service:newEdenStore", confidence: CONFIDENCE.SCANNER,
-  note: "newEdenStore is runtime (written by storeState via AUTHORITY_TABLE), SQLite-backed as of the 2026-06-25 backfill.",
+  note: "Store catalog/runtime state plus durable purchase and fulfillment settlement intents.",
 });
 define(["notifications"], {
   tier: TIERS.RUNTIME, domain: "service:notifications", confidence: CONFIDENCE.SCANNER,
@@ -233,6 +290,12 @@ define(["raffles", "rafflesRuntime"], {
 define(["sharedSettings"], {
   tier: TIERS.RUNTIME, domain: "service:settings", confidence: CONFIDENCE.SCANNER,
 });
+define(["scheduledJobs"], {
+  tier: TIERS.RUNTIME,
+  domain: "service:scheduler",
+  confidence: CONFIDENCE.INFERRED,
+  note: "Durable scheduler jobs and leases, owned by the scheduler process.",
+});
 define(["shipCosmetics", "shipDirt", "shipKillCounters", "shipLogoFittings"], {
   tier: TIERS.RUNTIME, domain: "service:ship", confidence: CONFIDENCE.SCANNER,
 });
@@ -246,12 +309,34 @@ define(["bookmarks", "bookmarkFolders", "bookmarkGroups", "bookmarkKnownFolders"
   tier: TIERS.RUNTIME, domain: "service:bookmark", confidence: CONFIDENCE.INFERRED,
   note: "Written via services/bookmark/bookmarkRuntimeStore.js (table constants forwarded through a wrapper).",
 });
-define(["industryJobs", "industryRuntime", "industryBlueprintState", "industryFacilityState"], {
+define([
+  "industryJobs",
+  "industryRuntime",
+  "industryBlueprintState",
+  "industryFacilityState",
+  "industryInstallSettlements",
+], {
   tier: TIERS.RUNTIME, domain: "service:industry", confidence: CONFIDENCE.INFERRED,
-  note: "Written via industryRuntimeState/industryFacilityState param-helpers.",
+  note: "Written via industry runtime/facility state and durable install settlement helpers.",
+});
+define(["jumpCloneActivationSettlements", "jumpCloneInstallSettlements"], {
+  tier: TIERS.RUNTIME,
+  domain: "service:station",
+  confidence: CONFIDENCE.INFERRED,
+  note: "Durable clone install and activation wallet/live-transition settlements.",
+});
+define(["jumpBridgeSettlements"], {
+  tier: TIERS.RUNTIME,
+  domain: "service:structure",
+  confidence: CONFIDENCE.INFERRED,
+  note: "Durable Ansiblex fuel, wallet, and live-transition settlements.",
 });
 define(["reprocessingFacilityState"], {
   tier: TIERS.RUNTIME, domain: "service:reprocessing", confidence: CONFIDENCE.INFERRED,
+});
+define(["repairOperations"], {
+  tier: TIERS.RUNTIME, domain: "service:repair", confidence: CONFIDENCE.INFERRED,
+  note: "Durable repair charge, target-state, and structure-tax settlement intents.",
 });
 define(["sovereignty"], {
   tier: TIERS.RUNTIME, domain: "service:sovereignty", confidence: CONFIDENCE.INFERRED,
@@ -272,10 +357,10 @@ define(
     "agentAuthority", "asteroidBelts", "asteroidFieldStyles", "asteroidTypesBySolarSystemID",
     "capitalNpcAuthority", "celestials", "characterCreationBloodlines", "characterCreationRaces",
     "characterCreationSchools", "clientEntityStandings", "clientTypeLists", "dbuffCollections",
-    "dungeonAuthority", "dynamicItemAttributes", "evermarksCatalog", "expertSystems",
+    "dungeonAuthority", "dungeonClientContent", "dynamicItemAttributes", "evermarksCatalog", "expertSystems",
     "explorationAuthority", "explorationWormholeStatic", "factions", "fighterAbilities",
     "industryBlueprints", "industryFacilities", "itemIcons", "itemTypes", "liveEventDefinitions", "mapTagsAuthority",
-    "missionAuthority", "movementAttributes", "npcBehaviorProfiles",
+    "missionAuthority", "moonMiningPoints", "movementAttributes", "npcBehaviorProfiles",
     "npcHostileUtilities", "npcLoadouts", "npcLootTables", "npcProfiles", "npcSpawnGroups",
     "npcSpawnPools", "npcStandingsAuthority", "npcStartupRules", "planetSchematics",
     "reprocessingClientRandomizedMaterials", "reprocessingStatic", "shipCosmeticsCatalog",
@@ -288,6 +373,18 @@ define(
   { tier: TIERS.STATIC, domain: "sde", confidence: CONFIDENCE.INFERRED,
     note: "Treated as read-only reference (not in any runtime-persisted set)." },
 );
+define(["researchFieldAuthority"], {
+  tier: TIERS.STATIC,
+  domain: "sde",
+  confidence: CONFIDENCE.INFERRED,
+  note: "Research agents' fields, built by tools/DatabaseCreator/build-research-field-authority.js and read only by services/agent/researchAuthority.js through staticJsonTableReader. No runtime writer.",
+});
+define(["stationDockingPlacements"], {
+  tier: TIERS.STATIC,
+  domain: "sde",
+  confidence: CONFIDENCE.INFERRED,
+  note: "Build input only: tools/DatabaseCreator/database-creator.js reads it when it builds the stations table. The server never reads it at runtime.",
+});
 
 // ── Query API ────────────────────────────────────────────────────────
 function getTableOwnership(table) {

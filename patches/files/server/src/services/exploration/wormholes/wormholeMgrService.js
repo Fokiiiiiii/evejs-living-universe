@@ -1,3 +1,14 @@
+"use strict";
+
+const {
+  cloneVector,
+} = require("../../../common/vector");
+
+const {
+  toFiniteNumber,
+  toInt,
+} = require("../../../common/numbers");
+
 const path = require("path");
 
 const BaseService = require(path.join(__dirname, "../../baseService"));
@@ -31,24 +42,6 @@ const FILETIME_EPOCH_OFFSET = 116444736000000000n;
 const FILETIME_TICKS_PER_MS = 10000n;
 const WORMHOLE_ENTER_DISTANCE_METERS = 5000;
 const WORMHOLE_JUMP_HANDOFF_DELAY_MS = 1500;
-
-function toInt(value, fallback = 0) {
-  const numeric = Number(value);
-  return Number.isFinite(numeric) ? Math.trunc(numeric) : fallback;
-}
-
-function toFiniteNumber(value, fallback = 0) {
-  const numeric = Number(value);
-  return Number.isFinite(numeric) ? numeric : fallback;
-}
-
-function cloneVector(vector = null, fallback = { x: 0, y: 0, z: 0 }) {
-  return {
-    x: toFiniteNumber(vector && vector.x, fallback.x),
-    y: toFiniteNumber(vector && vector.y, fallback.y),
-    z: toFiniteNumber(vector && vector.z, fallback.z),
-  };
-}
 
 function subtractVectors(left, right) {
   return {
@@ -90,6 +83,8 @@ function syncSessionSystemWideEffectsForSystem(session, systemID) {
   return true;
 }
 
+const log = require("../../../utils/logger");
+
 function completeWormholeJump({
   session,
   sourceScene,
@@ -108,87 +103,95 @@ function completeWormholeJump({
   ) {
     return;
   }
+  const reservationPairID = toInt(pendingJump.pairID, 0);
+  const reservationToken = String(pendingJump.reservationToken || "");
   session._wormholeJumpPending = null;
 
-  const destinationSystemID = toInt(
-    prepareResult.data.destinationSystemID,
-    0,
-  );
-  if (destinationSystemID <= 0) {
-    notifyWormholeJumpCancel(session);
-    return;
-  }
-
-  const jumpResult = jumpSessionToSolarSystem(session, destinationSystemID, {
-    // Wormhole transit grants the same post-jump cloak as a stargate jump.
-    // completeStargateJump hardcodes this on its own attachSession; the shared
-    // solar-jump path takes it from options and defaults to false, so a
-    // wormhole jump arrived uncloaked until this was passed explicitly.
-    stargateJumpCloak: true,
-    spawnStateOverride: wormholeRuntime.buildJumpSpawnState(
-      prepareResult.data.pair,
-      prepareResult.data.role,
-      {
-        shipMass,
-        nowMs: Date.now(),
-        characterID: session.characterID,
-      },
-    ),
-  });
-  if (!jumpResult || jumpResult.success !== true) {
-    notifyWormholeJumpCancel(session);
-    return;
-  }
-
-  syncSessionSystemWideEffectsForSystem(session, destinationSystemID);
-
-  const commitNowMs = Date.now();
-  wormholeRuntime.commitJump(
-    sourceEndpointID,
-    session.characterID,
-    shipMass,
-    commitNowMs,
-  );
-
-  if (sourceScene) {
-    wormholeRuntime.syncSceneEntities(sourceScene, commitNowMs);
-  }
-
-  const destinationScene = spaceRuntime.getSceneForSession(session);
-  if (destinationScene) {
-    wormholeRuntime.syncSceneEntities(destinationScene, commitNowMs);
-    const arrivalShipEntity = destinationScene.getShipEntityForSession(session);
-    const destinationEndpointID = toInt(
-      prepareResult.data.destinationEndpointID,
+  try {
+    const destinationSystemID = toInt(
+      prepareResult.data.destinationSystemID,
       0,
     );
-    const destinationWormholeEntity = destinationScene.getEntityByID(destinationEndpointID);
-    if (arrivalShipEntity && destinationWormholeEntity) {
-      destinationScene.broadcastSpecialFx(
-        destinationWormholeEntity.itemID,
-        "effects.WormholeActivity",
+    if (destinationSystemID <= 0) {
+      notifyWormholeJumpCancel(session);
+      return;
+    }
+
+    const jumpResult = jumpSessionToSolarSystem(session, destinationSystemID, {
+      // Wormhole transit grants the same post-jump cloak as a stargate jump.
+      // completeStargateJump hardcodes this on its own attachSession; the shared
+      // solar-jump path takes it from options and defaults to false, so a
+      // wormhole jump arrived uncloaked until this was passed explicitly.
+      stargateJumpCloak: true,
+      spawnStateOverride: wormholeRuntime.buildJumpSpawnState(
+        prepareResult.data.pair,
+        prepareResult.data.role,
         {
-          excludedSession: session,
+          shipMass,
+          nowMs: Date.now(),
+          characterID: session.characterID,
         },
-        arrivalShipEntity,
+      ),
+    });
+    if (!jumpResult || jumpResult.success !== true) {
+      notifyWormholeJumpCancel(session);
+      return;
+    }
+
+    syncSessionSystemWideEffectsForSystem(session, destinationSystemID);
+
+    const commitNowMs = Date.now();
+    wormholeRuntime.commitJump(
+      sourceEndpointID,
+      session.characterID,
+      shipMass,
+      commitNowMs,
+    );
+
+    if (sourceScene) {
+      wormholeRuntime.syncSceneEntities(sourceScene, commitNowMs);
+    }
+
+    const destinationScene = spaceRuntime.getSceneForSession(session);
+    if (destinationScene) {
+      wormholeRuntime.syncSceneEntities(destinationScene, commitNowMs);
+      const arrivalShipEntity = destinationScene.getShipEntityForSession(session);
+      const destinationEndpointID = toInt(
+        prepareResult.data.destinationEndpointID,
+        0,
+      );
+      const destinationWormholeEntity = destinationScene.getEntityByID(destinationEndpointID);
+      if (arrivalShipEntity && destinationWormholeEntity) {
+        destinationScene.broadcastSpecialFx(
+          destinationWormholeEntity.itemID,
+          "effects.WormholeActivity",
+          {
+            excludedSession: session,
+          },
+          arrivalShipEntity,
+        );
+      }
+    }
+
+    try {
+      const familyEstatePrologueRuntime = require(path.join(
+        __dirname,
+        "../../estate/familyEstatePrologueRuntime",
+      ));
+      familyEstatePrologueRuntime.handleWormholeJump(
+        session,
+        prepareResult.data,
+        { nowMs: commitNowMs },
+      );
+    } catch (error) {
+      log.warn(
+        `[WormholeMgr] Family estate prologue jump hook failed: ${error.message}`,
       );
     }
-  }
-
-  try {
-    const familyEstatePrologueRuntime = require(path.join(
-      __dirname,
-      "../../estate/familyEstatePrologueRuntime",
-    ));
-    familyEstatePrologueRuntime.handleWormholeJump(
-      session,
-      prepareResult.data,
-      { nowMs: commitNowMs },
-    );
-  } catch (error) {
-    log.warn(
-      `[WormholeMgr] Family estate prologue jump hook failed: ${error.message}`,
-    );
+  } finally {
+    if (reservationPairID > 0 && reservationToken) {
+      wormholeRuntime.releasePreparedJump(reservationPairID, reservationToken);
+    }
   }
 }
 
@@ -288,6 +291,15 @@ class WormholeMgrService extends BaseService {
     if (destinationSystemID <= 0) {
       return null;
     }
+    const pairID = toInt(prepareResult.data && prepareResult.data.pairID, 0);
+    const reservationToken = wormholeRuntime.reservePreparedJump(pairID, {
+      nowMs: Date.now(),
+      expiresAtMs: Date.now() + WORMHOLE_JUMP_HANDOFF_DELAY_MS + 3500,
+    });
+    if (!reservationToken) {
+      notifyWormholeJumpCancel(session);
+      return null;
+    }
 
     scene.broadcastSpecialFx(
       shipEntity.itemID,
@@ -315,7 +327,9 @@ class WormholeMgrService extends BaseService {
     session._wormholeJumpPending = {
       endpointID,
       destinationSystemID,
+      pairID,
       queuedAtMs: Date.now(),
+      reservationToken,
     };
     scheduleWormholeJumpHandoff(() => {
       completeWormholeJump({
@@ -337,3 +351,4 @@ module.exports._testing = {
   scheduleWormholeJumpHandoff,
   syncSessionSystemWideEffectsForSystem,
 };
+

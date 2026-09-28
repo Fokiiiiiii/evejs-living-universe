@@ -1,6 +1,12 @@
+"use strict";
+
+const {
+  toFiniteNumber,
+} = require("../common/numbers");
+
 const path = require("path");
 
-const config = require(path.join(__dirname, "../config"));
+const { PROXY_NODE_ID } = require(path.join(__dirname, "../network/protocolProfile"));
 const log = require(path.join(__dirname, "../utils/logger"));
 const sessionRegistry = require(path.join(
   __dirname,
@@ -34,14 +40,17 @@ const {
   ITEM_FLAGS,
   ensureCapsuleForCharacter,
   findItemById,
-  findCharacterShipByType,
+  findShipItemById,
+  isCapsuleTypeID,
   listContainerItems,
   moveShipToSpace,
   dockShipToLocation,
   dockShipToStation,
   normalizeShipConditionState,
   removeInventoryItem,
+  restoreInventoryItemChangesAtomic,
   setActiveShipForCharacter,
+  transferItemToOwnerLocation,
   updateShipItem,
 } = require(path.join(__dirname, "../services/inventory/itemStore"));
 const {
@@ -108,9 +117,16 @@ const {
   resolveSameSceneEgoAddBallsStamp,
 } = require(path.join(__dirname, "./destiny/delivery/transitionStamps.js"));
 const {
+  compareDestinyStamps,
+  getCurrentDestinyStamp,
+  getDestinyStampForwardBoundaryDeltaMs,
+  getDestinyStampForwardDistance,
   hasDestinyStamp,
   normalizeDestinyStamp,
 } = require(path.join(__dirname, "./destiny/delivery/stamps.js"));
+const {
+  PILOT_WARP_ACTIVATION_DELAY_DESTINY_TICKS,
+} = require(path.join(__dirname, "./destiny/simulation/warpContract.js"));
 const {
   getEntityMapKey,
   normalizeEntityIDSet,
@@ -148,14 +164,32 @@ const {
 const {
   getStargateSystemForwardDirection,
 } = require(path.join(__dirname, "./stargateOrientation"));
-const TRANSITION_GUARD_WINDOW_MS = 5000;
-const STARGATE_JUMP_HANDOFF_DELAY_MS = 1250;
+const {
+  isAbyssalHostLocationID,
+} = require("../abyssal").engineSupport.hostLocation;
+// TQ holds a normal gate command for roughly four seconds and, independently,
+// leaves at least three seconds after JumpOut reaches the client's Destiny
+// timeline.  The second floor matters when an accepted warp landing has moved
+// the client's history ahead of the scene clock.
+const STARGATE_JUMP_COMMAND_HANDOFF_DELAY_MS = 4000;
+const STARGATE_JUMP_POST_FX_HANDOFF_DELAY_MS = 3000;
+// A deadline converted once with the old TiDi factor can become needlessly
+// late when TiDi recovers. Recheck in bounded wallclock slices while keeping
+// the authoritative deadline in simulation time.
+const STARGATE_JUMP_HANDOFF_RECHECK_MAX_DELAY_MS = 1000;
 const STARGATE_JUMP_RANGE_METERS = 2500;
+// Retail drops an arrival at a random spot the same fixed distance out from
+// the gate's hull, so a fleet in matching hulls does not stack on one point.
+// The direction is what varies; the distance does not. Scattering the distance
+// too would pull every arrival closer to the gate than retail places it, which
+// changes approach times and gate-camp coverage for players who are not the
+// ones being fixed here.
 const STARGATE_JUMP_IN_SURFACE_CLEARANCE_METERS = 12000;
+const STARGATE_JUMP_IN_SCATTER_CONE_RADIANS = (45 * Math.PI) / 180;
 const STARGATE_JUMP_QUEUE_SPACE = 1000;
 const STARGATE_JUMP_QUEUE_TIMEOUT_SECONDS = 180;
 const SPACE_BOARDING_RANGE_METERS = 6550;
-const SESSION_CHANGE_COOLDOWN_MS = 7000;
+const SESSION_CHANGE_COOLDOWN_MS = 10000;
 const FILETIME_EPOCH_OFFSET = 116444736000000000n;
 const FILETIME_TICKS_PER_MS = 10000n;
 const UNDOCK_INVULNERABILITY_DURATION_TICKS = 300000000n;
@@ -664,12 +698,23 @@ function sendInvulnerabilityCancelled(session, shipID) {
 }
 
 function clearPendingUndockInvulnerability(session) {
-  if (!session || !session._undockInvulnerabilityCancelTimer) {
+  if (!session) {
     return false;
   }
-  clearTimeout(session._undockInvulnerabilityCancelTimer);
-  session._undockInvulnerabilityCancelTimer = null;
-  return true;
+  let cleared = false;
+  for (const fieldName of [
+    "_undockInvulnerabilityCancelTimer",
+    "_timedInvulnerabilityCancelTimer",
+  ]) {
+    const timer = session[fieldName];
+    if (!timer) {
+      continue;
+    }
+    clearTimeout(timer);
+    session[fieldName] = null;
+    cleared = true;
+  }
+  return cleared;
 }
 
 function markUndockInvulnerabilityState(session, shipID, durationMs) {
@@ -680,9 +725,10 @@ function markUndockInvulnerabilityState(session, shipID, durationMs) {
   if (!entity) {
     return false;
   }
+  const nowMs = scene.getCurrentSimTimeMs();
   entity.undockInvulnerabilityActive = true;
   entity.undockInvulnerabilityUntilMs =
-    scene.getCurrentSimTimeMs() + Math.max(0, Number(durationMs) || 0);
+    nowMs + Math.max(0, Number(durationMs) || 0);
   return true;
 }
 
@@ -938,7 +984,7 @@ function inspectContrabandForTransition(session, shipID, solarSystemID, reason) 
     session.characterID,
     shipID,
     solarSystemID,
-    { reason },
+    { reason, deferPenalties: true },
   );
   if (!result || !result.success) {
     log.warn(
@@ -1091,11 +1137,14 @@ function beginTransition(session, kind, targetID = 0) {
 
   const now = Date.now();
   const activeTransition = session._transitionState || null;
-  if (
-    activeTransition &&
-    activeTransition.kind === kind &&
-    (now - Number(activeTransition.startedAt || 0)) < TRANSITION_GUARD_WINDOW_MS
-  ) {
+  // `_transitionState` is an in-flight mutual-exclusion lock, not the retail
+  // next-session-change cooldown. Never replace an active transition: delayed
+  // handoffs (notably a TiDi-scaled stargate jump) still need their original
+  // state in order to complete safely. The state is cleared by endTransition,
+  // so a completed board or other selective sequential transition remains
+  // immediately eligible here; its separately advertised cooldown is client
+  // session-timer policy rather than an overlapping-operation guard.
+  if (activeTransition) {
     return false;
   }
 
@@ -1117,9 +1166,80 @@ function endTransition(session, kind) {
   }
 }
 
-function toFiniteNumber(value, fallback = 0) {
-  const numeric = Number(value);
-  return Number.isFinite(numeric) ? numeric : fallback;
+function buildStargateJumpHandoffDeadline(
+  commandSessionSimTimeMs,
+  jumpOutStamp,
+  jumpOutObservedSessionSimTimeMs = commandSessionSimTimeMs,
+) {
+  const commandSimTimeMs = Number(commandSessionSimTimeMs);
+  const jumpOutObservedSimTimeMs = Number(jumpOutObservedSessionSimTimeMs);
+  if (
+    !Number.isFinite(commandSimTimeMs) ||
+    !Number.isFinite(jumpOutObservedSimTimeMs) ||
+    !hasDestinyStamp(jumpOutStamp)
+  ) {
+    return null;
+  }
+
+  const currentStamp = getCurrentDestinyStamp(jumpOutObservedSimTimeMs);
+  const normalizedJumpOutStamp = normalizeDestinyStamp(jumpOutStamp);
+  let jumpOutBoundaryDeltaMs = 0;
+  if (compareDestinyStamps(currentStamp, normalizedJumpOutStamp) < 0) {
+    const forwardDistance = getDestinyStampForwardDistance(
+      currentStamp,
+      normalizedJumpOutStamp,
+    );
+    if (forwardDistance > PILOT_WARP_ACTIVATION_DELAY_DESTINY_TICKS) {
+      return null;
+    }
+    jumpOutBoundaryDeltaMs = getDestinyStampForwardBoundaryDeltaMs(
+      jumpOutObservedSimTimeMs,
+      currentStamp,
+      normalizedJumpOutStamp,
+      PILOT_WARP_ACTIVATION_DELAY_DESTINY_TICKS,
+    );
+  }
+
+  const commandDeadlineSimTimeMs =
+    commandSimTimeMs + STARGATE_JUMP_COMMAND_HANDOFF_DELAY_MS;
+  const jumpOutBoundarySimTimeMs =
+    jumpOutObservedSimTimeMs + jumpOutBoundaryDeltaMs;
+  const jumpOutDeadlineSimTimeMs =
+    jumpOutBoundarySimTimeMs + STARGATE_JUMP_POST_FX_HANDOFF_DELAY_MS;
+  const deadlineSimTimeMs = Math.max(
+    commandDeadlineSimTimeMs,
+    jumpOutDeadlineSimTimeMs,
+  );
+
+  return {
+    commandSimTimeMs,
+    jumpOutObservedSimTimeMs,
+    currentStamp,
+    jumpOutStamp: normalizedJumpOutStamp,
+    jumpOutBoundaryDeltaMs,
+    jumpOutBoundarySimTimeMs,
+    commandDeadlineSimTimeMs,
+    jumpOutDeadlineSimTimeMs,
+    deadlineSimTimeMs,
+  };
+}
+
+function getStargateJumpHandoffWallclockDelayMs(
+  remainingSimulationMs,
+  timeDilation,
+) {
+  const remainingMs = Math.max(0, toFiniteNumber(remainingSimulationMs, 0));
+  const tidiFactor = Math.min(
+    1,
+    Math.max(0.1, toFiniteNumber(timeDilation, 1)),
+  );
+  return Math.max(
+    1,
+    Math.min(
+      STARGATE_JUMP_HANDOFF_RECHECK_MAX_DELAY_MS,
+      Math.ceil(remainingMs / tidiFactor),
+    ),
+  );
 }
 
 function cloneVector(source = null, fallback = { x: 0, y: 0, z: 0 }) {
@@ -1165,6 +1285,14 @@ function normalizeVector(vector, fallback = { x: 1, y: 0, z: 0 }) {
   }
 
   return scaleVector(vector, 1 / length);
+}
+
+function crossProduct(left, right) {
+  return {
+    x: (left.y * right.z) - (left.z * right.y),
+    y: (left.z * right.x) - (left.x * right.z),
+    z: (left.x * right.y) - (left.y * right.x),
+  };
 }
 
 function distance(left, right) {
@@ -1243,8 +1371,48 @@ function resolveShipRadiusMeters(ship) {
   return Math.max(0, toFiniteNumber(movement && movement.radius, 0));
 }
 
-function buildGateSpawnState(stargate, ship = null) {
-  const direction = getResolvedStargateForwardDirection(stargate);
+// Any unit vector that is not parallel to `forward`, so the cross products
+// below cannot collapse to zero.
+function buildPerpendicularBasis(forward) {
+  const reference = Math.abs(forward.x) < 0.9
+    ? { x: 1, y: 0, z: 0 }
+    : { x: 0, y: 1, z: 0 };
+  const right = normalizeVector(crossProduct(reference, forward), { x: 0, y: 1, z: 0 });
+  return {
+    right,
+    up: normalizeVector(crossProduct(forward, right), { x: 0, y: 0, z: 1 }),
+  };
+}
+
+// Uniform over the spherical cap of half-angle `coneRadians` around `forward`,
+// rather than over the angle itself, which would crowd arrivals onto the axis.
+function sampleDirectionInCone(forward, coneRadians, random) {
+  const cosLimit = Math.cos(coneRadians);
+  const cosTheta = 1 - (random() * (1 - cosLimit));
+  const sinTheta = Math.sqrt(Math.max(0, 1 - (cosTheta ** 2)));
+  const phi = random() * 2 * Math.PI;
+  const { right, up } = buildPerpendicularBasis(forward);
+
+  return normalizeVector(
+    addVectors(
+      scaleVector(forward, cosTheta),
+      addVectors(
+        scaleVector(right, sinTheta * Math.cos(phi)),
+        scaleVector(up, sinTheta * Math.sin(phi)),
+      ),
+    ),
+    forward,
+  );
+}
+
+function buildGateSpawnState(stargate, ship = null, options = {}) {
+  const random = typeof options.random === "function" ? options.random : Math.random;
+  const forward = getResolvedStargateForwardDirection(stargate);
+  const direction = sampleDirectionInCone(
+    forward,
+    STARGATE_JUMP_IN_SCATTER_CONE_RADIANS,
+    random,
+  );
   const offset =
     resolveStargatePhysicalRadius(stargate) +
     resolveShipRadiusMeters(ship) +
@@ -1361,8 +1529,7 @@ function broadcastOnCharacterLeftStructure(session, structureID) {
 function buildSolarSessionChangeOptions(session, solarSystemID) {
   const sourceNodeID =
     Number(session && session._machoNodeID) ||
-    Number(config.proxyNodeId) ||
-    0;
+    PROXY_NODE_ID;
   if (session && typeof session === "object" && sourceNodeID > 0) {
     session._machoNodeID = sourceNodeID;
   }
@@ -1479,6 +1646,110 @@ function toInt(value, fallback = 0) {
 const SHIP_DESTRUCTION_EJECT_WARP_LANDING_BYPASS = Symbol(
   "shipDestructionEjectWarpLandingBypass",
 );
+const SHIP_DESTRUCTION_ABYSSAL_TRANSITION_BYPASS = Symbol(
+  "shipDestructionAbyssalTransitionBypass",
+);
+
+function resolveActiveAbyssalTransitionRestriction(session, action) {
+  if (!session || typeof session !== "object") {
+    return null;
+  }
+
+  const characterID = toInt(
+    session.characterID || session.charid || session.characterId,
+    0,
+  );
+  const shipID = toInt(
+    session._space && session._space.shipID,
+    toInt(session.shipID || session.shipid || session.activeShipID, 0),
+  );
+
+  // This lookup is intentionally server-owned and lazy. The transition module
+  // is itself used while the Abyssal manager is bootstrapping, and accepting an
+  // RPC option or a session boolean here would turn client input into a bypass.
+  let abyssalMgrService = null;
+  try {
+    abyssalMgrService = require("../abyssal").transitionIntegration;
+  } catch (error) {
+    log.error(
+      `[SpaceTransition] Abyssal transition authority unavailable ` +
+        `char=${characterID} ship=${shipID} action=${String(action || "unknown")} ` +
+        `reason=${error && error.message || "UNKNOWN"}`,
+    );
+    return isAbyssalHostLocationID(
+      session._space && session._space.systemID ||
+        session.solarsystemid2 ||
+        session.solarsystemid,
+    )
+      ? {
+          blocked: true,
+          action: String(action || "unknown"),
+          characterID,
+          shipID,
+          instanceID: 0,
+          reason: "ABYSSAL_AUTHORITY_UNAVAILABLE",
+        }
+      : null;
+  }
+
+  const activeRun =
+    characterID > 0 &&
+    typeof abyssalMgrService.getActiveAbyssalRunForCharacterID === "function"
+      ? abyssalMgrService.getActiveAbyssalRunForCharacterID(characterID)
+      : null;
+  const shipRun =
+    !activeRun &&
+    shipID > 0 &&
+    typeof abyssalMgrService.getActiveAbyssalRunForShipID === "function"
+      ? abyssalMgrService.getActiveAbyssalRunForShipID(shipID)
+      : null;
+  const pocketState = activeRun || shipRun;
+  const sceneKind = String(
+    session._space && session._space.sceneKind || "",
+  ).trim();
+  const sceneKey = String(
+    session._space && session._space.sceneKey || session.spaceSceneKey || "",
+  ).trim();
+  const sceneInstanceID = toInt(
+    session._space && session._space.instanceID,
+    toInt(session.spaceInstanceID, 0),
+  );
+  const hasAbyssalSceneAuthority = Boolean(
+    sceneKind === "abyssal" ||
+    /^abyssal-run:\d+$/.test(sceneKey) ||
+    isAbyssalHostLocationID(
+      session._space && session._space.systemID ||
+        session.solarsystemid2 ||
+        session.solarsystemid,
+    )
+  );
+  if (!pocketState && !hasAbyssalSceneAuthority) {
+    return null;
+  }
+
+  return {
+    blocked: true,
+    action: String(action || "unknown"),
+    characterID,
+    shipID,
+    instanceID: pocketState
+      ? toInt(pocketState.instanceID, 0)
+      : sceneInstanceID,
+    reason: pocketState ? "ABYSSAL_ACTIVE_RUN" : "ABYSSAL_SCENE_AUTHORITY",
+  };
+}
+
+function buildActiveAbyssalTransitionBlockedResult(session, action) {
+  const restriction = resolveActiveAbyssalTransitionRestriction(session, action);
+  if (!restriction) {
+    return null;
+  }
+  return {
+    success: false,
+    errorMsg: "ABYSSAL_TRANSITION_FORBIDDEN",
+    data: restriction,
+  };
+}
 
 function isPilotWarpLandingPending(session) {
   return Boolean(
@@ -1722,7 +1993,7 @@ function resolveReusableCapsuleForCharacter(
   const excludedItemID = Number(excludedShipID || 0) || 0;
   const ships = getCharacterShips(characterID).filter(
     (shipItem) =>
-      Number(shipItem && shipItem.typeID) === CAPSULE_TYPE_ID &&
+      isCapsuleTypeID(shipItem && shipItem.typeID) &&
       Number(shipItem && shipItem.itemID) !== excludedItemID,
   );
 
@@ -1750,7 +2021,7 @@ function resolveReusableCapsuleForCharacter(
     };
   }
 
-  const existingCapsule = findCharacterShipByType(characterID, CAPSULE_TYPE_ID);
+  const existingCapsule = ships[0] || null;
   if (existingCapsule && Number(existingCapsule.itemID) !== excludedItemID) {
     return {
       success: true,
@@ -1802,18 +2073,6 @@ function completeStargateJump(
       ? spaceRuntime.getSolarSystemTimeDilation(session._space.systemID)
       : null;
   const sourceClockCapturedAtWallclockMs = Date.now();
-  if (typeof spaceRuntime.beginSessionJumpTimingTrace === "function") {
-    spaceRuntime.beginSessionJumpTimingTrace(session, "stargate-jump", {
-      sourceSystemID: sourceGate.solarSystemID,
-      destinationSystemID: destinationGate.solarSystemID,
-      sourceGateID: sourceGate.itemID,
-      destinationGateID: destinationGate.itemID,
-      sourceSimTimeMs,
-      sourceTimeDilation,
-      sourceClockCapturedAtWallclockMs,
-      shipID: activeShip.itemID,
-    });
-  }
 
   deactivateActiveModulesForSpaceTransition(session, "stargate-jump");
   sendMachoObjectDisconnects(session);
@@ -1855,6 +2114,7 @@ function completeStargateJump(
       stationID: null,
       structureID: null,
     }),
+    { expectedLocationTransitionReason: "stargate-jump" },
   );
   if (!updateResult.success) {
     endTransition(session, "stargate-jump");
@@ -1953,6 +2213,19 @@ function completeStargateJump(
     );
   }
 
+  // Achievement travel progress is recorded only after the handoff has fully
+  // succeeded, so an interrupted or denied jump can never credit a visit.
+  try {
+    require(path.join(
+      __dirname,
+      "../services/achievement/achievementRuntime",
+    )).recordStargateJump(session.characterID, sourceGate, destinationGate);
+  } catch (achievementError) {
+    log.debug(
+      `[SpaceTransition] achievement stargate hook failed char=${session.characterID}: ${achievementError.message}`,
+    );
+  }
+
   endTransition(session, "stargate-jump");
   return {
     success: true,
@@ -1961,6 +2234,107 @@ function completeStargateJump(
       spawnState,
       boundResult: buildBoundResult(session),
     },
+  };
+}
+
+function scheduleStargateJumpHandoff(
+  session,
+  sourceGate,
+  destinationGate,
+  activeShip,
+  sourceScene,
+  transitionState,
+  sourceSpaceGeneration,
+  handoffDeadline,
+) {
+  const hasExpectedAuthority = () =>
+    Boolean(
+      session &&
+      session._space === sourceSpaceGeneration &&
+      session._transitionState === transitionState,
+    );
+
+  const cancelExpectedTransition = () => {
+    if (session && session._transitionState === transitionState) {
+      endTransition(session, "stargate-jump");
+    }
+  };
+
+  const attemptHandoff = () => {
+    if (!hasExpectedAuthority()) {
+      return;
+    }
+    if (session.socket && session.socket.destroyed === true) {
+      cancelExpectedTransition();
+      return;
+    }
+    const sourceShipEntity = sourceScene.getShipEntityForSession(session);
+    if (
+      !sourceShipEntity ||
+      Number(sourceShipEntity.itemID || 0) !== Number(activeShip.itemID || 0)
+    ) {
+      cancelExpectedTransition();
+      return;
+    }
+
+    const currentSessionSimTimeMs = sourceScene.getCurrentSessionSimTimeMs(session);
+    if (!Number.isFinite(currentSessionSimTimeMs)) {
+      log.warn(
+        `[SpaceTransition] Cancelling stargate jump for ${session.characterName || session.characterID}: source simulation clock is unavailable`,
+      );
+      cancelExpectedTransition();
+      return;
+    }
+    const remainingSimulationMs = Math.max(
+      0,
+      handoffDeadline.deadlineSimTimeMs - currentSessionSimTimeMs,
+    );
+    if (remainingSimulationMs > 0) {
+      const delayMs = getStargateJumpHandoffWallclockDelayMs(
+        remainingSimulationMs,
+        sourceScene.getTimeDilation(),
+      );
+      setTimeout(attemptHandoff, delayMs);
+      return;
+    }
+
+    if (typeof spaceRuntime.recordSessionJumpTimingTrace === "function") {
+      spaceRuntime.recordSessionJumpTimingTrace(
+        session,
+        "stargate-jump-handoff-deadline-reached",
+        {
+          currentSessionSimTimeMs,
+          deadlineSimTimeMs: handoffDeadline.deadlineSimTimeMs,
+          jumpOutStamp: handoffDeadline.jumpOutStamp,
+        },
+      );
+    }
+    const completionResult = completeStargateJump(
+      session,
+      sourceGate,
+      destinationGate,
+      activeShip,
+    );
+    if (!completionResult.success) {
+      log.warn(
+        `[SpaceTransition] Delayed stargate jump failed for ${session.characterName || session.characterID}: ${completionResult.errorMsg}`,
+      );
+    }
+  };
+
+  const initialSessionSimTimeMs = sourceScene.getCurrentSessionSimTimeMs(session);
+  const initialRemainingSimulationMs = Math.max(
+    0,
+    handoffDeadline.deadlineSimTimeMs - initialSessionSimTimeMs,
+  );
+  const initialDelayMs = getStargateJumpHandoffWallclockDelayMs(
+    initialRemainingSimulationMs,
+    sourceScene.getTimeDilation(),
+  );
+  setTimeout(attemptHandoff, initialDelayMs);
+  return {
+    deadlineSimTimeMs: handoffDeadline.deadlineSimTimeMs,
+    initialDelayMs,
   };
 }
 
@@ -2099,6 +2473,13 @@ function undockSession(session, options = {}) {
       errorMsg: "CHARACTER_NOT_SELECTED",
     };
   }
+  const abyssalRestriction = buildActiveAbyssalTransitionBlockedResult(
+    session,
+    "undock",
+  );
+  if (abyssalRestriction) {
+    return abyssalRestriction;
+  }
 
   const dockedLocationID = getDockedLocationID(session);
   if (!dockedLocationID) {
@@ -2227,6 +2608,7 @@ function undockSession(session, options = {}) {
         stationID: null,
         structureID: null,
       }),
+      { expectedLocationTransitionReason: "undock" },
     );
     if (!updateResult.success) {
       return updateResult;
@@ -2311,6 +2693,13 @@ function dockSession(session, stationID) {
       errorMsg: "CHARACTER_NOT_SELECTED",
     };
   }
+  const abyssalRestriction = buildActiveAbyssalTransitionBlockedResult(
+    session,
+    "dock",
+  );
+  if (abyssalRestriction) {
+    return abyssalRestriction;
+  }
 
   if (isDockedSession(session)) {
     return {
@@ -2340,6 +2729,18 @@ function dockSession(session, stationID) {
     return {
       success: false,
       errorMsg: "CRIMINAL_TIMER_ACTIVE",
+    };
+  }
+
+  // A weapons timer started after the docking request was accepted (an
+  // aggressive act during the approach) must still refuse the finalize.
+  if (crimewatchState.hasActiveWeaponTimer(
+    session.characterID,
+    getCrimewatchReferenceMs(session),
+  )) {
+    return {
+      success: false,
+      errorMsg: "WEAPONS_TIMER_ACTIVE",
     };
   }
 
@@ -2398,6 +2799,7 @@ function dockSession(session, stationID) {
         stationID: dockable.kind === "station" ? dockable.locationID : null,
         structureID: dockable.kind === "structure" ? dockable.locationID : null,
       }),
+      { expectedLocationTransitionReason: "dock" },
     );
     if (!updateResult.success) {
       return updateResult;
@@ -2427,20 +2829,6 @@ function dockSession(session, stationID) {
     log.info(
       `[SpaceTransition] Docked ${session.characterName || session.characterID} ship=${activeShip.itemID} location=${dockable.locationID} kind=${dockable.kind}`,
     );
-
-    try {
-      const familyEstatePrologueRuntime = require(path.join(
-        __dirname,
-        "../services/estate/familyEstatePrologueRuntime",
-      ));
-      familyEstatePrologueRuntime.handleSessionDocked(session, dockable, {
-        nowMs: Date.now(),
-      });
-    } catch (error) {
-      log.warn(
-        `[SpaceTransition] Family estate prologue docking hook failed: ${error.message}`,
-      );
-    }
 
     return {
       success: true,
@@ -2542,17 +2930,27 @@ function repairActiveShipSpaceStateForLogin(session, activeShip) {
     return activeShip;
   }
 
-  const stateSystemID = toInt(
-    activeShip.spaceState && activeShip.spaceState.systemID,
-    0,
-  );
+  const rawSpaceState =
+    activeShip.spaceState && typeof activeShip.spaceState === "object"
+      ? activeShip.spaceState
+      : null;
+  const stateSystemID = toInt(rawSpaceState && rawSpaceState.systemID, 0);
   const locationID = toInt(activeShip.locationID, 0);
   const flagID = toInt(activeShip.flagID, ITEM_FLAGS.HANGAR);
+  const hasPersistedWarpState = Boolean(
+    rawSpaceState &&
+      (
+        String(rawSpaceState.mode || "").toUpperCase() === "WARP" ||
+        rawSpaceState.warpState != null ||
+        rawSpaceState.pendingWarp != null
+      ),
+  );
   if (
-    activeShip.spaceState &&
+    rawSpaceState &&
     stateSystemID === systemID &&
     locationID === systemID &&
-    flagID === 0
+    flagID === 0 &&
+    !hasPersistedWarpState
   ) {
     return activeShip;
   }
@@ -2581,6 +2979,36 @@ function repairActiveShipSpaceStateForLogin(session, activeShip) {
 function restoreSpaceSession(session) {
   if (!session || !session.characterID || isDockedSession(session)) {
     return false;
+  }
+
+  try {
+    const AbyssalMgrService = require("../abyssal").transitionIntegration;
+    if (
+      AbyssalMgrService &&
+      typeof AbyssalMgrService.prepareStartupRecoveryBarrier === "function"
+    ) {
+      const recoveryResult = AbyssalMgrService.prepareStartupRecoveryBarrier(
+        "space-restore",
+        session,
+      );
+      if (recoveryResult && recoveryResult.success === false) {
+        log.warn(
+          `[SpaceTransition] Abyssal startup recovery barrier failed during space restore ` +
+            `char=${session.characterID} failedRuns=${Array.isArray(recoveryResult.failedInstanceIDs) ? recoveryResult.failedInstanceIDs.join(",") : "unknown"}`,
+        );
+      }
+      if (recoveryResult && recoveryResult.blocksSession === true) {
+        return false;
+      }
+    }
+  } catch (error) {
+    log.warn(
+      `[SpaceTransition] Abyssal startup recovery barrier threw during space restore ` +
+        `char=${session.characterID} reason=${error && error.message || "UNKNOWN"}`,
+    );
+    if (isAbyssalHostLocationID(session.solarsystemid2 || session.solarsystemid)) {
+      return false;
+    }
   }
 
   if (typeof spaceRuntime.beginSessionJumpTimingTrace === "function") {
@@ -2686,6 +3114,11 @@ function restoreSpaceSession(session) {
   return true;
 }
 
+// Ship destruction ejects the pilot whatever the ship's modules are doing.
+const SHIP_DESTRUCTION_MODULE_COMMITMENT_BYPASS = Symbol(
+  "shipDestructionModuleCommitmentBypass",
+);
+
 function ejectSession(session, options = {}) {
   if (!session || !session.characterID || !session._space) {
     return {
@@ -2693,11 +3126,41 @@ function ejectSession(session, options = {}) {
       errorMsg: "NOT_IN_SPACE",
     };
   }
+  if (options[SHIP_DESTRUCTION_ABYSSAL_TRANSITION_BYPASS] !== true) {
+    const abyssalRestriction = buildActiveAbyssalTransitionBlockedResult(
+      session,
+      "eject",
+    );
+    if (abyssalRestriction) {
+      return abyssalRestriction;
+    }
+  }
   if (
     options[SHIP_DESTRUCTION_EJECT_WARP_LANDING_BYPASS] !== true &&
     isPilotWarpLandingPending(session)
   ) {
     return buildWarpLandingPendingResult();
+  }
+
+  // Retail: a ship running an Entosis Link cannot eject. Read off the live
+  // entity, before the ship record lookup, so the gate answers the same way
+  // for a synthetic session in a test scene.
+  if (options[SHIP_DESTRUCTION_MODULE_COMMITMENT_BYPASS] !== true) {
+    const { hasActiveEntosisLinkEffect } = require(path.join(
+      __dirname,
+      "./modules/entosisLinkRuntime",
+    ));
+    const linkedScene = spaceRuntime.getSceneForSession(session);
+    const linkedEntity =
+      linkedScene && typeof linkedScene.getEntityByID === "function"
+        ? linkedScene.getEntityByID(session._space.shipID)
+        : null;
+    if (hasActiveEntosisLinkEffect(linkedEntity)) {
+      return {
+        success: false,
+        errorMsg: "EJECT_DISALLOWED_BY_MODULE",
+      };
+    }
   }
 
   const activeShip = getActiveShipRecord(session.characterID);
@@ -2707,7 +3170,7 @@ function ejectSession(session, options = {}) {
       errorMsg: "SHIP_NOT_FOUND",
     };
   }
-  if (Number(activeShip.typeID) === CAPSULE_TYPE_ID) {
+  if (isCapsuleTypeID(activeShip.typeID)) {
     return {
       success: false,
       errorMsg: "ALREADY_IN_CAPSULE",
@@ -2855,6 +3318,7 @@ function ejectSession(session, options = {}) {
         stationID: null,
         structureID: null,
       }),
+      { expectedLocationTransitionReason: "eject" },
     );
     if (!updateResult.success) {
       return updateResult;
@@ -2874,7 +3338,7 @@ function ejectSession(session, options = {}) {
     }
 
     const capsuleEntity = spaceRuntime.attachSession(session, capsuleMoveResult.data, {
-      systemID: currentSystemID,
+      sceneDescriptor: scene.sceneDescriptor || currentSystemID,
       pendingUndockMovement: false,
       spawnStopped: true,
       broadcast: false,
@@ -2911,10 +3375,12 @@ function ejectSession(session, options = {}) {
       };
     }
 
-    queuePostSpaceAttachFittingHydration(session, capsuleMoveResult.data.itemID, {
-      inventoryBootstrapPending: false,
-      hydrationProfile: "capsule",
-    });
+    if (session._abyssalOfflineSession !== true) {
+      queuePostSpaceAttachFittingHydration(session, capsuleMoveResult.data.itemID, {
+        inventoryBootstrapPending: false,
+        hydrationProfile: "capsule",
+      });
+    }
     if (beforeSameSceneShipSwapNotificationPlanFlush) {
       const hookResult = beforeSameSceneShipSwapNotificationPlanFlush({
         session,
@@ -3093,7 +3559,33 @@ function ejectSessionForShipDestruction(session, options = {}) {
   return ejectSession(session, {
     ...options,
     [SHIP_DESTRUCTION_EJECT_WARP_LANDING_BYPASS]: true,
+    [SHIP_DESTRUCTION_ABYSSAL_TRANSITION_BYPASS]: true,
+    [SHIP_DESTRUCTION_MODULE_COMMITMENT_BYPASS]: true,
   });
+}
+
+function isTargetLockedByAnotherPlayer(scene, targetEntity, boardingCharacterID) {
+  if (
+    !scene ||
+    !targetEntity ||
+    typeof scene.getTargetersForEntity !== "function" ||
+    typeof scene.getEntityByID !== "function"
+  ) {
+    return false;
+  }
+
+  const boarderID = Number(boardingCharacterID || 0) || 0;
+  for (const targeterID of scene.getTargetersForEntity(targetEntity)) {
+    const targeter = scene.getEntityByID(targeterID);
+    const targeterCharacterID = Number(
+      targeter && targeter.session && targeter.session.characterID,
+    ) || 0;
+    if (targeterCharacterID > 0 && targeterCharacterID !== boarderID) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 function boardSpaceShip(session, shipID) {
@@ -3102,6 +3594,13 @@ function boardSpaceShip(session, shipID) {
       success: false,
       errorMsg: "NOT_IN_SPACE",
     };
+  }
+  const abyssalRestriction = buildActiveAbyssalTransitionBlockedResult(
+    session,
+    "board",
+  );
+  if (abyssalRestriction) {
+    return abyssalRestriction;
   }
   if (isPilotWarpLandingPending(session)) {
     return buildWarpLandingPendingResult();
@@ -3141,11 +3640,11 @@ function boardSpaceShip(session, shipID) {
     };
   }
 
-  const targetShip = findCharacterShip(session.characterID, targetShipID);
+  let targetShip = findShipItemById(targetShipID);
   if (!targetShip) {
     return {
       success: false,
-      errorMsg: "SHIP_NOT_OWNED",
+      errorMsg: "SHIP_NOT_FOUND",
     };
   }
   if (Number(targetShip.locationID) !== Number(scene.systemID)) {
@@ -3178,6 +3677,18 @@ function boardSpaceShip(session, shipID) {
     return {
       success: false,
       errorMsg: "TARGET_SHIP_NOT_ON_GRID",
+    };
+  }
+  // Retail lets the last owner re-board regardless of target locks. Anyone
+  // else may only board an unoccupied hull while no other player has it locked.
+  // NPC and disconnected-entity locks intentionally do not count here.
+  if (
+    Number(targetShip.ownerID) !== Number(session.characterID) &&
+    isTargetLockedByAnotherPlayer(scene, targetEntity, session.characterID)
+  ) {
+    return {
+      success: false,
+      errorMsg: "SHIP_TARGETED_BY_OTHER_PLAYER",
     };
   }
 
@@ -3228,8 +3739,8 @@ function boardSpaceShip(session, shipID) {
       };
     }
     const shouldConsumePreviousCapsule =
-      Number(currentShip.typeID) === CAPSULE_TYPE_ID &&
-      Number(targetShip.typeID) !== CAPSULE_TYPE_ID;
+      isCapsuleTypeID(currentShip.typeID) &&
+      !isCapsuleTypeID(targetShip.typeID);
     const sourceDestinyGeneration = session._space;
     if (typeof scene.prepareSameSceneSessionTetherRelease === "function") {
       const tetherReleaseResult = scene.prepareSameSceneSessionTetherRelease(
@@ -3284,11 +3795,47 @@ function boardSpaceShip(session, shipID) {
       };
     }
 
+    let ownershipTransferResult = null;
+    if (Number(targetShip.ownerID) !== Number(session.characterID)) {
+      ownershipTransferResult = transferItemToOwnerLocation(
+        targetShipID,
+        session.characterID,
+        targetShip.locationID,
+        targetShip.flagID,
+        null,
+        { reownContents: true },
+      );
+      if (!ownershipTransferResult.success) {
+        return {
+          success: false,
+          errorMsg:
+            ownershipTransferResult.errorMsg ||
+            "SHIP_OWNERSHIP_TRANSFER_FAILED",
+        };
+      }
+
+      targetShip = findCharacterShip(session.characterID, targetShipID);
+      if (!targetShip) {
+        restoreInventoryItemChangesAtomic(
+          ownershipTransferResult.data && ownershipTransferResult.data.changes,
+        );
+        return {
+          success: false,
+          errorMsg: "SHIP_OWNERSHIP_TRANSFER_FAILED",
+        };
+      }
+    }
+
     const activeShipResult = setActiveShipForCharacter(
       session.characterID,
       targetShipID,
     );
     if (!activeShipResult.success) {
+      if (ownershipTransferResult) {
+        restoreInventoryItemChangesAtomic(
+          ownershipTransferResult.data && ownershipTransferResult.data.changes,
+        );
+      }
       return activeShipResult;
     }
 
@@ -3297,6 +3844,7 @@ function boardSpaceShip(session, shipID) {
         stationID: null,
         structureID: null,
       }),
+      { expectedLocationTransitionReason: "board-space-ship" },
     );
     if (!updateResult.success) {
       return updateResult;
@@ -3580,6 +4128,13 @@ function jumpSessionViaStargate(session, fromStargateID, toStargateID) {
       errorMsg: "NOT_IN_SPACE",
     };
   }
+  const abyssalRestriction = buildActiveAbyssalTransitionBlockedResult(
+    session,
+    "stargate-jump",
+  );
+  if (abyssalRestriction) {
+    return abyssalRestriction;
+  }
   if (isPilotWarpLandingPending(session)) {
     return buildWarpLandingPendingResult();
   }
@@ -3636,6 +4191,17 @@ function jumpSessionViaStargate(session, fromStargateID, toStargateID) {
     };
   }
 
+  if (crimewatchState.hasActiveWeaponTimer(
+    session.characterID,
+    getCrimewatchReferenceMs(session),
+  )) {
+    endTransition(session, "stargate-jump");
+    return {
+      success: false,
+      errorMsg: "WEAPONS_TIMER_ACTIVE",
+    };
+  }
+
   const shipEntity = spaceRuntime.getEntity(session, activeShip.itemID);
   if (
     shipEntity &&
@@ -3668,32 +4234,80 @@ function jumpSessionViaStargate(session, fromStargateID, toStargateID) {
     "stargate-jump",
   );
 
+  const sourceScene = spaceRuntime.getSceneForSession(session);
+  if (!sourceScene) {
+    endTransition(session, "stargate-jump");
+    return {
+      success: false,
+      errorMsg: "SCENE_NOT_FOUND",
+    };
+  }
+  const transitionState = session._transitionState;
+  const sourceSpaceGeneration = session._space;
+  const commandSessionSimTimeMs = sourceScene.getCurrentSessionSimTimeMs(session);
+  const sourceTimeDilation = sourceScene.getTimeDilation();
+  const sourceClockCapturedAtWallclockMs = Date.now();
+  if (typeof spaceRuntime.beginSessionJumpTimingTrace === "function") {
+    spaceRuntime.beginSessionJumpTimingTrace(session, "stargate-jump", {
+      sourceSystemID: sourceGate.solarSystemID,
+      destinationSystemID: destinationGate.solarSystemID,
+      sourceGateID: sourceGate.itemID,
+      destinationGateID: destinationGate.itemID,
+      sourceSimTimeMs: commandSessionSimTimeMs,
+      sourceTimeDilation,
+      sourceClockCapturedAtWallclockMs,
+      shipID: activeShip.itemID,
+    });
+  }
+
   const startResult = spaceRuntime.startStargateJump(session, sourceGate.itemID);
   if (!startResult.success) {
     endTransition(session, "stargate-jump");
     return startResult;
   }
+  if (!startResult.data || startResult.data.resultSessionDelivered !== true) {
+    endTransition(session, "stargate-jump");
+    return {
+      success: false,
+      errorMsg: "STARGATE_JUMP_FX_NOT_DELIVERED",
+    };
+  }
+  const jumpOutObservedSessionSimTimeMs =
+    sourceScene.getCurrentSessionSimTimeMs(session);
+  const handoffDeadline = buildStargateJumpHandoffDeadline(
+    commandSessionSimTimeMs,
+    startResult.data.stamp,
+    jumpOutObservedSessionSimTimeMs,
+  );
+  if (!handoffDeadline) {
+    endTransition(session, "stargate-jump");
+    return {
+      success: false,
+      errorMsg: "STARGATE_JUMP_FX_STAMP_INVALID",
+    };
+  }
+
   sendJumpQueueUpdate(session, destinationGate.solarSystemID);
-
-  // Scale the handoff delay by the TiDi factor so the client-side gate FX
-  // (which plays in dilated sim time) has enough wallclock time to finish
-  // before we detach the session and reset TiDi to 1.0.
-  const tidiFactor = spaceRuntime.getSolarSystemTimeDilation(sourceGate.solarSystemID);
-  const scaledDelay = Math.round(STARGATE_JUMP_HANDOFF_DELAY_MS / tidiFactor);
-
-  setTimeout(() => {
-    const completionResult = completeStargateJump(
+  if (typeof spaceRuntime.recordSessionJumpTimingTrace === "function") {
+    spaceRuntime.recordSessionJumpTimingTrace(
       session,
-      sourceGate,
-      destinationGate,
-      activeShip,
+      "stargate-jump-handoff-scheduled",
+      {
+        ...handoffDeadline,
+        sourceTimeDilation,
+      },
     );
-    if (!completionResult.success) {
-      log.warn(
-        `[SpaceTransition] Delayed stargate jump failed for ${session.characterName || session.characterID}: ${completionResult.errorMsg}`,
-      );
-    }
-  }, scaledDelay);
+  }
+  scheduleStargateJumpHandoff(
+    session,
+    sourceGate,
+    destinationGate,
+    activeShip,
+    sourceScene,
+    transitionState,
+    sourceSpaceGeneration,
+    handoffDeadline,
+  );
 
   return {
     success: true,
@@ -3715,13 +4329,21 @@ function rebuildDockedSessionAtStation(session, stationID, options = {}) {
   }
 
   const targetStationID = Number(stationID || 0);
-  const station = worldData.getStationByID(targetStationID);
-  if (!station) {
+  // A home clone can wait in an NPC station or in an Upwell structure, and
+  // waking in either is the same docked rebuild. A destroyed structure keeps
+  // its row, so check destroyedAt as well.
+  const dockable = resolveDockableLocation(targetStationID);
+  if (
+    !dockable ||
+    (dockable.kind === "structure" && dockable.record && dockable.record.destroyedAt)
+  ) {
     return {
       success: false,
       errorMsg: "STATION_NOT_FOUND",
     };
   }
+  const station = dockable.record;
+  const isStructure = dockable.kind === "structure";
 
   const previousLocalChannelID = Number(
     session.solarsystemid2 ||
@@ -3739,7 +4361,7 @@ function rebuildDockedSessionAtStation(session, stationID, options = {}) {
 
   const capsuleResult = ensureCapsuleForCharacter(
     session.characterID,
-    station.stationID,
+    dockable.locationID,
   );
   if (!capsuleResult.success || !capsuleResult.data) {
     return {
@@ -3757,7 +4379,9 @@ function rebuildDockedSessionAtStation(session, stationID, options = {}) {
     return activeShipResult;
   }
 
-  const currentRecord = getCharacterRecord(session.characterID);
+  const currentRecord = getCharacterRecord(session.characterID, {
+    expectedLocationTransitionReason: "rebuild-docked-session",
+  });
   const authoritativeHomeStationID =
     Number(
       (currentRecord && (
@@ -3771,14 +4395,18 @@ function rebuildDockedSessionAtStation(session, stationID, options = {}) {
       0,
     ) || 0;
 
+  // A structure is never a default home, the same rule as the dockable jump.
+  const fallbackHomeStationID = isStructure ? 60003760 : dockable.locationID;
   const updateResult = updateCharacterRecord(session.characterID, (record) =>
-    buildLocationIdentityPatch(record, station.solarSystemID, {
-      homeStationID: authoritativeHomeStationID || station.stationID,
+    buildLocationIdentityPatch(record, dockable.solarSystemID, {
+      homeStationID: authoritativeHomeStationID || fallbackHomeStationID,
       cloneStationID:
-        Number(record.cloneStationID || authoritativeHomeStationID || station.stationID) ||
-        station.stationID,
-      stationID: station.stationID,
+        Number(record.cloneStationID || authoritativeHomeStationID || fallbackHomeStationID) ||
+        fallbackHomeStationID,
+      stationID: isStructure ? null : dockable.locationID,
+      structureID: isStructure ? dockable.locationID : null,
     }),
+    { expectedLocationTransitionReason: "rebuild-docked-session" },
   );
   if (!updateResult.success) {
     return updateResult;
@@ -3809,7 +4437,7 @@ function rebuildDockedSessionAtStation(session, stationID, options = {}) {
       });
       if (!newbieShipResult.success) {
         log.warn(
-          `[SpaceTransition] Failed to auto-board corvette for ${session.characterName || session.characterID} station=${station.stationID} error=${newbieShipResult.errorMsg}`,
+          `[SpaceTransition] Failed to auto-board corvette for ${session.characterName || session.characterID} ${dockable.kind}=${dockable.locationID} error=${newbieShipResult.errorMsg}`,
         );
       } else if (
         newbieShipResult.data &&
@@ -3826,7 +4454,12 @@ function rebuildDockedSessionAtStation(session, stationID, options = {}) {
   }
 
   if (options.emitNotifications !== false) {
-    flushCharacterSessionNotificationPlan(session, applyResult.notificationPlan);
+    flushCharacterSessionNotificationPlan(
+      session,
+      isStructure
+        ? applyTqDockingTransitionSessionChangeShape(applyResult.notificationPlan)
+        : applyResult.notificationPlan,
+    );
   }
 
   const refreshedCapsule =
@@ -3899,11 +4532,18 @@ function rebuildDockedSessionAtStation(session, stationID, options = {}) {
     );
   }
 
-  queuePendingSessionEffects(session, {
-    previousLocalChannelID,
-  });
-  flushPendingCommandSessionEffects(session);
-  broadcastOnCharNowInStation(session, station.stationID);
+  if (session._abyssalOfflineSession !== true) {
+    queuePendingSessionEffects(session, {
+      previousLocalChannelID,
+    });
+    flushPendingCommandSessionEffects(session);
+    if (isStructure) {
+      sendDockingFinished(session, dockable.locationID);
+      broadcastOnCharacterEnteredStructure(session, dockable.locationID);
+    } else {
+      broadcastOnCharNowInStation(session, dockable.locationID);
+    }
+  }
 
   const activeShip =
     getActiveShipRecord(session.characterID) ||
@@ -3911,7 +4551,7 @@ function rebuildDockedSessionAtStation(session, stationID, options = {}) {
     refreshedCapsule;
 
   log.info(
-    `[SpaceTransition] Rebuilt docked session for ${session.characterName || session.characterID} station=${station.stationID} ship=${activeShip && activeShip.itemID}`,
+    `[SpaceTransition] Rebuilt docked session for ${session.characterName || session.characterID} ${dockable.kind}=${dockable.locationID} ship=${activeShip && activeShip.itemID}`,
   );
 
   return {
@@ -3926,20 +4566,27 @@ function rebuildDockedSessionAtStation(session, stationID, options = {}) {
   };
 }
 
-function jumpSessionToStation(session, stationID) {
+function jumpSessionToDockableLocation(session, locationID, options = {}) {
   if (!session || !session.characterID) {
     return {
       success: false,
       errorMsg: "CHARACTER_NOT_SELECTED",
     };
   }
+  const abyssalRestriction = buildActiveAbyssalTransitionBlockedResult(
+    session,
+    "station-jump",
+  );
+  if (abyssalRestriction) {
+    return abyssalRestriction;
+  }
   if (isPilotWarpLandingPending(session)) {
     return buildWarpLandingPendingResult();
   }
 
-  const targetStationID = Number(stationID || 0);
-  const station = worldData.getStationByID(targetStationID);
-  if (!station) {
+  const targetLocationID = Number(locationID || 0);
+  const dockable = resolveDockableLocation(targetLocationID);
+  if (!dockable) {
     return {
       success: false,
       errorMsg: "STATION_NOT_FOUND",
@@ -3954,7 +4601,7 @@ function jumpSessionToStation(session, stationID) {
     };
   }
 
-  if (!beginTransition(session, "station-jump", targetStationID)) {
+  if (!beginTransition(session, "station-jump", targetLocationID)) {
     return {
       success: false,
       errorMsg: "STATION_JUMP_IN_PROGRESS",
@@ -3978,12 +4625,17 @@ function jumpSessionToStation(session, stationID) {
       });
     }
 
-    const dockResult = dockShipToStation(activeShip.itemID, station.stationID);
+    const dockResult = dockShipToLocation(
+      activeShip.itemID,
+      dockable.locationID,
+    );
     if (!dockResult.success) {
       return dockResult;
     }
 
-    const currentRecord = getCharacterRecord(session.characterID);
+    const currentRecord = getCharacterRecord(session.characterID, {
+      expectedLocationTransitionReason: "station-jump",
+    });
     const authoritativeHomeStationID =
       Number(
         (currentRecord && (
@@ -3998,13 +4650,30 @@ function jumpSessionToStation(session, stationID) {
       ) || 0;
 
     const updateResult = updateCharacterRecord(session.characterID, (record) =>
-      buildLocationIdentityPatch(record, station.solarSystemID, {
-        homeStationID: authoritativeHomeStationID || station.stationID,
+      buildLocationIdentityPatch(record, dockable.solarSystemID, {
+        homeStationID:
+          authoritativeHomeStationID ||
+          (dockable.kind === "station" ? dockable.locationID : 60003760),
         cloneStationID:
-          Number(record.cloneStationID || authoritativeHomeStationID || station.stationID) ||
-          station.stationID,
-        stationID: station.stationID,
+          Number(
+            record.cloneStationID ||
+            authoritativeHomeStationID ||
+            (dockable.kind === "station" ? dockable.locationID : 60003760),
+          ) || 60003760,
+        stationID: dockable.kind === "station" ? dockable.locationID : null,
+        structureID:
+          dockable.kind === "structure" ? dockable.locationID : null,
+        ...(options.jumpCloneActivationOperationID
+          ? {
+              jumpCloneActivationTransitionReceipt: {
+                operationID: String(options.jumpCloneActivationOperationID),
+                locationKind: dockable.kind,
+                locationID: dockable.locationID,
+              },
+            }
+          : {}),
       }),
+      { expectedLocationTransitionReason: "station-jump" },
     );
     if (!updateResult.success) {
       return updateResult;
@@ -4020,29 +4689,48 @@ function jumpSessionToStation(session, stationID) {
       return applyResult;
     }
 
-    flushCharacterSessionNotificationPlan(session, applyResult.notificationPlan);
-    syncDockedShipTransitionForSession(session, dockResult);
+    flushCharacterSessionNotificationPlan(
+      session,
+      dockable.kind === "structure"
+        ? applyTqDockingTransitionSessionChangeShape(applyResult.notificationPlan)
+        : applyResult.notificationPlan,
+    );
+    syncDockedShipTransitionForSession(session, dockResult, {
+      locationContext: buildDockedShipLocationContext(
+        dockable.kind,
+        dockable.locationID,
+      ),
+    });
 
     queuePendingSessionEffects(session, {
       previousLocalChannelID,
     });
     flushPendingCommandSessionEffects(session);
-    broadcastOnCharNowInStation(session, station.stationID);
+    if (dockable.kind === "station") {
+      broadcastOnCharNowInStation(session, dockable.locationID);
+    } else {
+      sendDockingFinished(session, dockable.locationID);
+      broadcastOnCharacterEnteredStructure(session, dockable.locationID);
+    }
 
     log.info(
-      `[SpaceTransition] Station jump ${session.characterName || session.characterID} ship=${activeShip.itemID} station=${station.stationID} system=${station.solarSystemID}`,
+      `[SpaceTransition] Dockable jump ${session.characterName || session.characterID} ship=${activeShip.itemID} location=${dockable.locationID} kind=${dockable.kind} system=${dockable.solarSystemID}`,
     );
 
     return {
       success: true,
       data: {
-        station,
+        station: dockable.record,
         boundResult: buildBoundResult(session),
       },
     };
   } finally {
     endTransition(session, "station-jump");
   }
+}
+
+function jumpSessionToStation(session, stationID, options = {}) {
+  return jumpSessionToDockableLocation(session, stationID, options);
 }
 
 function jumpSessionToSolarSystem(session, solarSystemID, options = {}) {
@@ -4052,11 +4740,28 @@ function jumpSessionToSolarSystem(session, solarSystemID, options = {}) {
       errorMsg: "CHARACTER_NOT_SELECTED",
     };
   }
+  const abyssalRestriction = buildActiveAbyssalTransitionBlockedResult(
+    session,
+    "solar-system-jump",
+  );
+  if (abyssalRestriction) {
+    return abyssalRestriction;
+  }
   if (isPilotWarpLandingPending(session)) {
     return buildWarpLandingPendingResult();
   }
 
   const targetSolarSystemID = Number(solarSystemID || 0);
+  if (isAbyssalHostLocationID(targetSolarSystemID)) {
+    return {
+      success: false,
+      errorMsg: "ABYSSAL_DESTINATION_FORBIDDEN",
+      data: {
+        action: "solar-system-jump",
+        destinationSystemID: targetSolarSystemID,
+      },
+    };
+  }
   const system = worldData.getSolarSystemByID(targetSolarSystemID);
   if (!system) {
     return {
@@ -4070,6 +4775,41 @@ function jumpSessionToSolarSystem(session, solarSystemID, options = {}) {
     return {
       success: false,
       errorMsg: "SHIP_NOT_FOUND",
+    };
+  }
+
+  // A jump to the system the pilot is already flying in has nothing to do, and
+  // running the teardown anyway actively breaks the session: the re-anchor at
+  // the arrival stargate silently discards movement already in flight, and
+  // because the solar system never changes no SessionChange packet fires, so
+  // the client never re-binds beyonce, the server waits forever for that bind,
+  // and initialStateSent stays false -- which makes every destiny send path
+  // early-return and leaves the ship frozen. Bail out before beginTransition so
+  // the no-op does not even take the transition lock.
+  //
+  // spawnStateOverride is the safety valve. This is the shared path for
+  // wormholes, cyno beacons, jump bridges, conduits, abyssal and dungeon
+  // entries as well as the /tr chat command, and every caller that needs to
+  // land the pilot at a specific place inside the destination passes an
+  // override -- so a same-system move with one is legitimate and must proceed.
+  // Docked pilots are excluded too: a /tr from inside a station in that same
+  // system is a real move into space.
+  if (
+    session._space &&
+    Number(session._space.systemID || 0) === targetSolarSystemID &&
+    !options.spawnStateOverride &&
+    !Number(session.stationid || session.stationID || 0) &&
+    !Number(session.structureid || session.structureID || 0)
+  ) {
+    return {
+      success: true,
+      data: {
+        solarSystem: system,
+        ship: activeShip,
+        spawnState: null,
+        boundResult: buildBoundResult(session),
+        alreadyInSystem: true,
+      },
     };
   }
 
@@ -4138,6 +4878,13 @@ function jumpSessionToSolarSystem(session, solarSystemID, options = {}) {
       speedFraction: 0,
       mode: "STOP",
       targetPoint: spawnState.position,
+      ...(options.jumpBridgeSettlementReceipt
+        ? {
+            jumpBridgeTransitionReceipt: {
+              ...options.jumpBridgeSettlementReceipt,
+            },
+          }
+        : {}),
     });
     if (!moveResult.success) {
       return moveResult;
@@ -4178,7 +4925,15 @@ function jumpSessionToSolarSystem(session, solarSystemID, options = {}) {
           : {}),
         stationID: null,
         structureID: null,
+        ...(options.jumpBridgeSettlementReceipt
+          ? {
+              jumpBridgeTransitionReceipt: {
+                ...options.jumpBridgeSettlementReceipt,
+              },
+            }
+          : {}),
       }),
+      { expectedLocationTransitionReason: "solar-system-jump" },
     );
     if (!updateResult.success) {
       return updateResult;
@@ -4270,12 +5025,19 @@ function jumpSessionToSolarSystem(session, solarSystemID, options = {}) {
   }
 }
 
-function jumpSessionToShipCloneBay(session, targetShipID) {
+function jumpSessionToShipCloneBay(session, targetShipID, options = {}) {
   if (!session || !session.characterID) {
     return {
       success: false,
       errorMsg: "CHARACTER_NOT_SELECTED",
     };
+  }
+  const abyssalRestriction = buildActiveAbyssalTransitionBlockedResult(
+    session,
+    "ship-clone-bay-jump",
+  );
+  if (abyssalRestriction) {
+    return abyssalRestriction;
   }
   if (isPilotWarpLandingPending(session)) {
     return buildWarpLandingPendingResult();
@@ -4316,7 +5078,7 @@ function jumpSessionToShipCloneBay(session, targetShipID) {
     };
   }
 
-  if (Number(activeShip.typeID) !== CAPSULE_TYPE_ID) {
+  if (!isCapsuleTypeID(activeShip.typeID)) {
     if (!isDockedSession(session)) {
       return {
         success: false,
@@ -4469,7 +5231,17 @@ function jumpSessionToShipCloneBay(session, targetShipID) {
           : {}),
         stationID: null,
         structureID: null,
+        ...(options.jumpCloneActivationOperationID
+          ? {
+              jumpCloneActivationTransitionReceipt: {
+                operationID: String(options.jumpCloneActivationOperationID),
+                locationKind: "ship",
+                locationID: targetItemID,
+              },
+            }
+          : {}),
       }),
+      { expectedLocationTransitionReason: "ship-clone-bay-jump" },
     );
     if (!updateResult.success) {
       return updateResult;
@@ -4570,6 +5342,7 @@ module.exports = {
   getStrategicCruiserTransitionUseError,
   jumpSessionViaStargate,
   rebuildDockedSessionAtStation,
+  jumpSessionToDockableLocation,
   jumpSessionToStation,
   jumpSessionToShipCloneBay,
   jumpSessionToSolarSystem,
@@ -4577,13 +5350,16 @@ module.exports = {
   repairSameSceneSessionViewState,
 };
 module.exports._testing = {
+  buildActiveAbyssalTransitionBlockedResult,
   buildBoundResultForTesting: buildBoundResult,
   buildGateSpawnState,
+  buildStargateJumpHandoffDeadline,
   completeStargateJumpForTesting: completeStargateJump,
   clearStargateJumpQueuesForTesting() {
     stargateJumpQueuesByDestination.clear();
   },
   getResolvedStargateForwardDirection,
+  getStargateJumpHandoffWallclockDelayMs,
   recordStargateJumpQueueEntryForTesting: recordStargateJumpQueueEntry,
   getSurfaceDistanceBetweenEntities,
   resolveSameSceneEgoAddBallsStamp,

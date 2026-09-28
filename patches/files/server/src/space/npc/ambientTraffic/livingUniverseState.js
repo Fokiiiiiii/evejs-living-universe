@@ -822,7 +822,23 @@ function flushDurably() {
 }
 
 function suspendPersistence(reason) {
-  return database.suspendTableFlush(TABLE_NAME, reason);
+  // ponytail: quarantine the full table until restart after rollback failure; per-component recovery needs transactional writes.
+  if (typeof database.setTransientPath !== "function") {
+    return { success: false, errorMsg: "TRANSIENT_PATH_API_UNSUPPORTED" };
+  }
+  try {
+    database.setTransientPath(TABLE_NAME, ROOT_PATH, true);
+    return {
+      success: true,
+      suspended: true,
+      reason: String(reason || ""),
+    };
+  } catch (error) {
+    return {
+      success: false,
+      errorMsg: error && error.message || "PERSISTENCE_SUSPEND_FAILED",
+    };
+  }
 }
 
 function removeState() {

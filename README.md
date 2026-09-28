@@ -23,12 +23,13 @@ before changing anything and stops on a mismatch.
 
 ## Install
 
-You need the Go-built `xeve-patch` CLI, a clean EveJS v0.12.3.1 baseline, and
-Node.js/Rust/VS Build Tools for running the server itself. Stop the server and
-its supporting services, extract a clean EVEJS baseline, then run:
+You need the Go-built `xeve-patch` CLI and a clean EveJS v0.12.9 tree at
+commit `828823a75f211fdecb945b087a26c225f111491f`, plus Node.js/Rust/VS Build
+Tools for running the server itself. Stop the server and its supporting
+services, extract a clean EVEJS baseline, then run:
 
 ```bash
-xeve-patch install /path/to/EveJS-v0.12.3.1
+xeve-patch install /path/to/EveJS-v0.12.9
 ```
 
 The CLI validates the exact baseline against the release manifest, backs up the
@@ -38,15 +39,15 @@ and rolls back automatically on any failure.
 Verify an installed tree, or a clean baseline, separately:
 
 ```bash
-xeve-patch verify /path/to/EveJS-v0.12.3.1
+xeve-patch verify /path/to/EveJS-v0.12.9
 ```
 
 Run the patch's bundled verification scripts (grouped by subsystem) after the
 server has been started once:
 
 ```bash
-xeve-patch verify /path/to/EveJS-v0.12.3.1 --module livingEconomy
-xeve-patch verify /path/to/EveJS-v0.12.3.1 --tests
+xeve-patch verify /path/to/EveJS-v0.12.9 --module livingEconomy
+xeve-patch verify /path/to/EveJS-v0.12.9 --tests
 ```
 
 Additional commands: `xeve-patch status`, `xeve-patch repair`,

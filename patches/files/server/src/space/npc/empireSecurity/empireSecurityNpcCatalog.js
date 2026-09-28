@@ -1,3 +1,5 @@
+"use strict";
+
 const {
   EVERMORE_CUSTOMS_CORPORATION_ID,
   EVERMORE_CUSTOMS_LOADOUT_ID,
@@ -19,6 +21,7 @@ const NPC_TABLE = Object.freeze({
 });
 
 const PASSIVE_SECURITY_BEHAVIOR_ID = "npc_passive_idle";
+const GENERIC_LOOT_TABLE_ID = "generic_random_any";
 
 function buildSpawnGroup(spawnGroupID, name, description, entityType, entries, aliases = []) {
   return {
@@ -125,11 +128,15 @@ function buildGeneratedRows() {
 
 let cachedRowsByTableName = null;
 
+// Shared so tables this catalog does not contribute to return the same array
+// every call; npcData caches by identity and a fresh [] defeats it.
+const NO_GENERATED_ROWS = Object.freeze([]);
+
 function getEmpireSecurityGeneratedRows(tableName) {
   if (!cachedRowsByTableName) {
     cachedRowsByTableName = buildGeneratedRows();
   }
-  return cachedRowsByTableName[tableName] || [];
+  return cachedRowsByTableName[tableName] || NO_GENERATED_ROWS;
 }
 
 module.exports = {

@@ -1,5 +1,15 @@
+"use strict";
+
+const {
+  cloneValue,
+} = require("../../common/clone");
+const {
+  toFiniteNumber,
+} = require("../../common/numbers");
+
 const path = require("path");
 
+const log = require(path.join(__dirname, "../../utils/logger"));
 const {
   buildKillmailItemTreeForLocation,
 } = require(path.join(__dirname, "../../services/killmail/killmailItemPayload"));
@@ -7,15 +17,19 @@ const {
   resolveItemByTypeID,
 } = require(path.join(__dirname, "../../services/inventory/itemTypeRegistry"));
 const {
-  JOURNAL_ENTRY_TYPE,
-  adjustCharacterBalance,
-  getCharacterWallet,
-} = require(path.join(__dirname, "../../services/account/walletState"));
-const {
   ENTITY_TYPE,
 } = require(path.join(__dirname, "../entityConstants"));
+const {
+  resolveExactAbyssalNpcOutcomeContext,
+  shouldSuppressResolvedAbyssalNpcOutcome,
+} = require(path.join(
+  __dirname,
+  "../../services/_shared/abyssalNpcOutcomePolicy",
+));
+const {
+  toPublicSolarSystemID,
+} = require("../../abyssal").engineSupport.hostLocation;
 
-const CONCORD_CORPORATION_ID = 1000125;
 const CATEGORY_SHIP = 6;
 const GROUP_CAPSULE = 29;
 const GROUP_SHUTTLE = 31;
@@ -52,12 +66,28 @@ function getShipKillCounterStateService() {
   return require(path.join(__dirname, "../../services/ship/shipKillCounterState"));
 }
 
-function getNotificationStateService() {
-  return require(path.join(__dirname, "../../services/notifications/notificationState"));
+function getKillmailPostCommitPipeline() {
+  const pipeline = require(path.join(
+    __dirname,
+    "../../services/killmail/killmailPostCommitPipeline",
+  ));
+  pipeline.recoverPending({
+    onCommitted(record) {
+      return getKillmailNotificationFanout().notifyVictimKillmailAvailable(record);
+    },
+  });
+  return pipeline;
 }
 
-function getNotificationConstants() {
-  return require(path.join(__dirname, "../../services/notifications/notificationConstants"));
+function getKillmailNotificationFanout() {
+  return require(path.join(
+    __dirname,
+    "../../services/killmail/killmailNotificationFanout",
+  ));
+}
+
+function recoverPendingKillmailWork() {
+  return getKillmailPostCommitPipeline();
 }
 
 function createKillmailRecord(recordInput) {
@@ -65,6 +95,48 @@ function createKillmailRecord(recordInput) {
   return killmailState && typeof killmailState.createKillmailRecord === "function"
     ? killmailState.createKillmailRecord(recordInput)
     : { success: false, errorMsg: "KILLMAIL_STATE_UNAVAILABLE" };
+}
+
+function queueClassicPirateFobPayout(targetEntity, killmail, nowMs) {
+  if (
+    !targetEntity ||
+    String(targetEntity.kind || "").toLowerCase() !== "structure" ||
+    !killmail ||
+    toPositiveInt(killmail.killID, 0) <= 0
+  ) return;
+  try {
+    const classicFobRuntime = require(path.join(
+      __dirname,
+      "../../services/structure/classicPirateFobRuntime",
+    ));
+    if (
+      typeof classicFobRuntime.resolveClassicPirateFobFaction !== "function" ||
+      !classicFobRuntime.resolveClassicPirateFobFaction(targetEntity.typeID) ||
+      typeof classicFobRuntime.settleClassicPirateFobPayoutForDestruction !== "function"
+    ) return;
+    Promise.resolve(classicFobRuntime.settleClassicPirateFobPayoutForDestruction({
+      structureID: targetEntity.itemID,
+      killmail,
+      nowMs,
+    })).then((result) => {
+      if (!result || result.success !== true) {
+        log.warn(
+          `[ClassicFOB] Payout settlement failed structure=${targetEntity.itemID} ` +
+            `killID=${killmail.killID} error=${result && result.errorMsg || "UNKNOWN"}`,
+        );
+      }
+    }).catch((error) => {
+      log.warn(
+        `[ClassicFOB] Payout settlement threw structure=${targetEntity.itemID} ` +
+          `killID=${killmail.killID} error=${error && error.message || error}`,
+      );
+    });
+  } catch (error) {
+    log.warn(
+      `[ClassicFOB] Payout authority unavailable structure=${targetEntity.itemID} ` +
+        `killID=${killmail.killID} error=${error && error.message || error}`,
+    );
+  }
 }
 
 function resolveKillmailWarID(recordInput) {
@@ -81,11 +153,6 @@ function resolveCharacterRecord(characterID) {
     : null;
 }
 
-function toFiniteNumber(value, fallback = 0) {
-  const numericValue = Number(value);
-  return Number.isFinite(numericValue) ? numericValue : fallback;
-}
-
 function toInteger(value, fallback = 0) {
   const numericValue = Number(value);
   if (!Number.isFinite(numericValue)) {
@@ -97,13 +164,6 @@ function toInteger(value, fallback = 0) {
 function toPositiveInt(value, fallback = null) {
   const numericValue = toInteger(value, 0);
   return numericValue > 0 ? numericValue : fallback;
-}
-
-function cloneValue(value) {
-  if (value === undefined || value === null) {
-    return value;
-  }
-  return JSON.parse(JSON.stringify(value));
 }
 
 function formatKillmailFiletime(whenMs = Date.now()) {
@@ -238,6 +298,29 @@ function isNpcVictimEntity(entity) {
   );
 }
 
+// Last-resort victim identity, and in practice the ONLY one that survives.
+//
+// ⚠ WHY THIS EXISTS. A destroyed player ship reaches recordKillmailFromDestruction
+// already unlinked from its pilot: pilotCharacterID and characterID are 0 and
+// `session` is null (see the shape the golden killmailParity test builds). The
+// runtime captures `targetEntity.session` before the destroy, but for a player
+// ship that field is null there too, so `victimSession` arrives empty and the
+// victim resolved to NULL. Losses were then written with victimCharacterID:null,
+// which the killmail index cannot file under anyone — so a player's losses never
+// appeared in their combat log at all.
+//
+// `ownerID` is the one identity that does survive, and it is already trusted
+// enough to be used for the victim's CORPORATION below. Only accept it when it
+// resolves to a real character, so an NPC hull whose ownerID is a faction corp
+// can never be mistaken for a capsuleer.
+function resolveVictimCharacterIDFromOwner(targetEntity) {
+  const ownerID = toPositiveInt(targetEntity && targetEntity.ownerID, null);
+  if (!ownerID || !resolveCharacterRecord(ownerID)) {
+    return null;
+  }
+  return ownerID;
+}
+
 function canAwardKillmark(targetEntity, attackerEntity, finalAttacker, victimIdentity) {
   if (!isCapsuleerPilotedShipVictim(targetEntity, victimIdentity)) {
     return false;
@@ -315,6 +398,7 @@ function broadcastKillmarkSlimChange(targetEntity, attackerEntity, awardShipID, 
     scene.broadcastSlimItemChanges([liveEntity]);
     return true;
   } catch (error) {
+    // ignored: the kill is recorded either way; false says the live kill marks were not refreshed
     return false;
   }
 }
@@ -391,7 +475,7 @@ function resolveVictimIdentity(targetEntity, options = {}) {
     : toPositiveInt(
         targetEntity.pilotCharacterID ?? targetEntity.characterID,
         sessionCharacterID,
-      );
+      ) ?? resolveVictimCharacterIDFromOwner(targetEntity);
   const characterRecord = characterID ? resolveCharacterRecord(characterID) || {} : {};
   return {
     victimCharacterID: characterID,
@@ -476,6 +560,83 @@ function noteDamage(attackerEntity, targetEntity, appliedDamage, options = {}) {
   return cloneValue(currentEntry);
 }
 
+// NPC wreck ownership follows damage contribution, while the killmail still
+// records the pilot who landed the final blow separately.  Ledger rows are
+// keyed by the full ship/weapon identity for killmail fidelity, so collapse
+// them by character here before comparing totals.  The lethal hit is supplied
+// as a non-mutating candidate because destruction currently happens before
+// the normal post-damage ledger write.
+function resolveHighestDamageAttacker(targetEntity, options = {}) {
+  if (!targetEntity) {
+    return null;
+  }
+
+  const whenMs = Number.isFinite(Number(options.whenMs))
+    ? Number(options.whenMs)
+    : Date.now();
+  cleanupExpiredLedgers(whenMs);
+  const ledger = ledgersByVictim.get(getVictimLedgerKey(targetEntity)) || null;
+  const totalsByCharacterID = new Map();
+
+  const addContribution = (identity, damageDone) => {
+    const characterID = toPositiveInt(identity && identity.characterID, 0);
+    const damage = Math.max(0, toFiniteNumber(damageDone, 0));
+    if (characterID <= 0 || damage <= 0) {
+      return;
+    }
+    const current = totalsByCharacterID.get(characterID) || {
+      characterID,
+      corporationID: null,
+      allianceID: null,
+      factionID: null,
+      shipTypeID: null,
+      weaponTypeID: null,
+      securityStatus: null,
+      damageDone: 0,
+    };
+    for (const field of [
+      "corporationID",
+      "allianceID",
+      "factionID",
+      "shipTypeID",
+      "weaponTypeID",
+      "securityStatus",
+    ]) {
+      if (identity && identity[field] !== undefined && identity[field] !== null) {
+        current[field] = identity[field];
+      }
+    }
+    current.damageDone += damage;
+    totalsByCharacterID.set(characterID, current);
+  };
+
+  for (const entry of Object.values(ledger && ledger.attackers || {})) {
+    addContribution(entry, entry && entry.damageDone);
+  }
+
+  const candidateDamage = Math.max(
+    0,
+    toFiniteNumber(options.candidateDamage, 0),
+  );
+  if (candidateDamage > 0 && options.candidateAttackerEntity) {
+    addContribution(
+      resolveAttackerIdentity(
+        options.candidateAttackerEntity,
+        options.candidateOptions || options,
+      ),
+      candidateDamage,
+    );
+  }
+
+  const ranked = [...totalsByCharacterID.values()].sort((left, right) => (
+    toFiniteNumber(right && right.damageDone, 0) -
+      toFiniteNumber(left && left.damageDone, 0) ||
+    toPositiveInt(left && left.characterID, 0) -
+      toPositiveInt(right && right.characterID, 0)
+  ));
+  return ranked.length > 0 ? cloneValue(ranked[0]) : null;
+}
+
 function resolveKillmailItems(destroyResult = {}, lootLocationIDs = []) {
   const lootOutcomeItems =
     destroyResult &&
@@ -548,29 +709,17 @@ function resolveBountyPayout(targetEntity, finalAttacker = {}, options = {}) {
   }
 
   const hunterCharacterID = toPositiveInt(finalAttacker && finalAttacker.characterID, null);
-  if (!hunterCharacterID || !getCharacterWallet(hunterCharacterID)) {
+  if (!hunterCharacterID) {
     return null;
   }
 
   const playerBountyState = require(path.join(__dirname, "../../services/bounty/playerBountyState"));
   const payoutResult = playerBountyState.claimBountyPayout({
     victim: options.victimIdentity || {},
+    victimEntity: targetEntity,
     iskLost: options.iskLost,
     hunterCharacterID,
-  });
-  if (!payoutResult || payoutResult.eligible !== true || !(payoutResult.amount > 0)) {
-    return null;
-  }
-
-  const creditResult = adjustCharacterBalance(hunterCharacterID, payoutResult.amount, {
-    entryTypeID: JOURNAL_ENTRY_TYPE.NPC_BOUNTY_PRIZE,
-    description: JSON.stringify({
-      playerBounty: true,
-      targetIDs: payoutResult.allocations.map((allocation) => allocation.targetID),
-      iskLost: payoutResult.lossValue,
-      capAmount: payoutResult.capAmount,
-    }),
-    ownerID1: hunterCharacterID,
+    payoutID: options.payoutID,
     ownerID2:
       toPositiveInt(options.victimIdentity && options.victimIdentity.victimCharacterID, 0) ||
       toPositiveInt(options.victimIdentity && options.victimIdentity.victimCorporationID, 0) ||
@@ -581,7 +730,10 @@ function resolveBountyPayout(targetEntity, finalAttacker = {}, options = {}) {
       toPositiveInt(options.victimIdentity && options.victimIdentity.victimCharacterID, 0) ||
       hunterCharacterID,
   });
-  return creditResult.success ? payoutResult.amount : null;
+  if (!payoutResult || payoutResult.eligible !== true || !(payoutResult.amount > 0)) {
+    return null;
+  }
+  return payoutResult.amount;
 }
 
 function selectKillRightActivationForKill(victimCharacterID, finalAttacker, whenMs) {
@@ -685,49 +837,6 @@ function notifyKillRightUsed(activation, targetEntity, attackerEntity) {
   return sessions.length;
 }
 
-function isLiveNotificationSession(session) {
-  return Boolean(
-    session &&
-      typeof session.sendNotification === "function" &&
-      (!session.socket || !session.socket.destroyed),
-  );
-}
-
-function resolveKillmailNotificationSessions(victimCharacterID, extraSessions = []) {
-  const targetCharacterID = toPositiveInt(victimCharacterID, 0) || 0;
-  if (targetCharacterID <= 0) {
-    return [];
-  }
-
-  const sessions = [];
-  const seen = new Set();
-  const addSession = (session) => {
-    if (!isLiveNotificationSession(session) || seen.has(session)) {
-      return;
-    }
-    const sessionCharacterID = toPositiveInt(
-      session.characterID || session.charID || session.charid,
-      0,
-    ) || 0;
-    if (sessionCharacterID !== targetCharacterID) {
-      return;
-    }
-    seen.add(session);
-    sessions.push(session);
-  };
-
-  const sessionRegistry = getSessionRegistry();
-  if (sessionRegistry && typeof sessionRegistry.getSessions === "function") {
-    for (const session of sessionRegistry.getSessions()) {
-      addSession(session);
-    }
-  }
-  for (const session of Array.isArray(extraSessions) ? extraSessions : []) {
-    addSession(session);
-  }
-  return sessions;
-}
-
 function notifyVictimKillmailAvailable(record, targetEntity, victimIdentity, options = {}) {
   const victimCharacterID = toPositiveInt(
     victimIdentity && victimIdentity.victimCharacterID,
@@ -738,58 +847,37 @@ function notifyVictimKillmailAvailable(record, targetEntity, victimIdentity, opt
     return null;
   }
 
-  const notificationState = getNotificationStateService();
-  const notificationConstants = getNotificationConstants();
-  if (
-    !notificationState ||
-    typeof notificationState.createNotification !== "function" ||
-    !notificationConstants ||
-    !notificationConstants.NOTIFICATION_TYPE
-  ) {
-    return null;
-  }
-
-  const killmailState = getKillmailStateService();
-  const killMailHash =
-    killmailState && typeof killmailState.getKillmailHashValue === "function"
-      ? killmailState.getKillmailHashValue(record)
-      : "";
   const extraSessions = [
     targetEntity && targetEntity.session,
     options.victimSession,
   ].filter(Boolean);
-  const notificationResult = notificationState.createNotification(victimCharacterID, {
-    typeID: notificationConstants.NOTIFICATION_TYPE.KILL_REPORT_AVAILABLE,
-    senderID: CONCORD_CORPORATION_ID,
-    groupID: notificationConstants.NOTIFICATION_GROUP.WAR,
-    processed: false,
-    created: record.killTime,
-    data: {
-      killMailHash,
-      killMailID: killID,
-      victimShipTypeID:
-        toPositiveInt(record.victimShipTypeID, 0) ||
-        toPositiveInt(victimIdentity && victimIdentity.victimShipTypeID, 0) ||
-        null,
-    },
+  return getKillmailNotificationFanout().notifyVictimKillmailAvailable(record, {
+    victimCharacterID,
+    victimShipTypeID:
+      toPositiveInt(record.victimShipTypeID, 0) ||
+      toPositiveInt(victimIdentity && victimIdentity.victimShipTypeID, 0) ||
+      null,
     extraSessions,
   });
-  if (!notificationResult || notificationResult.success !== true) {
-    return notificationResult || null;
+}
+
+// The killer's kill report, sent off the same committed record as the victim's.
+// Fires for every kill the record itself says belongs in a kill log, which
+// includes player-owned structures as well as capsuleers, so the shooter and
+// their corporation see the kill without waiting for the victim to log in.
+function notifyFinalBlowKillmailAvailable(record, attackerEntity, options = {}) {
+  const killID = toPositiveInt(record && record.killID, 0) || 0;
+  if (killID <= 0) {
+    return null;
   }
 
-  const sessions = resolveKillmailNotificationSessions(
-    victimCharacterID,
+  const extraSessions = [
+    attackerEntity && attackerEntity.session,
+    options.attackerSession,
+  ].filter(Boolean);
+  return getKillmailNotificationFanout().notifyFinalBlowKillmailAvailable(record, {
     extraSessions,
-  );
-  for (const session of sessions) {
-    session.sendNotification("OnKillNotification", "charid", []);
-    session.sendNotification("OnShipDeath", "charid", []);
-  }
-  return {
-    ...notificationResult,
-    sentSessionCount: sessions.length,
-  };
+  });
 }
 
 function consumeKillRightAfterKill(activation, targetEntity, attackerEntity, whenMs) {
@@ -827,6 +915,29 @@ function consumeKillRightAfterKill(activation, targetEntity, attackerEntity, whe
   };
 }
 
+function recordCombatAchievement(killRecord, context = {}) {
+  const killID = toPositiveInt(killRecord && killRecord.killID, 0);
+  if (!killID) {
+    return;
+  }
+  try {
+    require(path.join(
+      __dirname,
+      "../../services/achievement/achievementRuntime",
+    )).recordCombatKillmailOutcome({
+      killID,
+      solarSystemID: context.solarSystemID,
+      victimEntity: context.targetEntity,
+      victimIdentity: context.victimIdentity,
+      finalAttacker: context.finalAttacker,
+    });
+  } catch (error) {
+    // Killmail persistence and combat state must never be held hostage by
+    // optional progression bookkeeping.
+    log.debug(`[Killmail] achievement progress for kill ${killID} failed: ${error && error.message}`);
+  }
+}
+
 function recordKillmailFromDestruction(targetEntity, destroyResult, options = {}) {
   if (!targetEntity || !destroyResult || destroyResult.success !== true) {
     return null;
@@ -834,6 +945,19 @@ function recordKillmailFromDestruction(targetEntity, destroyResult, options = {}
 
   const whenMs = Number.isFinite(Number(options.whenMs)) ? Number(options.whenMs) : Date.now();
   const ledgerKey = getVictimLedgerKey(targetEntity);
+  if (String(targetEntity.kind || "").toLowerCase() === "drone") {
+    // Omit drones from killmails
+    ledgersByVictim.delete(ledgerKey);
+    return null;
+  }
+  const abyssalNpcContext = resolveExactAbyssalNpcOutcomeContext(targetEntity);
+  if (shouldSuppressResolvedAbyssalNpcOutcome(abyssalNpcContext)) {
+    // NPC-victim killmails expose the reused host location, encounter hull mix,
+    // and corporation activity. Abyssal NPC outcomes are private run state, so
+    // clear the transient damage ledger without persisting a public record.
+    ledgersByVictim.delete(ledgerKey);
+    return null;
+  }
   const ledger = ledgersByVictim.get(ledgerKey) || getOrCreateLedger(targetEntity, whenMs);
   const finalIdentity = resolveAttackerIdentity(options.attackerEntity || null, options);
   const finalAttackerKey = buildAttackerLedgerKey(finalIdentity);
@@ -856,76 +980,90 @@ function recordKillmailFromDestruction(targetEntity, destroyResult, options = {}
     whenMs,
     victimIdentity,
     iskLost,
+    payoutID: `kill:${ledgerKey}`,
   });
-  // Faction standing loss (TQ parity): destroying a faction NPC lowers standing with its faction
-  // only (single-faction hit, no derived; debounced per character/faction/system, calibrated from
-  // the golden mission logs). Best-effort; never blocks the kill.
-  if (isNpcVictimEntity(targetEntity)) {
+  // Keep simulated pilot IDs out of player standings; resolve the actual player through the attacker session.
+  let actingPlayerCharacterID = 0;
+  if (
+    isNpcVictimEntity(targetEntity) ||
+    (targetEntity.livingUniverseActorID && targetEntity.livingUniverseFlightID)
+  ) {
     try {
-      // Both standing paths key on the session-resolved acting player — the single
-      // player-identity test (factionHostilityRuntime). finalAttacker.characterID is NOT that
-      // test: NPC drone/fighter final blows carry simulated-pilot characterIDs, which must
-      // receive neither the TQ-parity loss nor the R1 gain (standing writes for fake pilots
-      // would silently accrete rows as the living universe fights itself). For genuine player
-      // kills (turret/missile/smartbomb ships, player drones/fighters) both IDs agree.
-      const factionHostility = require(path.join(__dirname, "../../services/character/factionHostilityRuntime"));
-      const actingPlayerCharacterID = factionHostility.resolveAttackerPlayerCharacterID(
-        options.attackerEntity || null,
+      const factionHostility = require(path.join(
+        __dirname,
+        "../../services/character/factionHostilityRuntime",
+      ));
+      actingPlayerCharacterID = toPositiveInt(
+        factionHostility.resolveAttackerPlayerCharacterID(
+          options.attackerEntity || null,
+        ),
+        0,
       );
-      if (actingPlayerCharacterID > 0) {
-        const factionKillStanding = require(path.join(__dirname, "../../services/character/factionKillStandingRuntime"));
-        factionKillStanding.recordNpcFactionStandingLoss(
-          targetEntity,
-          actingPlayerCharacterID,
-          { nowMs: whenMs, systemID: toPositiveInt(targetEntity && targetEntity.systemID, 0) },
-        );
-        // Resident track R1: the same kill grants a small standing gain with the victim
-        // faction's designated enemies (config-gated, non-TQ). Best-effort like the loss path.
+    } catch (_error) {
+      // Best-effort identity resolution must not block the kill pipeline.
+    }
+  }
+  const standingOptions = {
+    nowMs: whenMs,
+    systemID: toPositiveInt(targetEntity && targetEntity.systemID, 0),
+  };
+  if (isNpcVictimEntity(targetEntity) && actingPlayerCharacterID > 0) {
+    try {
+      const factionKillStanding = require(path.join(
+        __dirname,
+        "../../services/character/factionKillStandingRuntime",
+      ));
+      factionKillStanding.recordNpcFactionStandingLoss(
+        targetEntity,
+        actingPlayerCharacterID,
+        standingOptions,
+      );
+      if (typeof factionKillStanding.recordNpcFactionStandingGains === "function") {
         factionKillStanding.recordNpcFactionStandingGains(
           targetEntity,
           actingPlayerCharacterID,
-          { nowMs: whenMs, systemID: toPositiveInt(targetEntity && targetEntity.systemID, 0) },
+          standingOptions,
         );
       }
-    } catch (error) {
-      /* faction-standing loss is best-effort; the kill must still record */
+    } catch (_error) {
+      // Standing is best-effort; the kill must still record.
     }
   }
-  // Resident track R1: when a living-universe pilot dies to a player's final blow, stage the
-  // actorID -> killer credit for the living runtime's absence-based loss accounting. Gated on
-  // livingUniverseFlightID (exclusive to living flights — industrial/mining crew hulls reuse
-  // livingUniverseActorID and their losses are never booked by the living runtime), and the
-  // killer must resolve through the session-backed player test — flag sniffing misses NPC wing
-  // drones, which carry bare simulated-pilot characterIDs. Best-effort; never blocks the kill.
-  if (targetEntity.livingUniverseActorID && targetEntity.livingUniverseFlightID) {
+  if (
+    targetEntity.livingUniverseActorID &&
+    targetEntity.livingUniverseFlightID &&
+    actingPlayerCharacterID > 0
+  ) {
     try {
-      const factionHostility = require(path.join(__dirname, "../../services/character/factionHostilityRuntime"));
-      const killerCharacterID = factionHostility.resolveAttackerPlayerCharacterID(
-        options.attackerEntity || null,
+      const livingKillCreditLedger = require(path.join(
+        __dirname,
+        "../npc/ambientTraffic/livingKillCreditLedger",
+      ));
+      livingKillCreditLedger.recordPlayerKillCredit(
+        String(targetEntity.livingUniverseActorID),
+        actingPlayerCharacterID,
+        whenMs,
       );
-      if (killerCharacterID > 0) {
-        const livingKillCreditLedger = require(path.join(
-          __dirname,
-          "../npc/ambientTraffic/livingKillCreditLedger",
-        ));
-        livingKillCreditLedger.recordPlayerKillCredit(
-          String(targetEntity.livingUniverseActorID),
-          killerCharacterID,
-          whenMs,
-        );
-      }
-    } catch (error) {
-      /* kill credit is best-effort; the kill must still record */
+    } catch (_error) {
+      // Kill credit is best-effort; the kill must still record.
     }
   }
+
   const killRightActivation = selectKillRightActivationForKill(
     victimIdentity.victimCharacterID,
     finalAttacker,
     whenMs,
   );
+  const rawSolarSystemID = toPositiveInt(
+    targetEntity.systemID,
+    toPositiveInt(ledger.solarSystemID, null),
+  );
   const killRecordInput = {
     killTime: formatKillmailFiletime(whenMs),
-    solarSystemID: toPositiveInt(targetEntity.systemID, toPositiveInt(ledger.solarSystemID, null)),
+    // Reserved Abyssal hosts are reusable implementation details, not public
+    // geography. Preserve the player loss but redact its host at the point the
+    // durable killmail is assembled; never misattribute it to the entry system.
+    solarSystemID: toPublicSolarSystemID(rawSolarSystemID, null),
     moonID: null,
     ...victimIdentity,
     victimDamageTaken: Math.max(0, toFiniteNumber(ledger.damageTaken, 0)),
@@ -950,9 +1088,66 @@ function recordKillmailFromDestruction(targetEntity, destroyResult, options = {}
     items,
   };
   killRecordInput.warID = resolveKillmailWarID(killRecordInput);
+
+  if (options.deferPostCommit === true) {
+    const targetSession = targetEntity.session || null;
+    const victimSession = options.victimSession || null;
+    const attackerSession =
+      (options.attackerEntity && options.attackerEntity.session) || null;
+    const pipeline = getKillmailPostCommitPipeline();
+    const receipt = pipeline.enqueue(killRecordInput, {
+      onCommitted(record) {
+        const victimResult = notifyVictimKillmailAvailable(
+          record,
+          { session: targetSession },
+          victimIdentity,
+          { victimSession },
+        );
+        notifyFinalBlowKillmailAvailable(record, { session: attackerSession });
+        queueClassicPirateFobPayout(targetEntity, record, whenMs);
+        return victimResult;
+      },
+    });
+    const reservedRecord = receipt && receipt.success
+      ? { killID: receipt.killID }
+      : null;
+
+    // These are authoritative combat consequences. They commit at the
+    // destruction boundary and never wait for killmail enrichment,
+    // persistence, or client fan-out.
+    awardKillmarkForFinalBlow(
+      targetEntity,
+      options.attackerEntity || null,
+      finalAttacker,
+      victimIdentity,
+      reservedRecord,
+      { whenMs },
+    );
+    if (killRightActivation) {
+      consumeKillRightAfterKill(
+        killRightActivation,
+        targetEntity,
+        options.attackerEntity || null,
+        whenMs,
+      );
+    }
+    if (reservedRecord) {
+      recordCombatAchievement(reservedRecord, {
+        solarSystemID: rawSolarSystemID,
+        targetEntity,
+        victimIdentity,
+        finalAttacker,
+      });
+    }
+    ledgersByVictim.delete(ledgerKey);
+    return receipt && receipt.success ? receipt : null;
+  }
+
   const record = createKillmailRecord(killRecordInput);
   if (record && toPositiveInt(record.killID, 0) > 0) {
     notifyVictimKillmailAvailable(record, targetEntity, victimIdentity, options);
+    notifyFinalBlowKillmailAvailable(record, options.attackerEntity || null, options);
+    queueClassicPirateFobPayout(targetEntity, record, whenMs);
     awardKillmarkForFinalBlow(
       targetEntity,
       options.attackerEntity || null,
@@ -961,6 +1156,12 @@ function recordKillmailFromDestruction(targetEntity, destroyResult, options = {}
       record,
       { whenMs },
     );
+    recordCombatAchievement(record, {
+      solarSystemID: rawSolarSystemID,
+      targetEntity,
+      victimIdentity,
+      finalAttacker,
+    });
   }
   if (record && toPositiveInt(record.killID, 0) > 0 && killRightActivation) {
     consumeKillRightAfterKill(
@@ -974,10 +1175,22 @@ function recordKillmailFromDestruction(targetEntity, destroyResult, options = {}
   return record;
 }
 
+function enqueueKillmailFromDestruction(targetEntity, destroyResult, options = {}) {
+  return recordKillmailFromDestruction(targetEntity, destroyResult, {
+    ...options,
+    deferPostCommit: true,
+  });
+}
+
 module.exports = {
+  enqueueKillmailFromDestruction,
   noteDamage,
+  resolveHighestDamageAttacker,
+  recoverPendingKillmailWork,
   recordKillmailFromDestruction,
 };
 module.exports._testing = {
   notifyVictimKillmailAvailable,
+  notifyFinalBlowKillmailAvailable,
+  resolveKillmailItems,
 };

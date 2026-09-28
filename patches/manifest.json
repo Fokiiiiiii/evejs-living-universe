@@ -1,10 +1,10 @@
 {
   "schemaVersion": 3,
   "release": {
-    "version": "0.3.0",
-    "evejs": "0.12.3.1",
-    "archiveName": "EveJS-v0.12.3.1.zip",
-    "archiveSha256": "1DEB61A51F808D9F2B330214DA64EC297D9EE5F96EE4B8265692A65F35EEFC1E"
+    "version": "0.4.0",
+    "evejs": "0.12.9",
+    "archiveName": "EveJS-v0.12.9-828823a.zip",
+    "archiveSha256": "9A7F3F8901EDAB67DBC47B69E23CAD47D09980A49FA89EE08EF06E4A4310F96F"
   },
   "files": [
     {
@@ -13,8 +13,8 @@
       "kind": "modified",
       "source": "docker-overlay",
       "baseline": {
-        "sha256": "35458E575AA86E256603DEF29D7DB22A0B340856A0FAB6D26D7C57B1AFBF06DB",
-        "size": 1275
+        "sha256": "DB348AB57242EC235136C8AD3876FAA5A4037422360FD1041DE5243DD3FC1080",
+        "size": 2333
       },
       "installed": {
         "sha256": "260A38BD4A2CFA1AB19956BBDAD01E53F10D019A94430163A9A471889C6EBC32",
@@ -28,8 +28,8 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "CC782CB020C48CF8C91BAB2D37A63A6B2412075E7CBAA9E959276AA23624D128",
-        "size": 25823
+        "sha256": "4A6E1F953A0760202F7B20F78E74630B96E641C3CB45C7DA5DC2D6520F319DAC",
+        "size": 29969
       },
       "installed": {
         "sha256": "941092F95714DE19DB47C6E9200E50D1FCA1D5EC9FDDCDEF4563214D44E26ED3",
@@ -43,8 +43,8 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "C4E0A89876FBA84E8626C486BB009E48388614CEF6E8FA362143E5F280439BB9",
-        "size": 20279
+        "sha256": "ED693B38F31EF0A7F6ADF4E7202EF86EE0B8200A6781FDC0496A0E74B800A1FB",
+        "size": 2313
       },
       "installed": {
         "sha256": "75AF681FE3EA664DD606119C3ACA28D052FDEABDC883AA02CFAEB175295DCF85",
@@ -58,12 +58,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "AD7283A3ECC302F2BE3890AAABACADD59DF3059B22CEBC733B868D3AD75F7E62",
-        "size": 9280
+        "sha256": "9AC55A3E051796365C46E3B83347BFF583711386F5EB72EC8C14AB8B77936567",
+        "size": 9317
       },
       "installed": {
-        "sha256": "F2A7A2B5FC5BA15B900FF745E299FF3519F1893304FC9E5DC8BF99E91E3D9608",
-        "size": 9604
+        "sha256": "9AC55A3E051796365C46E3B83347BFF583711386F5EB72EC8C14AB8B77936567",
+        "size": 9317
       },
       "module": "core"
     },
@@ -77,8 +77,8 @@
         "size": 7899
       },
       "installed": {
-        "sha256": "6C2E7453ACC1E6514B7B84822560B2D4A9F4D50AA7CDBF1603062949C58745C0",
-        "size": 9127
+        "sha256": "E00D317C0C6507F15A517740F06ECDFDA9143AE990C7177EF7566EDAABE9F9B5",
+        "size": 8586
       },
       "module": "core"
     },
@@ -88,8 +88,8 @@
       "kind": "modified",
       "source": "docker-overlay",
       "baseline": {
-        "sha256": "3CEF3E7323457C4FC99F5D784701EBA8BFC2640D6E36FA1C5455BB830C95F8AB",
-        "size": 13419
+        "sha256": "E8E47A699C5D6F9772315E268DF8ECC29EB93C9487E6830135DA8C95973C88FD",
+        "size": 18971
       },
       "installed": {
         "sha256": "2711E32A4C0F2FDC8D6442D4891F34C129700B32090A89419A26E850091886E4",
@@ -118,12 +118,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "30FFDBCCC2AE0BC28DBA748AA26DF9DF3779F4EA7CDCA79E0A0E0B86ECAA43AC",
-        "size": 18811
+        "sha256": "BB6F373D2B9B5F02B3E54669241FD759EB4A6CC2FBF84A7B63F9635722C1E9D6",
+        "size": 20267
       },
       "installed": {
-        "sha256": "35002374D896535FC9BCCEE7B4C1F449908C89F1CC2BC04A2D4EB52E82AA7DA8",
-        "size": 20124
+        "sha256": "081FF274C48097066A394FAD350BE213491736D3F4884B9606F61E7D4F45550E",
+        "size": 21556
       },
       "module": "livingEconomy"
     },
@@ -133,12 +133,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "9FF5A3ACB67073D82D61A60D9689CB9D6A48C0057621317F0F9C21B7B6BD55C9",
-        "size": 11343
+        "sha256": "0D4952B33A9112052A06A3FB705776B9647778374C2AB3A44985590E5BC68111",
+        "size": 12280
       },
       "installed": {
-        "sha256": "5AD79A5A549629C138BF6434365C3BEDD5D69B4FCE283650FBE3EAC00A64DC7A",
-        "size": 11711
+        "sha256": "FE9B358FC2BC191E9F3CF06781D9C8BD67B5828425B171E557E190DF99F329AB",
+        "size": 12648
       },
       "module": "livingEconomy"
     },
@@ -148,12 +148,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "08168A78EF0C5DD770DF824934A83E473A369937AC792431EDC90703EE9EA12C",
-        "size": 126707
+        "sha256": "B0DDD3D97F3A9284845C1C9B9A90858A571A58B7D580BA7E0DFFAAAC86344F49",
+        "size": 148730
       },
       "installed": {
-        "sha256": "819528395C132EB5441A00C133764A5ADDAE39F7FECD2A2D14DEDC900E9A4AD2",
-        "size": 149771
+        "sha256": "0B839379B640EAD558CD88175A7FCEE99B4B223EF59AD1B1BB79132A618C2B39",
+        "size": 161398
       },
       "module": "livingEconomy"
     },
@@ -163,12 +163,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "7141E35A4517CF5F939E4531DF5658BCB445ABA4A9A930FDD1D25A7BE51E708E",
-        "size": 9223
+        "sha256": "4BDFADCF7A527EC48B93C85F358CA719F539154870878952560701324ED2385D",
+        "size": 2739
       },
       "installed": {
-        "sha256": "CA80A6259861B0781B1BC3F670232DA4DEB03BD5A093A74F51C1059471257C9C",
-        "size": 11819
+        "sha256": "CA38999B41B63708160FE8AE7A06BBEE137CC9B807DC22A8E4E803FA07698B24",
+        "size": 6725
       },
       "module": "core"
     },
@@ -1153,8 +1153,8 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "3D64B28D63D9AF924BB6ECE95C92A7F40E52B5EFA75FBA8ACE87EF873A6AB54B",
-        "size": 64008
+        "sha256": "A15CDF35087F8C00497FD706673238BFF045D834E168DD63B14BCC61D1DE4F9E",
+        "size": 65599
       },
       "installed": {
         "sha256": "59140A7892966B98EB279B2A331D3221A46488207ECDC59A09A0F2F0238BF3D5",
@@ -1165,11 +1165,11 @@
     {
       "path": "server/src/_secondary/express/gatewayServices/webChatGatewayService.js",
       "operation": "overlay",
-      "kind": "modified",
+      "kind": "added",
       "source": "patch",
       "baseline": {
-        "sha256": "2BACD869C0D42A4811F6B2AE64C141AF4118261426C65B18762F411746AB002A",
-        "size": 12141
+        "sha256": "",
+        "size": 0
       },
       "installed": {
         "sha256": "B9A7C0E45B60A991A8F92ED05A4580C4DBDBA521C048C7591749E1B35C50E6F5",
@@ -1183,8 +1183,8 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "56CC79EE3563DE82784C028B0D2833A088E0D654183ED576887E3A63632FE1D7",
-        "size": 5970
+        "sha256": "05DA6CAD81889FE6F0714240AD1532E17AD863FDD7E347C82AB6A706DC54CDDC",
+        "size": 10531
       },
       "installed": {
         "sha256": "42266A6B7CFA74D5DB26821FFFFD0C510846E62F7CB83D5E14B16DD540DA9CDB",
@@ -1198,12 +1198,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "9D7C2D21C5B35E5F42ED9D2B54C57B03B7AEC504BB8BE8A1DBCD3E8D9A89ACAD",
-        "size": 103164
+        "sha256": "AF57C1B631124A7C5929DD0482452A858DF9DD18683FD2664DBE203267984392",
+        "size": 276
       },
       "installed": {
-        "sha256": "80E2AF44DC5A3F6C394A72D8A0D2703387B47D46F73788FD7D85E6492DE696DC",
-        "size": 164647
+        "sha256": "B600D2ED6963346A321657708B5E2E3FA6D980BFD019D38D41EE169CCDA57952",
+        "size": 16877
       },
       "module": "core"
     },
@@ -1228,12 +1228,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "B080F379566A52205773AD3C3F110A0252C0A690513544F5A7A2E381C24C854E",
-        "size": 47258
+        "sha256": "31068ADEC4251F04229790A4FF6748E4454DBFB45A5D35FA15C65FF5EBABA3FD",
+        "size": 77752
       },
       "installed": {
-        "sha256": "4E91711AA57B2A13B4648ABFCD9809C4092AFAFAB10165095FB3176F906D44FB",
-        "size": 56164
+        "sha256": "0E1D9F07D3582F553A5FF73DDA156F3FDEE4F8425BA85ABC73D2F2385A492275",
+        "size": 85634
       },
       "module": "core"
     },
@@ -1243,8 +1243,8 @@
       "kind": "modified",
       "source": "docker-overlay",
       "baseline": {
-        "sha256": "6DA415252BFB154DFCDD40F151BDFBACEFF5411B531A608085D5CB70FE9DF227",
-        "size": 26239
+        "sha256": "1DA3EF3BE1F79B33B18E3DDF5875E068E5473EB63723A7B2F47D939073294E68",
+        "size": 57548
       },
       "installed": {
         "sha256": "D31BD566BD3CC43AD9308BC4648CF10C649EF0F4B234C83032182E70E2170347",
@@ -1258,12 +1258,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "C8BDFE7A32CF69D4DF39D028B52CCC9BC33AC0515FB28E98059B9DAD9A54B047",
-        "size": 14928
+        "sha256": "018EAB3241831CA0604FAB8B09975FFE3FF58D008ED7BEFBFED775D816ED8D39",
+        "size": 19211
       },
       "installed": {
-        "sha256": "6694FD181C66A9CE2E7DF93B1C24CFAEF64E49353112AA2FFC60029F35A13966",
-        "size": 15839
+        "sha256": "A1733C36003BE6A68F7EEAF81C37FD7F078D52D58795756E75A51EF9306D7CDC",
+        "size": 20087
       },
       "module": "core"
     },
@@ -1273,12 +1273,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "A43C521D70A8A017D135DB5A085325CE1761685609C6B59D318BCAD3793F7862",
-        "size": 6950
+        "sha256": "1D2876355531FBF59337CCF053C5016B678A02191F4F1A9D6FEBEEB2477D9B5D",
+        "size": 7582
       },
       "installed": {
-        "sha256": "6E2CDE54D9DDE6BE967DEAA1A41EFD3752100A67D2045F86A9B49838ED2138E3",
-        "size": 7866
+        "sha256": "AE42C7BC8EC2C1CD758FC8EB04C50D74FDE9C2A6E2E19B5C8DD46F52CFB90393",
+        "size": 8435
       },
       "module": "core"
     },
@@ -1288,8 +1288,8 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "9A6B9386F6A789E80A4F2725DAC7FFB7D22A024FBCD875AE3B6502A4C6B862B6",
-        "size": 20194
+        "sha256": "8C2202AA0989C85F1E37925298E3252C1303579D408636880C8EA4E8EBAA8D1C",
+        "size": 25237
       },
       "installed": {
         "sha256": "B33B22A23CD60BC671AB09064CD2D9D1990FD777BFEDBA1EBC81ACCB70C9F29F",
@@ -1303,12 +1303,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "B8D33721709E3ACEA5666233EF468A3D65B6F52837453FCC5D86409943046246",
-        "size": 21901
+        "sha256": "30E61A655F938956060E0CB96DB6767E6DB9558B8BE199D76A682DCBCB793027",
+        "size": 21951
       },
       "installed": {
-        "sha256": "4A16616AD08E32C569431EB8CDEB10BA22E2166502E1EDD7260344F9560A68A0",
-        "size": 21830
+        "sha256": "30E61A655F938956060E0CB96DB6767E6DB9558B8BE199D76A682DCBCB793027",
+        "size": 21951
       },
       "module": "livingConflict"
     },
@@ -1318,12 +1318,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "BCFF7CE0D28854E6ACDD8C66C41D34A523F88EF0DE2ACCD98BF8AB4A3F0E02A8",
-        "size": 35610
+        "sha256": "F2606545C811DED81723381CB6E38D1A4CBC058CD7AC8C70902753536FB59863",
+        "size": 36244
       },
       "installed": {
-        "sha256": "A245CD7E3FA8AAA0FEEB4F6404927A58DCD9EA21ABAE1808E8BC12B8C8BB834F",
-        "size": 39080
+        "sha256": "F2606545C811DED81723381CB6E38D1A4CBC058CD7AC8C70902753536FB59863",
+        "size": 36244
       },
       "module": "livingUniverse"
     },
@@ -1333,12 +1333,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "1B817F186E55F65AAAAF6D5BBBC6D2509760A8711B9787648C9FFCD4FFD02FCF",
-        "size": 147031
+        "sha256": "D74C43D1E3E0086533A5EE749F5D73FBDF9228A2CEB86B95A6CDFF0E4B8A44E4",
+        "size": 162814
       },
       "installed": {
-        "sha256": "BE33C7EDC70B5B9A2659F7FB305D7899FBE9D9FBEDE6D1169E35DC799C3AF1BE",
-        "size": 148565
+        "sha256": "ACD02EFC0A5788BCF4D91E06CF9E0061D20BF390660DA0D7BC44433B1B3B0BCA",
+        "size": 163648
       },
       "module": "livingUniverse"
     },
@@ -1363,12 +1363,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "1918A645DF9DBF7083A5BADA6C89CCD27D38E76A1279AF06BA84FEEC3CFBD7C0",
-        "size": 5429
+        "sha256": "05211E3F54F8DAD3358A3949610AB2E3CE61D08AC3B68958EBF24C5290359026",
+        "size": 6277
       },
       "installed": {
-        "sha256": "644456B3867939DA3895B91BB967E728A3E6FBBD527E5F2582892115BB1D2F95",
-        "size": 11432
+        "sha256": "39DFBB4B0AD9393720CFEA46A9E4FBCE30B541B032924F9B6BA420030D97F739",
+        "size": 10022
       },
       "module": "livingConflict"
     },
@@ -1378,12 +1378,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "474E023DBE62AA6925F9161FD8310FDEAF01B88A16423562B30326DBF8EB36B2",
-        "size": 354010
+        "sha256": "88E60BD6F77C5C9092DB0901C95EB72EC6237B9FB506F34BCD1F402A66EE570B",
+        "size": 72767
       },
       "installed": {
-        "sha256": "A8DD41BCEC7B1ED17798AE606C2398F158D3C98D1A284E755D7F8B3578C0C3C5",
-        "size": 363428
+        "sha256": "512B6A4997F44A6F8C64647BA71D4B5DBA3811F5F0B1B17C1C5ABDB5B14E5725",
+        "size": 82582
       },
       "module": "core"
     },
@@ -1393,8 +1393,8 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "70AE15EE49507BD2034701517AFA01A4271F6ED608176BC128E598F9BB797C0B",
-        "size": 6333
+        "sha256": "0136DE7D7E6CA17C328B4072B9F976448D2952A54795C1DB51FAA79290B184BB",
+        "size": 6422
       },
       "installed": {
         "sha256": "C59982D663809868AD2CB5297602090CA55B32060C3CF66DEA117AF30294BEEF",
@@ -1408,12 +1408,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "C6C781C1DF361164BE59008DBBBE00E3CE6FEC6C0DA1B0AE1BA95467317529F2",
-        "size": 543
+        "sha256": "2A99BA33969607AA964BB6674B644BAB687C8979236F87B33AB1090323E571BD",
+        "size": 583
       },
       "installed": {
-        "sha256": "11BB6F54692794AF99FDC9DC05EC735907DD64A38A980C4850B9A42816BBFD77",
-        "size": 756
+        "sha256": "A841A12BB821FD5C94AF9A6FAA075EACD155232EFC2F7EF618DEB22884D327BF",
+        "size": 775
       },
       "module": "familyEstate"
     },
@@ -1423,12 +1423,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "49F87A66DBDB24BCD16EBA7470CBC3AC4BD5C9D715A28D449116536A1134FF28",
-        "size": 13675
+        "sha256": "103CAF16EACB193AAAB3BFA8B34E8F9F8649BE66503709C11EAA7A916D486467",
+        "size": 14377
       },
       "installed": {
-        "sha256": "D1E6E03F315DD9839D671723E47090FB2B10844114EDFD3CAEB2B13880E21B82",
-        "size": 35510
+        "sha256": "A84F57CC68FE114CF4C2369893F5AE92325C6683E4AA07F8EB30CF1B2EC35BAD",
+        "size": 35789
       },
       "module": "familyEstate"
     },
@@ -1438,8 +1438,8 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "56A6C2DC10CFAA3D0E7958BC944A652FF6B98BE7515E1A1707B72EBE005D4BA1",
-        "size": 104679
+        "sha256": "1D7CF7593EBFAA17D62FFBE1CF677A75BC72E691AF5F48912469BEE7AE1918F9",
+        "size": 106333
       },
       "installed": {
         "sha256": "13B056A2D5D8602605AE70B1A48D2FC767BECAE740A173E3E128F04F11C8E34B",
@@ -1453,12 +1453,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "D18A330D8146BDEE68F73818F66AF455FA0A3A149BC1A3E14D71D74C76BF5964",
-        "size": 19134
+        "sha256": "49CBD80934D5352D31518B98D45321C3EE2E7B6A5EA016E3F2506E65DA8FD741",
+        "size": 27166
       },
       "installed": {
-        "sha256": "99F5DE1B5394211233BBD45737BE90F8F8269EF48FA99CD736BBD2E42C166492",
-        "size": 19747
+        "sha256": "6225C28E4857D49C76D3700217FFEF93E8D7BCCBEE49971B817328CC0E58399F",
+        "size": 27620
       },
       "module": "core"
     },
@@ -1468,8 +1468,8 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "9A73152DA2873EAA9580AD88ED42A070E3B7543FE07AC567BF93F82D44BF5807",
-        "size": 11991
+        "sha256": "76F8D2B24C2E541B976284028CD8D9D5F4ADE3140219EE91E6C22B7E74BBA7B9",
+        "size": 12990
       },
       "installed": {
         "sha256": "FABE490BA527F8CCFF059746CBC5A2B659C0EF4DB4E19D9197C2D445ADFC6912",
@@ -1498,8 +1498,8 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "8F485709931A3B41CFC99038B43D91103163E2A36E41F1848638C45A63B512D4",
-        "size": 100376
+        "sha256": "21A292528BD252F149E92C34EE396D973CC78792A25B4A69C4DBDA9AA655C625",
+        "size": 136394
       },
       "installed": {
         "sha256": "A567CCD509FBBB59FB58346398FE56E99211FEFC0E8E6AB17CDA4997C410A0E4",
@@ -1513,8 +1513,8 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "3484CB038240F862D734DD45361504979F18DD118112071FF780DEA1685E1641",
-        "size": 15527
+        "sha256": "96DC57CD1D9E4337350EDA338BE099E7515E5CDAFE32F40D67488A11BF77FD38",
+        "size": 38058
       },
       "installed": {
         "sha256": "3BC2E93CE2F58F67FCAC474FC271339F6490ED216B1FA6270E76F6A25373F135",
@@ -1528,8 +1528,8 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "C0FEA61DDBFA2EEF0F14D3FA30CD5D56354374E5030FAE120FE7AA1554E66F7D",
-        "size": 53220
+        "sha256": "149EB65653F469D603583861510B9C371BEA17D0E7BCD078602199EA50346A1E",
+        "size": 64713
       },
       "installed": {
         "sha256": "9591ABC01B0D7B8419666E616CA0355AD4B1C1283182BBE60ACB0436FA972EB5",
@@ -1543,12 +1543,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "B2EF4A0A1B09ACA2D9BE557026C298B3DC9860BD673ABD73D2423899F0CCAA34",
-        "size": 34107
+        "sha256": "9BF374663A877C33202E279F73ED54EAD96124C0ABDD251E025C4AE425B77B92",
+        "size": 47188
       },
       "installed": {
-        "sha256": "0A1CD27EC8EBC900E99A701953E2A8528BF6E59AB2A89A5FD1B2CA31CF120ECA",
-        "size": 34922
+        "sha256": "195660669E9CD7C3E0D959D5935D2E347D9C78B682656FDCF6BABD71F2C62083",
+        "size": 48003
       },
       "module": "industrialHirelings"
     },
@@ -1558,12 +1558,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "282A3803E4522980F5FDF1857E6937D357021571576F4756373E3D1D927F82B0",
-        "size": 154999
+        "sha256": "019A9122BF88C19E6B35B26C1D199DC39CA83203A104027233F73925DE6BF74C",
+        "size": 264613
       },
       "installed": {
-        "sha256": "34EDF7FDE24D7DDBEDE9232C715CD3E1079D17CFE6333D9B4755B3F53794D95E",
-        "size": 160549
+        "sha256": "F652693808AC51F503B5D04A9BABB3163DD48E1181B5CC849E88327D93F6C687",
+        "size": 269989
       },
       "module": "industrialHirelings"
     },
@@ -1678,12 +1678,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "E1604074BCD2D6BF8962DE67523D6A0D5C6CC758CCFD6950F9E1624F451E199C",
-        "size": 6305
+        "sha256": "9FA665CE37FA930E92EB4530163BB8F34401C36C387C7061F8367A12F93FA631",
+        "size": 6401
       },
       "installed": {
-        "sha256": "78DCFE89CBDA900E003DB394CB82DFE45F5AEDA1D78D2539909837786E530C43",
-        "size": 6568
+        "sha256": "A7BF40A3DDDA83975FE22A147815C345BDE309D6D0E719B3A87ECAB78BB1616B",
+        "size": 6474
       },
       "module": "familyEstate"
     },
@@ -1693,12 +1693,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "95B13013CB13D737CC9265D1B69A084E734079F1728E24E3ED401017627880C3",
-        "size": 9273
+        "sha256": "60E0D017E4E8ADDEE0A4FF2535C3C83EF5FF094E13929ADD520992507BA7E15F",
+        "size": 9677
       },
       "installed": {
-        "sha256": "B707933D7CCACDC09948BCA28DBCC593B4558C2A6625C026AD8173F09B255A50",
-        "size": 9688
+        "sha256": "E975AB90C9993B23E720BC1BD89651E87CD740D96DF4F9E64E2A3BFDFE857E1C",
+        "size": 10201
       },
       "module": "familyEstate"
     },
@@ -1708,12 +1708,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "2FAEEF6EDD5C0479D1E395D0F66B945C62D0806FBB1714FC0EBB3B60ADEE43F0",
-        "size": 75008
+        "sha256": "7BAA176F08399DF318E9E26D55CD5045BE759927478B00713CC59F529710D74B",
+        "size": 93075
       },
       "installed": {
-        "sha256": "1721EBB0FC6733FB664E8845C2D0D8FD9F8F54A7D2D29D0ECB4E8FD86FE5F84D",
-        "size": 93626
+        "sha256": "6011A02F83DF526D102CE46285CE3F1E33AE5503AA5CD2592B52E76D0464E096",
+        "size": 111307
       },
       "module": "familyEstate"
     },
@@ -1723,12 +1723,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "E37A9F8C5FE5141CCC76F8DB38AE63B7A516C7FC6457A2364EEB870B0628101C",
-        "size": 11991
+        "sha256": "E0320B1D47E3168B8EDBCBC40B09969173D1A2067DAC022041840B6F52B62ED3",
+        "size": 27316
       },
       "installed": {
-        "sha256": "15D0D49CB42E015CFCFDEFB473AD0C8965F3BE6EC7E90867715DBF4495174393",
-        "size": 12321
+        "sha256": "64ACA81D10D5E0E7A16CE50E8FEE53322728A3103DDE842893916AD7297113B1",
+        "size": 27641
       },
       "module": "familyEstate"
     },
@@ -1933,12 +1933,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "1716976D59EA33535830AFE38ED264DC727F6414CBAE796CB7B530651A30CAF4",
-        "size": 9776
+        "sha256": "9697EC55E968CBBB02D3DAFE19F76BAE286FB5E75743CDC105AE0DC6BDE1682E",
+        "size": 13495
       },
       "installed": {
-        "sha256": "9C50FAA9CFF57F4010B4F572FC075957431DD2B122D7973D43D9BA01D5662E62",
-        "size": 10522
+        "sha256": "98D75AAB1FB79714F5817585F31FE897BFC58F8EC2B32B1252E0CED00847EBD1",
+        "size": 14219
       },
       "module": "livingEconomy"
     },
@@ -1948,12 +1948,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "A2E2B2D9ACADA1EAA07F2C3B7DBC8A7A044AC538BBD0899E49C30A9E1AAF67DE",
-        "size": 135367
+        "sha256": "F5464AB2426278E267B7AE2AE6DC20C0E562E47343DAC27458CB5249BA666E24",
+        "size": 249255
       },
       "installed": {
-        "sha256": "7DE103539890F1E2F950F724D9F1E78A1B4D9AEF17CFB48DFD1B5E88312DC863",
-        "size": 140442
+        "sha256": "0205E10C7C907E736E15671408D9E155DE9335D1C28E8466AEE6CB22FD8C6363",
+        "size": 252465
       },
       "module": "livingEconomy"
     },
@@ -1963,12 +1963,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "68444D35FF29BBC904699DEB0958A49B43BF92D642232A194ABD778859376FE5",
-        "size": 8010
+        "sha256": "44C2DADA97FF9AF22F1C102CB428AA28042AFD98C5DC04179467BA23560D329F",
+        "size": 8316
       },
       "installed": {
-        "sha256": "E23D0FFCCCD2DACA6D39DB3E0EC2F4469954373D1786DBAEC8A1B93C90D56B48",
-        "size": 10159
+        "sha256": "58E004281C2F1002E3A9AD457CAFFE70A62F5B24EADD34FCFFB76D4033E76AE9",
+        "size": 10176
       },
       "module": "livingEconomy"
     },
@@ -1978,12 +1978,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "C4B8C0DB86C9610480A00880D3C5E51B466A1E2F713BE7B773EDC809AA14E078",
-        "size": 103073
+        "sha256": "75891BE635B7ADD01F06CA364DC6C6257D7EAD76CD72B958000B01481F9AA0FA",
+        "size": 113369
       },
       "installed": {
-        "sha256": "0CD5F4F5B634331F902B3877BA0C0A5EAA24CEAA492521CD614695E34A6B7D5A",
-        "size": 261535
+        "sha256": "F41F95A48F5BE8074DAD3FF5D4862560E260A56452378A543E791E82BD9BA844",
+        "size": 254224
       },
       "module": "livingEconomy"
     },
@@ -1993,12 +1993,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "16C4256790DB93083277855DF9BA25D3F5BD76CA98DBABFE05D2F65B35B7A105",
-        "size": 53910
+        "sha256": "9C86AEBC158C3EF83126A7B00BC6FA868BA2CC51A5A9B18EF668501819D73F50",
+        "size": 60502
       },
       "installed": {
-        "sha256": "B880A0703D7BC881B008D18195EB6B82604E00CE3E88636DE3AD2FB2C0F125CC",
-        "size": 63609
+        "sha256": "98C47DB38E25CC9917B9F9468B844C97BEDAB96920798AB29D7761FF3F709C21",
+        "size": 70201
       },
       "module": "livingEconomy"
     },
@@ -2023,8 +2023,8 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "BD60AC9019E3F55118D4F73A289365E57B8D8FA4195A945811B07318A8A1E261",
-        "size": 40571
+        "sha256": "A56A4EEC9AC4E722C420120C72A2A793B37A0BC496FD557E94CEE4167F18F28A",
+        "size": 41874
       },
       "installed": {
         "sha256": "A2950989477B0042DF0B8E4822574A0BB4482B887F511AD4775F7C13CCE5956B",
@@ -2038,12 +2038,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "9182361430FDB4CA7CA04A639F4357A55C78FB5133C4E99801EA47C337F57CB2",
-        "size": 125744
+        "sha256": "E7ED009F5029EEBFACA5A0F52CEA82B6D82269563A374B1340DF540EAF5F3BA8",
+        "size": 154558
       },
       "installed": {
-        "sha256": "DCE52BC575D413626336657D04115FD0307D5A709AF6AC25D37B979EB9D3E631",
-        "size": 125797
+        "sha256": "E7ED009F5029EEBFACA5A0F52CEA82B6D82269563A374B1340DF540EAF5F3BA8",
+        "size": 154558
       },
       "module": "livingConflict"
     },
@@ -2143,12 +2143,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "644DDDC64873803F890A3E17DAB9B8D2777E95EB16891383D0C5459798FF13EA",
-        "size": 37378
+        "sha256": "81B2FE80B55F67FB263120EF7CCA63DE1A2D5BA23A25A293AFC8A29CA8294795",
+        "size": 38305
       },
       "installed": {
-        "sha256": "A2010076382749B72013387BD624B7BDBDBB155BFDE0F6521A32C994194367CC",
-        "size": 40557
+        "sha256": "345F65E78046BA21F6CBFEE274BFEB76819B858D07799071E2F2D545E2DCABF3",
+        "size": 40222
       },
       "module": "livingEconomy"
     },
@@ -2158,12 +2158,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "C125B7D9BAD8A8B4BD25889F7A892708CB61416F833C13A701B0A617AA2297A5",
-        "size": 31815
+        "sha256": "A3033197B526B29A417220DDB2CE072010834C395498D7F38A4EB97C8653D322",
+        "size": 39691
       },
       "installed": {
-        "sha256": "3245E030FA9B55A18B1741D11964FA9071DDDA8A2E3B63F8A19872FDEEE81802",
-        "size": 34465
+        "sha256": "EF388FFDE036448579AEB5EBD7EDD4E7812F4ECF358C0E2FE894D6AFF3528F69",
+        "size": 41008
       },
       "module": "livingConflict"
     },
@@ -2173,12 +2173,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "E1E2DF78A6BA9DCFBDA6A8017431D4650BE07A11041F051AC089231B934C5DD5",
-        "size": 50444
+        "sha256": "FDE79D9F672B7E2A178E5F5190744BC599D6FD2F145E7D322E504066B4DE1B44",
+        "size": 58613
       },
       "installed": {
-        "sha256": "CED04BEA131F4DCC0ACDA0E5F66AA57FD98BD8A9D3C64CB927087479447905EF",
-        "size": 52281
+        "sha256": "FDE79D9F672B7E2A178E5F5190744BC599D6FD2F145E7D322E504066B4DE1B44",
+        "size": 58613
       },
       "module": "livingConflict"
     },
@@ -2188,12 +2188,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "FEB5A5E631F6618491B25937F42928AF5CBD014D2F121440FA89D15739D04796",
-        "size": 28014
+        "sha256": "8FB2BE91992E7755C475E6E71A5754B23EA5FE85A50AB694249B428C238989EB",
+        "size": 35614
       },
       "installed": {
-        "sha256": "AEECDB34C06B976AE00E08353F10E669B06F935F8A61BBE87AB160963EE66454",
-        "size": 28066
+        "sha256": "8FB2BE91992E7755C475E6E71A5754B23EA5FE85A50AB694249B428C238989EB",
+        "size": 35614
       },
       "module": "core"
     },
@@ -2203,8 +2203,8 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "14D9CA3C88826BBD770A8A6497B6F370E7BCFE33D56C45A1E90C485E8E36703C",
-        "size": 10285
+        "sha256": "7F36681C4CA88D022EA06F7EAB0274DC5F1A75009F90A40535F6B3CAFCB4F961",
+        "size": 11386
       },
       "installed": {
         "sha256": "AE9D63C3C08CD22ADCF197EE9BC3C6454C0C73771344DCE8F676785E2E6B7CFA",
@@ -2308,12 +2308,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "8395A73F32A7D4881B3C91821C9082F30A768B21037D3CE5E9F50D8586F80A0C",
-        "size": 43596
+        "sha256": "70E98A6E645EA616EF0FD46A427D8CFBC5FDC96BF043A6824158C13A67273F8B",
+        "size": 57350
       },
       "installed": {
-        "sha256": "00C5CF9A3F4045C781674AFCCD64673148151791976C1DA755FAD44EFCF0D36F",
-        "size": 43626
+        "sha256": "89D2D81E3373A1467C868A2529BBEC829F85B1D2A58A9E780DE0916D015DA532",
+        "size": 57380
       },
       "module": "livingEconomy"
     },
@@ -2657,8 +2657,8 @@
         "size": 0
       },
       "installed": {
-        "sha256": "DF87A76F4FF8C2AC5C880EFA0050586C5EBC4FC9EDB5C028023A2B4974E00B8D",
-        "size": 26493
+        "sha256": "D5E439957FCD155091F844E885F7A84EDDFA6EF4AECA40D5B0C2A7BA46BFAB0E",
+        "size": 27024
       },
       "module": "livingUniverse"
     },
@@ -2668,12 +2668,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "25A429E0C61D3E37A59A5A110297875A6DCE90D12728A8E42D863D10B0413F80",
-        "size": 3863
+        "sha256": "2B589F5106C9CC2972C00C23EB4AF759B5CF1F94C1A5C094009754C2A5FF062C",
+        "size": 4092
       },
       "installed": {
-        "sha256": "7090327CF3B2FD694DA64C0DD0E6EF12457684D70C7D917010E849B5A7AF3334",
-        "size": 4211
+        "sha256": "4ADDA1DEF6F17858527F5DBE2EBD7E2F7F7CB54B558BD1C739A37A338C1A6A9A",
+        "size": 4493
       },
       "module": "livingConflict"
     },
@@ -2743,12 +2743,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "0EC5ED6C53EE39CA02DC8D2ED14DE8E1FEA640DD15DF1018A768A8F8B7728DAE",
-        "size": 59743
+        "sha256": "38963012E4A8EA9008AC34E78E8462873FEA776B92EE2449E3EAB408160C9FB4",
+        "size": 90831
       },
       "installed": {
-        "sha256": "AD08C41ED19A87E0D461BE1721DD8A29F1B383F8963569801250FC7CE2BE84AF",
-        "size": 71100
+        "sha256": "A5A1B3E664D3CE87BEF8A2729F4E9F614CD107D835E51296AC1F66E781CB19B6",
+        "size": 95339
       },
       "module": "core"
     },
@@ -2758,12 +2758,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "86377C735899BD33164CC59100853C4A862C1207DC96CB0FC2BF07C089B491BD",
-        "size": 26581
+        "sha256": "57C11AFFC94C0C01D8A64A010EADC0A1BFBEA359C831945F88D578139AC75065",
+        "size": 34367
       },
       "installed": {
-        "sha256": "A8FE55A7492B0E473404AC8246F480E8D1B2C44AD53EE0C7B41937DE030586B1",
-        "size": 29137
+        "sha256": "57C11AFFC94C0C01D8A64A010EADC0A1BFBEA359C831945F88D578139AC75065",
+        "size": 34367
       },
       "module": "core"
     },
@@ -2773,8 +2773,8 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "F8307C4B4A7F2B47B88ED0E2BE9B55C35314AAB94A85547F6A24FAC8773681B7",
-        "size": 147959
+        "sha256": "57A2F83BC8E7D3432F6E94DCF9025634DF7B3865C03CE89F223D361FB05C051D",
+        "size": 186680
       },
       "installed": {
         "sha256": "7D81638AC5AF00BE77B3D556F5F0B4B7D6FB0DC2614B6173869C16FC4356A5FE",
@@ -2788,8 +2788,8 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "1740173FF324A78C709C72CEE317F50121DCBB2036F9626ED84F107563517169",
-        "size": 2720
+        "sha256": "1144553F95B6162A4F22D9AA2A0468CE50E466772306B1ADB982496F73CFC3CB",
+        "size": 2826
       },
       "installed": {
         "sha256": "1D6A6FF53A5187954AF4492FF735F7477FB55E8771B558BC57A898AA0E25DA87",
@@ -2803,8 +2803,8 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "6677F6F4EA27D7B3DA657F5555061897DD386988A7A53C328C0854B588277F97",
-        "size": 11519
+        "sha256": "F8DB064D91E8B5B0DAA1EE979FAC611EB1C3D5B9F3B55F2A06C9C50B7D1F3166",
+        "size": 11478
       },
       "installed": {
         "sha256": "3949ECD29064CC5188BD385833818FF3A30D7CAC8DC6923E3B23A1111ACDC119",
@@ -2818,8 +2818,8 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "30957F7CBC0ECD46D768CEC0060F5A744582C750179912676FBED056594595AC",
-        "size": 15247
+        "sha256": "14228279573B829918EC694E20984BC135820476A922451873DDF3011923CABF",
+        "size": 17092
       },
       "installed": {
         "sha256": "74A5FA94405C9A1C6340CCBE0805047A0F7BA118B8C12A3FCF0C241ECE54D052",
@@ -2833,8 +2833,8 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "8F9312FC4FEEA85D78CB76EE9FA88441D01152491BC10798B59C0D42DF93DD26",
-        "size": 6591
+        "sha256": "D7DBA8B4A5A3CFDBD9803B240D86B786A7BDE5576DB79A3EE4570E07D932F289",
+        "size": 9739
       },
       "installed": {
         "sha256": "D3F81FA378A2047559FD4AC681178F6B5B4CCAE33EAF836C89ED2BC0CA594939",
@@ -2848,8 +2848,8 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "9A00E28DEEFAE271AB46E91C050EED018BCCF7ACB3177358C361118B6C1A65F2",
-        "size": 41207
+        "sha256": "738A74151109856591F6A18120DE0230DED482AB5BB22E15D258DF65AD564B3F",
+        "size": 54720
       },
       "installed": {
         "sha256": "A7848CF3310E4649E25D283BE983DED2776526D1FB904D5646EF000EACF1EBBE",
@@ -2878,8 +2878,8 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "A5A3F124D407E40EB841657C6467F92F0BC64E6CBBBF46947645B7B4F6CDDFBE",
-        "size": 59624
+        "sha256": "05D45252F864133D3AD9E4296F0C00145F1985E96283108316D5F1F34FFF4200",
+        "size": 74624
       },
       "installed": {
         "sha256": "CCAB6023B65BF2312B32AA91165FDA8B06198C7771F41B33FB70164D4406E93F",
@@ -2893,12 +2893,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "5DA55FE6D5A7BDDF0E43169D81DE6AD205586FE0BC2A77EBCA3D4899E801E4CD",
-        "size": 1432283
+        "sha256": "D4516171AD06C508480882BDB14095F8B4E9B9E5A851E80C4074F6126355F16E",
+        "size": 65007
       },
       "installed": {
-        "sha256": "12C6EBEC12798777AAC40D8DE86DA056BB32CCE4146365F4648536AD92140455",
-        "size": 1459442
+        "sha256": "D4516171AD06C508480882BDB14095F8B4E9B9E5A851E80C4074F6126355F16E",
+        "size": 65007
       },
       "module": "core"
     },
@@ -2923,12 +2923,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "46411FEC4846E271C1161675079959C01A12E8F500938A91D8E0ECC19B110CAE",
-        "size": 141154
+        "sha256": "6D050FD500895D9D052784DF495C5C2CDB4E492F65D8031A45ED8CAB3197E5F5",
+        "size": 167882
       },
       "installed": {
-        "sha256": "75C52D09F99CA8CF7A71E867BD377E44634DD8AAB396BE522BA33A8D4D485AC4",
-        "size": 141582
+        "sha256": "6D050FD500895D9D052784DF495C5C2CDB4E492F65D8031A45ED8CAB3197E5F5",
+        "size": 167882
       },
       "module": "core"
     },
@@ -2938,8 +2938,8 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "AB78A01D2C3A0DB24E5F090620798DF3A1F006AC50E7C8C9A5A23C1BE89319C5",
-        "size": 7078
+        "sha256": "1C1ED8C8310788A77377159FCE52BA7169061C006E7965273B4637135A98C1A1",
+        "size": 9233
       },
       "installed": {
         "sha256": "CA2C016E6BE2213B1D6199F3FEEE60D66F8643B5FB77AB9FBB6CCD5DBAD539EB",
@@ -2972,8 +2972,8 @@
         "size": 0
       },
       "installed": {
-        "sha256": "A1A6E5BE5EA6CA8F64115D5FFFFDDA01D0F6BC6A04C01DB914311102A85D47AB",
-        "size": 8697
+        "sha256": "1F8E1EBFEF6F29CBC351FC2E49D2C79629BFDD3EAD4CBB563B34B8365F64F7EF",
+        "size": 9888
       },
       "module": "core"
     },
@@ -3028,12 +3028,12 @@
       "kind": "modified",
       "source": "patch",
       "baseline": {
-        "sha256": "1FF2894A4D60A5C4E72D2D3EAC44F1E4FA065005C930FE31379C7EE2B54BA8C9",
-        "size": 67402
+        "sha256": "D592090614D3F38231C2152B951D2C0178C5769EB20021E4B920DDBE222A1DCE",
+        "size": 81412
       },
       "installed": {
-        "sha256": "70F7CA0DC36F860592574C2CF9EDA1BD3D033BFCB66AB56986D898340C5FF744",
-        "size": 75658
+        "sha256": "5A6EA24FD01D2D419718820E5081A77EA55A3A2DB89BD453022A570642AEC49C",
+        "size": 91201
       },
       "module": "livingEconomy"
     }

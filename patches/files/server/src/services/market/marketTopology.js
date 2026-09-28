@@ -1,3 +1,5 @@
+"use strict";
+
 const path = require("path");
 
 const worldData = require(path.join(__dirname, "../../space/worldData"));

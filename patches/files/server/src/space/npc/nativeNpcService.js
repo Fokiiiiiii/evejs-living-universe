@@ -1,3 +1,9 @@
+"use strict";
+
+const {
+  toFiniteNumber,
+} = require("../../common/numbers");
+
 const path = require("path");
 
 const log = require(path.join(__dirname, "../../utils/logger"));
@@ -45,101 +51,57 @@ const {
   buildNpcEntityIdentity,
 } = require(path.join(__dirname, "./npcPresentation"));
 const nativeNpcStore = require(path.join(__dirname, "./nativeNpcStore"));
+
+const { validateGovernedNpcDefinition } = require(path.join(__dirname, "./governance/npcDoctrineGovernance"));
+const { resolveIndustrialCrewRegionalDefense } = require(path.join(__dirname, "./governance/industrialCrewDoctrineCatalog"));
 const {
-  validateGovernedNpcDefinition,
-} = require(path.join(__dirname, "./governance/npcDoctrineGovernance"));
-const {
-  resolveIndustrialCrewRegionalDefense,
-} = require(path.join(__dirname, "./governance/industrialCrewDoctrineCatalog"));
+  isDestructibleNpcSentry,
+  buildNpcSentryBehaviorOverrides,
+  applyStationaryNpcSentryState,
+  applyNpcSentryRuntimePolicy,
+} = require(path.join(__dirname, "./npcSentryPolicy"));
 const {
   ENTITY_TYPE,
 } = require(path.join(__dirname, "../entityConstants"));
 
-function toFiniteNumber(value, fallback = 0) {
-  const numeric = Number(value);
-  return Number.isFinite(numeric) ? numeric : fallback;
-}
+const ABYSSAL_RUN_SCOPE_FIELDS = Object.freeze([
+  "abyssalRunID",
+  "evejsAbyssalInstanceID",
+  "evejsAbyssalPocketInstanceID",
+  "dungeonCurrentInstanceID",
+  "dungeonSiteInstanceID",
+]);
+const ABYSSAL_ROOM_SCOPE_FIELDS = Object.freeze([
+  "abyssalRoomIndex",
+  "evejsAbyssalRoomIndex",
+]);
 
 function toPositiveInt(value, fallback = 0) {
   const numeric = Math.trunc(Number(value) || 0);
   return numeric > 0 ? numeric : fallback;
 }
 
-function toOptionalNonNegativeInt(value) {
-  if (value === null || value === undefined || value === "") {
-    return undefined;
-  }
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric)) {
-    return undefined;
-  }
-  const normalized = Math.trunc(numeric);
-  return normalized >= 0 ? normalized : undefined;
-}
-
-function resolveIndexedNonNegativeIDOverride(
-  options,
-  singularKey,
-  pluralKey,
-  index,
-) {
-  const indexedValues = Array.isArray(options && options[pluralKey])
-    ? options[pluralKey]
-    : null;
-  if (indexedValues && index < indexedValues.length) {
-    const indexedOverride = toOptionalNonNegativeInt(indexedValues[index]);
-    if (indexedOverride !== undefined) {
-      return indexedOverride;
-    }
-  }
-  return toOptionalNonNegativeInt(options && options[singularKey]);
-}
-
 function cloneValue(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
-function resolveDefenseProfileForSystem(systemID, options = {}) {
-  const explicit = String(
-    options.defenseDamageProfile ||
-      options.hostileFactionKey ||
-      options.pirateFactionKey ||
-      "",
-  ).trim();
-  if (explicit) {
-    return explicit;
+function shouldSuppressNativeNpcSlimName(identity, options = {}) {
+  if (options.suppressSlimName === true) {
+    return true;
   }
-  try {
-    const beltRatRuntime = require(path.join(__dirname, "./beltRatRuntime"));
-    if (typeof beltRatRuntime.resolvePirateFactionKeyForSystem === "function") {
-      return beltRatRuntime.resolvePirateFactionKeyForSystem(systemID) || "kinetic";
-    }
-  } catch (_error) {
-    // The governed loadout resolver has a deterministic kinetic fallback.
+  if (
+    options.suppressSlimName === false ||
+    Object.prototype.hasOwnProperty.call(options, "slimNameOverride")
+  ) {
+    return false;
   }
-  return "kinetic";
-}
 
-function normalizePilotSkills(entries) {
-  return (Array.isArray(entries) ? entries : [])
-    .map((entry) => ({
-      typeID: toPositiveInt(entry && entry.typeID, 0),
-      level: Math.max(0, Math.min(5, Math.trunc(Number(entry && entry.level) || 0))),
-      name: String(entry && entry.name || "").trim() || null,
-    }))
-    .filter((entry) => entry.typeID > 0 && entry.level > 0);
-}
-
-function buildPilotSkillMap(entries) {
-  return new Map(normalizePilotSkills(entries).map((entry) => [
-    entry.typeID,
-    {
-      typeID: entry.typeID,
-      skillLevel: entry.level,
-      trainedSkillLevel: entry.level,
-      effectiveSkillLevel: entry.level,
-    },
-  ]));
+  const slimTypeID = toPositiveInt(identity && identity.slimTypeID, 0);
+  const slimType = slimTypeID > 0 ? resolveItemByTypeID(slimTypeID) : null;
+  const canonicalTypeName = String(slimType && slimType.name || "").trim();
+  const intendedSlimName = String(identity && identity.slimName || "").trim();
+  // Canonical type names belong to client data and should be localized there.
+  return canonicalTypeName !== "" && intendedSlimName === canonicalTypeName;
 }
 
 function isDamageableChargeType(itemType) {
@@ -169,6 +131,437 @@ function isTransientStartupControllerRecord(entityRecord, controllerRecord) {
   return (
     (entityRecord.transient === true || controllerRecord.transient === true) &&
     (startupRuleID !== "" || operatorKind !== "")
+  );
+}
+
+function buildDescriptorVirtualAnchor(descriptor = {}) {
+  return {
+    kind: String(descriptor.kind || "coordinates"),
+    itemID: toPositiveInt(
+      descriptor.itemID || descriptor.entityID || descriptor.anchorID,
+      0,
+    ),
+    itemName: String(descriptor.name || descriptor.itemName || "Custom Anchor"),
+    position: cloneVector(descriptor.position),
+    direction: normalizeVector(
+      descriptor.direction,
+      { x: 1, y: 0, z: 0 },
+    ),
+    radius: Math.max(0, toFiniteNumber(descriptor.radius, 0)),
+  };
+}
+
+function isCoordinateAnchorDescriptor(descriptor = {}) {
+  const kind = String(descriptor && descriptor.kind || "")
+    .trim()
+    .toLowerCase();
+  return kind === "coordinates" || Boolean(descriptor && descriptor.position);
+}
+
+function buildSceneContextFields(scene, fallbackSystemID = 0) {
+  return {
+    systemID: toPositiveInt(scene && scene.systemID, fallbackSystemID),
+    sceneDescriptor: scene && scene.sceneDescriptor || null,
+    sceneKey: String(scene && scene.sceneKey || ""),
+    sceneKind: String(scene && scene.sceneKind || ""),
+    instanceID: toPositiveInt(scene && scene.instanceID, 0),
+    locationID: toPositiveInt(scene && scene.locationID, fallbackSystemID),
+  };
+}
+
+function listScopeContainers(record) {
+  if (!record || typeof record !== "object") {
+    return [];
+  }
+  return [
+    record,
+    record.spaceState && typeof record.spaceState === "object"
+      ? record.spaceState
+      : null,
+  ].filter(Boolean);
+}
+
+function resolveExactPositiveClaims(sources, fieldNames) {
+  let value = 0;
+  let present = false;
+  const values = new Set();
+  for (const source of sources) {
+    if (!source || typeof source !== "object") {
+      continue;
+    }
+    for (const fieldName of fieldNames) {
+      if (
+        !Object.hasOwn(source, fieldName) ||
+        source[fieldName] === null ||
+        source[fieldName] === undefined
+      ) {
+        continue;
+      }
+      present = true;
+      const candidate = toPositiveInt(source[fieldName], 0);
+      if (candidate <= 0) {
+        return { present, valid: false, value: 0, values: [...values] };
+      }
+      values.add(candidate);
+      if (value > 0 && candidate !== value) {
+        return { present, valid: false, value: 0, values: [...values] };
+      }
+      value = candidate;
+    }
+  }
+  return {
+    present,
+    valid: present && value > 0,
+    value,
+    values: [...values],
+  };
+}
+
+function resolveExactTextClaims(sources, fieldNames, options = {}) {
+  let value = "";
+  let present = false;
+  const values = new Set();
+  for (const source of sources) {
+    if (!source || typeof source !== "object") {
+      continue;
+    }
+    for (const fieldName of fieldNames) {
+      if (
+        !Object.hasOwn(source, fieldName) ||
+        source[fieldName] === null ||
+        source[fieldName] === undefined
+      ) {
+        continue;
+      }
+      let candidate = String(source[fieldName]).trim();
+      if (!candidate) {
+        continue;
+      }
+      if (options.lowercase === true) {
+        candidate = candidate.toLowerCase();
+      }
+      present = true;
+      values.add(candidate);
+      if (value && candidate !== value) {
+        return { present, valid: false, value: "", values: [...values] };
+      }
+      value = candidate;
+    }
+  }
+  return {
+    present,
+    valid: present && value !== "",
+    value,
+    values: [...values],
+  };
+}
+
+function resolveNativeNpcAbyssalDestructionAuthority(
+  runtimeEntity,
+  controller,
+  scene,
+  options = {},
+) {
+  const source = runtimeEntity && typeof runtimeEntity === "object"
+    ? runtimeEntity
+    : {};
+  const controllerRecord = controller && typeof controller === "object"
+    ? controller
+    : {};
+  const sceneRecord = scene && typeof scene === "object"
+    ? scene
+    : {};
+  const sourceContainers = listScopeContainers(source);
+  const controllerContainers = listScopeContainers(controllerRecord);
+  const sceneDescriptor = sceneRecord.sceneDescriptor &&
+      typeof sceneRecord.sceneDescriptor === "object"
+    ? sceneRecord.sceneDescriptor
+    : null;
+  const optionSceneDescriptor = options.sceneDescriptor &&
+      typeof options.sceneDescriptor === "object"
+    ? options.sceneDescriptor
+    : null;
+  const actualSceneSources = [sceneRecord, sceneDescriptor].filter(Boolean);
+  const allAuthoritySources = [
+    ...sourceContainers,
+    ...controllerContainers,
+    sceneRecord,
+    sceneDescriptor,
+    optionSceneDescriptor,
+  ].filter(Boolean);
+
+  // NPC-owned run and room tags are mandatory. Scene/controller context may
+  // corroborate those tags, but it must never supply missing objective scope.
+  const sourceRun = resolveExactPositiveClaims(
+    sourceContainers,
+    ABYSSAL_RUN_SCOPE_FIELDS,
+  );
+  const sourceRoom = resolveExactPositiveClaims(
+    sourceContainers,
+    ABYSSAL_ROOM_SCOPE_FIELDS,
+  );
+  const allRun = resolveExactPositiveClaims(
+    allAuthoritySources,
+    [...ABYSSAL_RUN_SCOPE_FIELDS, "runID", "instanceID"],
+  );
+  const allRoom = resolveExactPositiveClaims(
+    [
+      ...sourceContainers,
+      ...controllerContainers,
+      options,
+    ],
+    [...ABYSSAL_ROOM_SCOPE_FIELDS, "roomIndex"],
+  );
+  const actualSceneRun = resolveExactPositiveClaims(
+    actualSceneSources,
+    [...ABYSSAL_RUN_SCOPE_FIELDS, "runID", "instanceID"],
+  );
+  const actualSceneKeys = resolveExactTextClaims(actualSceneSources, ["sceneKey"]);
+  const allSceneKeys = resolveExactTextClaims(allAuthoritySources, ["sceneKey"]);
+  const actualSceneKinds = resolveExactTextClaims(
+    actualSceneSources,
+    ["sceneKind"],
+    { lowercase: true },
+  );
+  const allSceneKinds = resolveExactTextClaims(
+    allAuthoritySources,
+    ["sceneKind", "instanceScope"],
+    { lowercase: true },
+  );
+  const hasAbyssalSignal = Boolean(
+    sourceRun.present ||
+    sourceRoom.present ||
+    source.evejsAbyssalNpc === true ||
+    allSceneKinds.values.includes("abyssal") ||
+    allSceneKeys.values.some((sceneKey) => sceneKey.startsWith("abyssal-run:"))
+  );
+  const invalid = (reason) => ({
+    present: hasAbyssalSignal,
+    valid: false,
+    reason,
+    runID: 0,
+    roomIndex: 0,
+    sceneKey: String(sceneRecord.sceneKey || sceneDescriptor && sceneDescriptor.sceneKey || ""),
+  });
+
+  if (!hasAbyssalSignal) {
+    return invalid("ABYSSAL_AUTHORITY_MISSING");
+  }
+  if (!sourceRun.valid) {
+    return invalid(
+      sourceRun.present
+        ? "ABYSSAL_RUN_SCOPE_INVALID"
+        : "ABYSSAL_RUN_SCOPE_MISSING",
+    );
+  }
+  if (!sourceRoom.valid) {
+    return invalid(
+      sourceRoom.present
+        ? "ABYSSAL_ROOM_SCOPE_INVALID"
+        : "ABYSSAL_ROOM_SCOPE_MISSING",
+    );
+  }
+  if (!allRun.valid || allRun.value !== sourceRun.value) {
+    return invalid("ABYSSAL_RUN_AUTHORITY_CONFLICT");
+  }
+  if (!allRoom.valid || allRoom.value !== sourceRoom.value) {
+    return invalid("ABYSSAL_ROOM_AUTHORITY_CONFLICT");
+  }
+
+  const expectedSceneKey = `abyssal-run:${sourceRun.value}`;
+  if (
+    !actualSceneRun.valid ||
+    actualSceneRun.value !== sourceRun.value ||
+    !actualSceneKeys.valid ||
+    actualSceneKeys.value !== expectedSceneKey ||
+    !actualSceneKinds.valid ||
+    actualSceneKinds.value !== "abyssal"
+  ) {
+    return invalid("ABYSSAL_SCENE_AUTHORITY_INVALID");
+  }
+  if (
+    !allSceneKeys.valid ||
+    allSceneKeys.value !== expectedSceneKey ||
+    !allSceneKinds.valid ||
+    allSceneKinds.value !== "abyssal"
+  ) {
+    return invalid("ABYSSAL_SCENE_AUTHORITY_CONFLICT");
+  }
+
+  return {
+    present: true,
+    valid: true,
+    reason: "EXACT_ABYSSAL_RUN_ROOM_SCENE_AUTHORITY",
+    runID: sourceRun.value,
+    roomIndex: sourceRoom.value,
+    sceneKey: expectedSceneKey,
+  };
+}
+
+function captureNativeNpcDestructionContext(entityID, controller, runtimeEntity, scene, options = {}) {
+  const source = runtimeEntity && typeof runtimeEntity === "object"
+    ? runtimeEntity
+    : {};
+  const controllerRecord = controller && typeof controller === "object"
+    ? controller
+    : {};
+  const sceneRecord = scene && typeof scene === "object"
+    ? scene
+    : {};
+  const npcID = toPositiveInt(entityID, toPositiveInt(source.itemID, 0));
+  const abyssalAuthority = resolveNativeNpcAbyssalDestructionAuthority(
+    source,
+    controllerRecord,
+    sceneRecord,
+    options,
+  );
+  const abyssalRunID = abyssalAuthority.valid ? abyssalAuthority.runID : 0;
+  const abyssalRoomIndex = abyssalAuthority.valid ? abyssalAuthority.roomIndex : 0;
+  return Object.freeze({
+    npcID,
+    entityID: npcID,
+    itemID: npcID,
+    sceneKey: abyssalAuthority.sceneKey,
+    sceneKind: abyssalAuthority.valid ? "abyssal" : String(sceneRecord.sceneKind || ""),
+    abyssalRunID,
+    instanceID: abyssalRunID,
+    abyssalRoomIndex,
+    roomIndex: abyssalRoomIndex,
+    instanceScope: abyssalAuthority.valid ? "abyssal" : "",
+    abyssalAuthorityPresent: abyssalAuthority.present,
+    abyssalAuthorityValid: abyssalAuthority.valid,
+    abyssalAuthorityReason: abyssalAuthority.reason,
+    objectiveID: npcID,
+    objectiveRequired: source.evejsAbyssalObjectiveRelevant !== false,
+    typeID: toPositiveInt(source.typeID, 0),
+    destructionReason: String(options.destructionReason || "combat"),
+  });
+}
+
+function normalizeNpcObjectiveNotificationResult(result, fallback = "not-tracked") {
+  if (result && typeof result === "object") {
+    return {
+      handled: result.handled === true || result.success === true,
+      newlyRecorded: result.newlyRecorded === true,
+      objectiveComplete: result.objectiveComplete === true,
+      result: String(result.result || result.status || (result.duplicate === true ? "already-notified" : fallback)),
+      pending: result.pending === true,
+      errorMsg: result.errorMsg || null,
+    };
+  }
+  if (result === true) {
+    return {
+      handled: true,
+      newlyRecorded: true,
+      objectiveComplete: false,
+      result: "notified",
+      pending: false,
+      errorMsg: null,
+    };
+  }
+  return {
+    handled: false,
+    newlyRecorded: false,
+    objectiveComplete: false,
+    result: fallback,
+    pending: false,
+    errorMsg: null,
+  };
+}
+
+function validateStoredNativeControllerSceneAuthority(
+  scene,
+  entityRecord,
+  controllerRecord,
+) {
+  if (!scene || !entityRecord || !controllerRecord) {
+    return {
+      success: false,
+      errorMsg: "NPC_SCENE_AUTHORITY_INVALID",
+    };
+  }
+  const records = [entityRecord, controllerRecord];
+  const sceneKeyClaims = resolveExactTextClaims(records, ["sceneKey"]);
+  const sceneKindClaims = resolveExactTextClaims(
+    records,
+    ["sceneKind"],
+    { lowercase: true },
+  );
+  const instanceClaims = resolveExactPositiveClaims(records, ["instanceID"]);
+  const locationClaims = resolveExactPositiveClaims(
+    records,
+    ["locationID", "systemID"],
+  );
+  const sceneKey = String(scene.sceneKey || "").trim();
+  const sceneKind = String(scene.sceneKind || "").trim().toLowerCase();
+  const sceneInstanceID = toPositiveInt(scene.instanceID, 0);
+  const sceneLocationID = toPositiveInt(scene.locationID, toPositiveInt(scene.systemID, 0));
+  const hasAbyssalClaim = Boolean(
+    sceneKind === "abyssal" ||
+    sceneKindClaims.values.includes("abyssal") ||
+    sceneKeyClaims.values.some((value) => value.startsWith("abyssal-run:"))
+  );
+  const invalid = () => ({
+    success: false,
+    errorMsg: "NPC_SCENE_AUTHORITY_INVALID",
+  });
+
+  if (
+    sceneKeyClaims.present &&
+    (!sceneKeyClaims.valid || sceneKeyClaims.value !== sceneKey)
+  ) {
+    return invalid();
+  }
+  if (
+    sceneKindClaims.present &&
+    (!sceneKindClaims.valid || sceneKindClaims.value !== sceneKind)
+  ) {
+    return invalid();
+  }
+  if (
+    locationClaims.present &&
+    (!locationClaims.valid || locationClaims.value !== sceneLocationID)
+  ) {
+    return invalid();
+  }
+  if (!hasAbyssalClaim) {
+    return { success: true, errorMsg: null };
+  }
+  if (
+    sceneKind !== "abyssal" ||
+    !sceneKeyClaims.valid ||
+    !sceneKindClaims.valid ||
+    !instanceClaims.valid ||
+    instanceClaims.value !== sceneInstanceID ||
+    sceneKeyClaims.value !== `abyssal-run:${sceneInstanceID}`
+  ) {
+    return invalid();
+  }
+  for (const record of records) {
+    if (
+      String(record.sceneKey || "").trim() !== sceneKey ||
+      String(record.sceneKind || "").trim().toLowerCase() !== "abyssal" ||
+      toPositiveInt(record.instanceID, 0) !== sceneInstanceID
+    ) {
+      return invalid();
+    }
+  }
+  return { success: true, errorMsg: null };
+}
+
+function logNpcObjectiveNotificationDiagnostic(context, notificationResult, options = {}) {
+  const callbackAvailable = typeof options.notifyNpcDestroyed === "function";
+  log.info(
+    `[NpcDestruction] objective notification ` +
+      `npc=${toPositiveInt(context && context.npcID, 0)} ` +
+      `runID=${toPositiveInt(context && context.abyssalRunID, 0) || "none"} ` +
+      `room=${toPositiveInt(context && context.abyssalRoomIndex, 0) || "none"} ` +
+      `sceneKey=${String(context && context.sceneKey || "none")} ` +
+      `authority=${String(context && context.abyssalAuthorityReason || "none")} ` +
+      `objectiveTracked=${notificationResult.handled === true} ` +
+      `callbackAvailable=${callbackAvailable} ` +
+      `result=${notificationResult.result} ` +
+      `reason=${String(context && context.destructionReason || "combat")}`,
   );
 }
 
@@ -263,53 +656,6 @@ function resolveAuthoredModuleQuantity(moduleEntry) {
   const explicitFlagCount = countExplicitFlagAssignments(moduleEntry);
   const authoredQuantity = toPositiveInt(moduleEntry && moduleEntry.quantity, 0);
   return Math.max(1, authoredQuantity, explicitFlagCount);
-}
-
-function normalizePositiveIntSelector(value, pluralKey, singularKey) {
-  const source =
-    value && Array.isArray(value[pluralKey])
-      ? value[pluralKey]
-      : (
-        value && value[singularKey] !== undefined && value[singularKey] !== null
-          ? [value[singularKey]]
-          : []
-      );
-  return source
-    .map((entry) => toPositiveInt(entry, 0))
-    .filter((entry) => entry > 0);
-}
-
-function doesAuthoredChargeSelectModule(chargeEntry, moduleRecord) {
-  if (!chargeEntry || !moduleRecord) {
-    return false;
-  }
-
-  const selectedFlagIDs = normalizePositiveIntSelector(
-    chargeEntry,
-    "moduleFlagIDs",
-    "moduleFlagID",
-  );
-  const selectedTypeIDs = normalizePositiveIntSelector(
-    chargeEntry,
-    "moduleTypeIDs",
-    "moduleTypeID",
-  );
-  if (selectedFlagIDs.length <= 0 && selectedTypeIDs.length <= 0) {
-    return true;
-  }
-  if (
-    selectedFlagIDs.length > 0 &&
-    !selectedFlagIDs.includes(toPositiveInt(moduleRecord.flagID, 0))
-  ) {
-    return false;
-  }
-  if (
-    selectedTypeIDs.length > 0 &&
-    !selectedTypeIDs.includes(toPositiveInt(moduleRecord.typeID, 0))
-  ) {
-    return false;
-  }
-  return true;
 }
 
 const TRANSIENT_CONCORD_TARGETING_SCAN_RESOLUTION = 5_000;
@@ -470,6 +816,30 @@ function applyNativeNpcHullCombatOverrides(entity, entityRecord, definition) {
     entity.passiveDerivedState.maxLockedTargets = entity.maxLockedTargets;
     entity.passiveDerivedState.capacitorCapacity = entity.capacitorCapacity;
   }
+  // Rat entity types carry no maxTargetRange (attribute 76) and sometimes no
+  // maxLockedTargets in the SDE — they use entityAttackRange instead — so a
+  // later refreshShipEntityDerivedState recomputes both as 0 and overwrites the
+  // values resolved above. isTargetLockRangeValid then refuses every lock with
+  // TARGET_OUT_OF_RANGE before it ever measures distance, leaving the rat
+  // orbiting its target forever without firing. Preserve the resolved bases so
+  // the refresh feeds them back through Dogma, where sensor damping still
+  // scales them.
+  entity.nativeNpcCombatBases = {
+    maxTargetRange: Math.max(0, toFiniteNumber(entity.maxTargetRange, 0)),
+    scanResolution: Math.max(0, toFiniteNumber(entity.scanResolution, 0)),
+    maxLockedTargets: Math.max(0, toPositiveInt(entity.maxLockedTargets, 0)),
+    capacitorCapacity: Math.max(0, toFiniteNumber(entity.capacitorCapacity, 0)),
+  };
+  if (entity.capitalNpc === true) {
+    // These authored capital values replace zero or incomplete hull Dogma
+    // bases. Runtime recomputes feed them into Dogma before hostile modifiers
+    // are applied, so dampening and capacitor effects still scale them.
+    entity.capitalNpcCombatBases = {
+      maxTargetRange: Math.max(0, toFiniteNumber(entity.maxTargetRange, 0)),
+      scanResolution: Math.max(0, toFiniteNumber(entity.scanResolution, 0)),
+      capacitorCapacity: Math.max(0, toFiniteNumber(entity.capacitorCapacity, 0)),
+    };
+  }
   return entity;
 }
 
@@ -496,17 +866,23 @@ function resolveNativeSpawnContextForSystem(systemID, options = {}) {
     };
   }
 
+  const descriptorScene =
+    options.sceneDescriptor && typeof spaceRuntime.ensureScene === "function"
+      ? spaceRuntime.ensureScene(options.sceneDescriptor)
+      : null;
+  const sceneContextFields = buildSceneContextFields(descriptorScene, numericSystemID);
   const anchorEntity = options.anchorEntity || null;
   if (anchorEntity && anchorEntity.position) {
     return {
       success: true,
       data: {
-        systemID: numericSystemID,
-        scene: spaceRuntime.ensureScene(numericSystemID),
+        systemID: sceneContextFields.systemID || numericSystemID,
+        scene: descriptorScene || spaceRuntime.ensureScene(numericSystemID),
         anchorEntity,
         preferredTargetID: toPositiveInt(options.preferredTargetID, 0),
         anchorKind: String(anchorEntity.kind || "anchor"),
         anchorLabel: String(anchorEntity.itemName || anchorEntity.slimName || "Anchor"),
+        ...sceneContextFields,
       },
     };
   }
@@ -519,16 +895,41 @@ function resolveNativeSpawnContextForSystem(systemID, options = {}) {
     };
   }
 
+  if (descriptorScene && isCoordinateAnchorDescriptor(anchorDescriptor)) {
+    const anchor = buildDescriptorVirtualAnchor(anchorDescriptor);
+    return {
+      success: true,
+      data: {
+        systemID: sceneContextFields.systemID || numericSystemID,
+        scene: descriptorScene,
+        anchorEntity: anchor,
+        preferredTargetID: toPositiveInt(options.preferredTargetID, 0),
+        anchorKind: String(anchor.kind || anchorDescriptor.kind || "anchor"),
+        anchorLabel: String(
+          anchor.itemName ||
+            anchorDescriptor.name ||
+            anchorDescriptor.nameQuery ||
+            "Anchor",
+        ),
+        ...sceneContextFields,
+      },
+    };
+  }
+
   const anchorResult = resolveAnchor(numericSystemID, anchorDescriptor);
   if (!anchorResult.success || !anchorResult.data || !anchorResult.data.anchor) {
     return anchorResult;
   }
+  const resolvedSceneContextFields = buildSceneContextFields(
+    descriptorScene || anchorResult.data.scene,
+    numericSystemID,
+  );
 
   return {
     success: true,
     data: {
-      systemID: numericSystemID,
-      scene: anchorResult.data.scene,
+      systemID: resolvedSceneContextFields.systemID || numericSystemID,
+      scene: descriptorScene || anchorResult.data.scene,
       anchorEntity: anchorResult.data.anchor,
       preferredTargetID: toPositiveInt(options.preferredTargetID, 0),
       anchorKind: String(anchorResult.data.anchor.kind || anchorDescriptor.kind || "anchor"),
@@ -538,6 +939,7 @@ function resolveNativeSpawnContextForSystem(systemID, options = {}) {
           anchorDescriptor.nameQuery ||
           "Anchor",
       ),
+      ...resolvedSceneContextFields,
     },
   };
 }
@@ -732,11 +1134,11 @@ function buildNativeCargoRecords(entityRecord, moduleRecords, definition, option
     }
   }
 
-  const authoredCargo = Array.isArray(options.cargoOverride)
-    ? options.cargoOverride
-    : Array.isArray(definition && definition.loadout && definition.loadout.cargo)
-      ? definition.loadout.cargo
-      : [];
+  const authoredCargo = Array.isArray(
+    definition && definition.loadout && definition.loadout.cargo,
+  )
+    ? definition.loadout.cargo
+    : [];
   for (const cargoEntry of authoredCargo) {
     const cargoType = resolveItemByTypeID(toPositiveInt(cargoEntry && cargoEntry.typeID, 0));
     if (!cargoType) {
@@ -791,6 +1193,126 @@ function buildNativeCargoRecords(entityRecord, moduleRecords, definition, option
     cargoRecords.push(cargoRecord);
   }
 
+  const missionObjectiveCargo = options.missionObjectiveCargo &&
+    typeof options.missionObjectiveCargo === "object"
+    ? options.missionObjectiveCargo
+    : null;
+  if (missionObjectiveCargo) {
+    const typeID = toPositiveInt(missionObjectiveCargo.typeID, 0);
+    const quantity = toPositiveInt(missionObjectiveCargo.quantity, 0);
+    const missionRunID = String(missionObjectiveCargo.missionRunID || "").trim();
+    const effectID = String(missionObjectiveCargo.effectID || "").trim();
+    const missionOwnerCharacterID = toPositiveInt(
+      missionObjectiveCargo.missionOwnerCharacterID,
+      0,
+    );
+    const source = missionObjectiveCargo.source &&
+      typeof missionObjectiveCargo.source === "object"
+      ? missionObjectiveCargo.source
+      : null;
+    const target = missionObjectiveCargo.target &&
+      typeof missionObjectiveCargo.target === "object"
+      ? missionObjectiveCargo.target
+      : null;
+    const placement = String(missionObjectiveCargo.placement || "").trim();
+    const targetNpcTypeID = toPositiveInt(target && target.npcTypeID, 0);
+    const targetNameID = toPositiveInt(target && target.nameID, 0);
+    const targetMemberIndex = Number(target && target.memberIndex);
+    const nativeNpcOwnerID = toPositiveInt(entityRecord.ownerID, 0);
+    if (
+      typeID <= 0 ||
+      quantity <= 0 ||
+      !missionRunID ||
+      !effectID ||
+      !effectID.startsWith(`${missionRunID}:`) ||
+      missionOwnerCharacterID <= 0 ||
+      !source ||
+      source.kind !== "mission_fetch_objective" ||
+      toPositiveInt(source.typeID, 0) !== typeID ||
+      toPositiveInt(source.quantity, 0) !== quantity ||
+      !target ||
+      !String(target.encounterKey || "").trim() ||
+      !String(target.planKey || "").trim() ||
+      !Number.isSafeInteger(targetMemberIndex) ||
+      targetMemberIndex < 0 ||
+      targetNpcTypeID <= 0 ||
+      nativeNpcOwnerID <= 0 ||
+      placement !== "native_npc_cargo" ||
+      entityRecord.typeID !== targetNpcTypeID ||
+      (targetNameID > 0 && entityRecord.nameID !== targetNameID)
+    ) {
+      return {
+        success: false,
+        errorMsg: "NPC_NATIVE_MISSION_CARGO_BINDING_INVALID",
+      };
+    }
+    const effectAlreadyApplied = nativeNpcStore.listNativeCargo().some(
+      (record) => record && record.missionItemReceipt &&
+        record.missionItemReceipt.effectID === effectID,
+    ) || nativeNpcStore.listNativeWreckItems().some(
+      (record) => record && record.missionItemReceipt &&
+        record.missionItemReceipt.effectID === effectID,
+    );
+    if (effectAlreadyApplied) {
+      return {
+        success: false,
+        errorMsg: "NPC_NATIVE_MISSION_CARGO_EFFECT_ALREADY_APPLIED",
+      };
+    }
+    const cargoType = resolveItemByTypeID(typeID);
+    if (!cargoType) {
+      return {
+        success: false,
+        errorMsg: "NPC_NATIVE_MISSION_CARGO_TYPE_NOT_FOUND",
+      };
+    }
+    const singleton = resolveNativeCargoSingleton(cargoType, false);
+    if (singleton && quantity !== 1) {
+      return {
+        success: false,
+        errorMsg: "NPC_NATIVE_MISSION_CARGO_QUANTITY_INVALID",
+      };
+    }
+    const cargoIDResult = nativeNpcStore.allocateCargoID({ transient });
+    if (!cargoIDResult.success || !cargoIDResult.data) {
+      return cargoIDResult;
+    }
+    const cargoRecord = {
+      cargoID: cargoIDResult.data,
+      entityID: entityRecord.entityID,
+      ownerID: entityRecord.ownerID,
+      moduleID: 0,
+      typeID: cargoType.typeID,
+      groupID: toPositiveInt(cargoType.groupID, 0),
+      categoryID: toPositiveInt(cargoType.categoryID, 0),
+      itemName: String(cargoType.name || ""),
+      quantity,
+      singleton,
+      flagID: 5,
+      moduleState: null,
+      missionItemReceipt: {
+        missionRunID,
+        effectID,
+        typeID: cargoType.typeID,
+        quantity,
+        source: cloneValue(source),
+        target: cloneValue(target),
+        owner: {
+          missionOwnerCharacterID,
+          nativeNpcOwnerID: toPositiveInt(entityRecord.ownerID, 0),
+          holderEntityID: toPositiveInt(entityRecord.entityID, 0),
+        },
+        placement,
+      },
+      transient,
+    };
+    const upsertResult = nativeNpcStore.upsertNativeCargo(cargoRecord, { transient });
+    if (!upsertResult.success) {
+      return upsertResult;
+    }
+    cargoRecords.push(cargoRecord);
+  }
+
   return {
     success: true,
     data: cargoRecords,
@@ -807,19 +1329,30 @@ function resolveNativeRuntimeKind(options = {}) {
 
 function buildNativeControllerRecord(context, definition, entityRecord, spawnState, options = {}) {
   const runtimeKind = resolveNativeRuntimeKind(options);
+  const controllerPaused = options.controllerPaused === true || options.startPaused === true;
   const nextThinkAtMs =
-    runtimeKind === "nativeAmbient" || options.skipInitialBehaviorTick === true
+    runtimeKind === "nativeAmbient" ||
+      options.skipInitialBehaviorTick === true ||
+      controllerPaused
       ? Number.MAX_SAFE_INTEGER
       : 0;
   return {
     entityID: entityRecord.entityID,
     systemID: entityRecord.systemID,
+    sceneKey: entityRecord.sceneKey || context.sceneKey || "",
+    sceneKind: entityRecord.sceneKind || context.sceneKind || "",
+    instanceID: toPositiveInt(entityRecord.instanceID, toPositiveInt(context.instanceID, 0)),
+    locationID: toPositiveInt(entityRecord.locationID, toPositiveInt(context.locationID, entityRecord.systemID)),
     profileID: definition.profile.profileID,
     loadoutID: definition.loadout.loadoutID,
     behaviorProfileID: definition.behaviorProfile.behaviorProfileID,
     lootTableID: definition.lootTable ? definition.lootTable.lootTableID : null,
     definitionSnapshot: definition ? cloneValue(definition) : null,
-    behaviorOverrides: normalizeBehaviorOverrides(options.behaviorOverrides),
+    behaviorOverrides: normalizeBehaviorOverrides(
+      isDestructibleNpcSentry(entityRecord)
+        ? buildNpcSentryBehaviorOverrides(options.behaviorOverrides)
+        : options.behaviorOverrides,
+    ),
     preferredTargetID: toPositiveInt(options.preferredTargetID, toPositiveInt(context.preferredTargetID, 0)),
     currentTargetID: 0,
     selectionKind: String(options.selectionKind || "").trim() || null,
@@ -832,6 +1365,11 @@ function buildNativeControllerRecord(context, definition, entityRecord, spawnSta
     entityType: entityRecord.npcEntityType,
     transient: options.transient === true,
     runtimeKind,
+    controllerPaused,
+    controllerLifecycleState: controllerPaused ? "materialized_paused" : "active",
+    pausedReason: controllerPaused
+      ? String(options.controllerPausedReason || "abyssal_room_prewarm").trim() || "abyssal_room_prewarm"
+      : "",
     startupSlotIndex: Math.max(0, Math.trunc(Number(options.startupSlotIndex) || 0)),
     anchorKind: String(options.anchorKind || context.anchorKind || "anchor"),
     anchorID: toPositiveInt(
@@ -854,6 +1392,95 @@ function buildNativeControllerRecord(context, definition, entityRecord, spawnSta
     lastHomeDirection: null,
     returningHome: false,
   };
+}
+
+function resolveDefenseProfileForSystem(systemID, options = {}) {
+  const explicit = String(
+    Reflect.get(options || {}, "defenseDamageProfile") ||
+      Reflect.get(options || {}, "hostileFactionKey") ||
+      Reflect.get(options || {}, "pirateFactionKey") ||
+      "",
+  ).trim();
+  if (explicit) {
+    return explicit;
+  }
+  try {
+    const beltRatRuntime = require(path.join(__dirname, "./beltRatRuntime"));
+    if (typeof beltRatRuntime.resolvePirateFactionKeyForSystem === "function") {
+      return beltRatRuntime.resolvePirateFactionKeyForSystem(systemID) || "kinetic";
+    }
+  } catch (_error) {
+    // Governed loadouts use a deterministic kinetic fallback.
+  }
+  return "kinetic";
+}
+
+function normalizePilotSkills(entries) {
+  return (Array.isArray(entries) ? entries : [])
+    .map((entry) => ({
+      typeID: toPositiveInt(entry && entry.typeID, 0),
+      level: Math.max(0, Math.min(5, Math.trunc(Number(entry && entry.level) || 0))),
+      name: String(entry && entry.name || "").trim() || null,
+    }))
+    .filter((entry) => entry.typeID > 0 && entry.level > 0);
+}
+
+function buildPilotSkillMap(entries) {
+  return new Map(normalizePilotSkills(entries).map((entry) => [
+    entry.typeID,
+    {
+      typeID: entry.typeID,
+      skillLevel: entry.level,
+      trainedSkillLevel: entry.level,
+      effectiveSkillLevel: entry.level,
+    },
+  ]));
+}
+
+function normalizePositiveIntSelector(value, pluralKey, singularKey) {
+  const source =
+    value && Array.isArray(value[pluralKey])
+      ? value[pluralKey]
+      : (
+        value && value[singularKey] !== undefined && value[singularKey] !== null
+          ? [value[singularKey]]
+          : []
+      );
+  return source
+    .map((entry) => toPositiveInt(entry, 0))
+    .filter((entry) => entry > 0);
+}
+
+function doesAuthoredChargeSelectModule(chargeEntry, moduleRecord) {
+  if (!chargeEntry || !moduleRecord) {
+    return false;
+  }
+  const selectedFlagIDs = normalizePositiveIntSelector(
+    chargeEntry,
+    "moduleFlagIDs",
+    "moduleFlagID",
+  );
+  const selectedTypeIDs = normalizePositiveIntSelector(
+    chargeEntry,
+    "moduleTypeIDs",
+    "moduleTypeID",
+  );
+  if (selectedFlagIDs.length <= 0 && selectedTypeIDs.length <= 0) {
+    return true;
+  }
+  if (
+    selectedFlagIDs.length > 0 &&
+    !selectedFlagIDs.includes(toPositiveInt(moduleRecord.flagID, 0))
+  ) {
+    return false;
+  }
+  if (
+    selectedTypeIDs.length > 0 &&
+    !selectedTypeIDs.includes(toPositiveInt(moduleRecord.typeID, 0))
+  ) {
+    return false;
+  }
+  return true;
 }
 
 function buildNativeRuntimeShipSpec(entityRecord) {
@@ -886,6 +1513,10 @@ function buildNativeRuntimeShipSpec(entityRecord) {
     spawnSiteID: entityRecord.spawnSiteID || null,
     startupRuleID: entityRecord.startupRuleID || null,
     operatorKind: entityRecord.operatorKind || null,
+    sceneKey: entityRecord.sceneKey || null,
+    sceneKind: entityRecord.sceneKind || null,
+    instanceID: toPositiveInt(entityRecord.instanceID, 0),
+    locationID: toPositiveInt(entityRecord.locationID, entityRecord.systemID),
     anchorKind: entityRecord.anchorKind || null,
     anchorID: entityRecord.anchorID || null,
     anchorName: entityRecord.anchorName || null,
@@ -905,9 +1536,6 @@ function buildNativeRuntimeShipSpec(entityRecord) {
     fittedItems: nativeNpcStore.buildNativeFittedItems(entityRecord.entityID),
     nativeCargoItems: nativeNpcStore.buildNativeCargoItems(entityRecord.entityID),
     skillMap: buildPilotSkillMap(entityRecord.pilotSkills),
-    npcProfileID: entityRecord.profileID || null,
-    npcLoadoutID: entityRecord.loadoutID || null,
-    npcDoctrineID: entityRecord.doctrineID || null,
     governedDroneBay: cloneValue(entityRecord.governedDroneBay || []),
     defensiveDroneFlights: cloneValue(entityRecord.defensiveDroneFlights || []),
     defenseDamageProfile: entityRecord.defenseDamageProfile || null,
@@ -936,6 +1564,16 @@ function applyNativeRuntimeNpcPresentation(entity, entityRecord, definition = nu
   entity.spawnSiteID = entityRecord.spawnSiteID || null;
   entity.startupRuleID = entityRecord.startupRuleID || null;
   entity.operatorKind = entityRecord.operatorKind || null;
+  if (entityRecord.sceneKey) {
+    entity.sceneKey = entityRecord.sceneKey;
+  }
+  if (entityRecord.sceneKind) {
+    entity.sceneKind = entityRecord.sceneKind;
+  }
+  if (toPositiveInt(entityRecord.instanceID, 0) > 0) {
+    entity.instanceScope = entityRecord.sceneKind || entity.instanceScope || null;
+    entity.abyssalRunID = toPositiveInt(entityRecord.instanceID, 0);
+  }
   entity.anchorKind = entityRecord.anchorKind || null;
   entity.anchorID = entityRecord.anchorID || null;
   entity.anchorName = entityRecord.anchorName || null;
@@ -974,14 +1612,12 @@ function applyNativeRuntimeNpcPresentation(entity, entityRecord, definition = nu
   }
   entity.fittedItems = nativeNpcStore.buildNativeFittedItems(entityRecord.entityID);
   entity.nativeCargoItems = nativeNpcStore.buildNativeCargoItems(entityRecord.entityID);
-  entity.modules = nativeNpcStore.buildNativeSlimModuleTuples(entityRecord.entityID);
-  entity.npcProfileID = entityRecord.profileID || null;
-  entity.npcLoadoutID = entityRecord.loadoutID || null;
-  entity.npcDoctrineID = entityRecord.doctrineID || null;
+  entity.skillMap = buildPilotSkillMap(entityRecord.pilotSkills);
   entity.governedDroneBay = cloneValue(entityRecord.governedDroneBay || []);
   entity.defensiveDroneFlights = cloneValue(entityRecord.defensiveDroneFlights || []);
   entity.defenseDamageProfile = entityRecord.defenseDamageProfile || null;
-  return applyNativeNpcHullCombatOverrides(
+  entity.modules = nativeNpcStore.buildNativeSlimModuleTuples(entityRecord.entityID);
+  const presentedEntity = applyNativeNpcHullCombatOverrides(
     applyCapitalNpcCombatOverrides(
       applyTransientConcordCombatOverrides(entity, entityRecord),
       entityRecord,
@@ -990,6 +1626,7 @@ function applyNativeRuntimeNpcPresentation(entity, entityRecord, definition = nu
     entityRecord,
     definition,
   );
+  return applyNpcSentryRuntimePolicy(presentedEntity);
 }
 
 function resolveIdleOrbitDistance(entity, controller, anchorEntity, behaviorProfile) {
@@ -1064,7 +1701,11 @@ function registerNativeRuntimeController(entityRecord, controllerRecord, definit
   return registerController({
     ...cloneValue(controllerRecord),
     behaviorProfile: cloneValue(definition && definition.behaviorProfile || {}),
-    behaviorOverrides: normalizeBehaviorOverrides(controllerRecord.behaviorOverrides),
+    behaviorOverrides: normalizeBehaviorOverrides(
+      isDestructibleNpcSentry(entityRecord)
+        ? buildNpcSentryBehaviorOverrides(controllerRecord.behaviorOverrides)
+        : controllerRecord.behaviorOverrides,
+    ),
     preferredTargetID: toPositiveInt(controllerRecord.preferredTargetID, 0),
     currentTargetID: toPositiveInt(controllerRecord.currentTargetID, 0),
     ownerCharacterID: 0,
@@ -1073,6 +1714,11 @@ function registerNativeRuntimeController(entityRecord, controllerRecord, definit
     capitalClassID: entityRecord.capitalClassID || null,
     capitalRarity: entityRecord.capitalRarity || null,
     runtimeKind,
+    controllerPaused: controllerRecord && controllerRecord.controllerPaused === true,
+    controllerLifecycleState:
+      String(controllerRecord && controllerRecord.controllerLifecycleState || "").trim() ||
+      (controllerRecord && controllerRecord.controllerPaused === true ? "materialized_paused" : "active"),
+    pausedReason: String(controllerRecord && controllerRecord.pausedReason || "").trim(),
     nextThinkAtMs:
       runtimeKind === "nativeAmbient"
         ? Number.MAX_SAFE_INTEGER
@@ -1131,11 +1777,15 @@ function materializeNativeRuntimeEntity(scene, entityRecord, controllerRecord, d
   }
 
   const spawnResult = spaceRuntime.spawnDynamicShip(
-    scene.systemID,
+    scene.sceneDescriptor || scene.systemID,
     buildNativeRuntimeShipSpec(entityRecord),
     {
+      sceneDescriptor: scene.sceneDescriptor || undefined,
       persistSpaceState: false,
       broadcast: options.broadcast !== false,
+      initialPublication: options.initialPublication,
+      suppressInitialPublication: options.suppressInitialPublication === true,
+      runtimeEntityMetadata: options.runtimeEntityMetadata,
       excludedSession: options.excludedSession || null,
       entityScopeMetadata,
     },
@@ -1188,6 +1838,14 @@ function materializeStoredNativeController(scene, entityID, options = {}) {
       success: false,
       errorMsg: "NPC_NOT_FOUND",
     };
+  }
+  const sceneAuthority = validateStoredNativeControllerSceneAuthority(
+    scene,
+    entityRecord,
+    controllerRecord,
+  );
+  if (!sceneAuthority.success) {
+    return sceneAuthority;
   }
   const scopeResolution = nativeNpcStore.validateStoredEntityScopeMetadata(
     entityRecord,
@@ -1445,11 +2103,8 @@ function spawnNativeNpcEntityInContext(context, definition, options = {}) {
     itemName: String(definition.profile.shipNameTemplate || definition.profile.name || "NPC"),
   });
   const ownerIDOverride = toPositiveInt(options.ownerIDOverride, 0);
-  const corporationIDOverride = toPositiveInt(options.corporationIDOverride, 0);
-  const allianceIDOverride = toOptionalNonNegativeInt(options.allianceIDOverride);
-  const warFactionIDOverride = toOptionalNonNegativeInt(options.warFactionIDOverride);
-  const suppressSlimName = options.suppressSlimName === true;
   const hasSlimNameOverride = Object.prototype.hasOwnProperty.call(options, "slimNameOverride");
+  const suppressSlimName = shouldSuppressNativeNpcSlimName(identity, options);
   const slimName = suppressSlimName
     ? ""
     : hasSlimNameOverride
@@ -1466,6 +2121,13 @@ function spawnNativeNpcEntityInContext(context, definition, options = {}) {
   const entityRecord = {
     entityID: entityIDResult.data,
     systemID: scene.systemID,
+    sceneKey: String(scene.sceneKey || context.sceneKey || ""),
+    sceneKind: String(scene.sceneKind || context.sceneKind || ""),
+    instanceID: toPositiveInt(scene.instanceID, toPositiveInt(context.instanceID, 0)),
+    locationID: toPositiveInt(
+      scene.locationID,
+      toPositiveInt(context.locationID, scene.systemID),
+    ),
     profileID: definition.profile.profileID,
     loadoutID: definition.loadout.loadoutID,
     behaviorProfileID: definition.behaviorProfile.behaviorProfileID,
@@ -1483,13 +2145,9 @@ function spawnNativeNpcEntityInContext(context, definition, options = {}) {
     suppressSlimName,
     nameID: nameIDOverride || null,
     ownerID: ownerIDOverride || identity.ownerID,
-    corporationID: corporationIDOverride || identity.corporationID,
-    allianceID: allianceIDOverride === undefined
-      ? identity.allianceID
-      : allianceIDOverride,
-    warFactionID: warFactionIDOverride === undefined
-      ? identity.warFactionID
-      : warFactionIDOverride,
+    corporationID: identity.corporationID,
+    allianceID: identity.allianceID,
+    warFactionID: identity.warFactionID,
     securityStatus: identity.securityStatus,
     bounty: identity.bounty,
     npcEntityType: identity.npcEntityType,
@@ -1500,49 +2158,6 @@ function spawnNativeNpcEntityInContext(context, definition, options = {}) {
     friendlyResponseThreshold: identity.friendlyResponseThreshold,
     nativeNpc: true,
     nativeNpcOccupied: true,
-    loadoutGoverned: doctrineGovernance.governed === true,
-    doctrineID: doctrineGovernance.governed === true
-      ? doctrineGovernance.governance.doctrineID
-      : null,
-    doctrineRevision: doctrineGovernance.governed === true
-      ? doctrineGovernance.governance.doctrineRevision
-      : null,
-    npcRole: doctrineGovernance.governed === true
-      ? doctrineGovernance.governance.role
-      : null,
-    equipmentBand: doctrineGovernance.governed === true
-      ? doctrineGovernance.governance.equipmentBand
-      : null,
-    procurementPolicy: doctrineGovernance.governed === true
-      ? doctrineGovernance.governance.procurementPolicy
-      : null,
-    recoverabilityPolicyID: doctrineGovernance.governed === true
-      ? doctrineGovernance.governance.recoverabilityPolicyID
-      : null,
-    fittedModuleDropChance: doctrineGovernance.governed === true
-      ? doctrineGovernance.governance.fittedModuleDropChance
-      : null,
-    fittedModuleDropChances: doctrineGovernance.governed === true
-      ? cloneValue(doctrineGovernance.governance.fittedModuleDropChances)
-      : null,
-    cargoSurvivalChance: doctrineGovernance.governed === true
-      ? doctrineGovernance.governance.cargoSurvivalChance
-      : null,
-    pilotSkills: doctrineGovernance.governed === true
-      ? normalizePilotSkills(doctrineGovernance.governance.pilotSkills)
-      : [],
-    governedDroneBay: doctrineGovernance.governed === true
-      ? cloneValue(regionalDefense.droneBay)
-      : [],
-    defensiveDroneFlights: doctrineGovernance.governed === true
-      ? cloneValue(regionalDefense.defenseFlights)
-      : [],
-    defenseDamageProfile: doctrineGovernance.governed === true
-      ? regionalDefense.damageProfile
-      : null,
-    loadoutSeed: doctrineGovernance.governed === true
-      ? String(options.loadoutSeed || entityIDResult.data)
-      : null,
     transient: options.transient === true,
     selectionKind: String(options.selectionKind || "").trim() || null,
     selectionID: String(options.selectionID || "").trim() || null,
@@ -1583,10 +2198,26 @@ function spawnNativeNpcEntityInContext(context, definition, options = {}) {
       shieldCharge: 1,
       incapacitated: false,
     },
+    pilotSkills: doctrineGovernance.governed === true
+      ? normalizePilotSkills(doctrineGovernance.governance.pilotSkills)
+      : [],
+    governedDroneBay: doctrineGovernance.governed === true
+      ? cloneValue(regionalDefense.droneBay)
+      : [],
+    defensiveDroneFlights: doctrineGovernance.governed === true
+      ? cloneValue(regionalDefense.defenseFlights)
+      : [],
+    defenseDamageProfile: doctrineGovernance.governed === true
+      ? regionalDefense.damageProfile
+      : null,
     ...scopeResolution.data.metadata,
   };
+  if (isDestructibleNpcSentry(entityRecord)) {
+    entityRecord.nativeNpcSentry = true;
+    applyStationaryNpcSentryState(entityRecord);
+  }
   const entityWriteResult = nativeNpcStore.upsertNativeEntity(entityRecord, {
-    transient: options.transient === true,
+    transient: Reflect.get(options || {}, "transient") === true,
   });
   if (!entityWriteResult.success) {
     return entityWriteResult;
@@ -1617,42 +2248,43 @@ function spawnNativeNpcEntityInContext(context, definition, options = {}) {
     options,
   );
   const controllerWriteResult = nativeNpcStore.upsertNativeController(controllerRecord, {
-    transient: options.transient === true,
+    transient: Reflect.get(options || {}, "transient") === true,
   });
   if (!controllerWriteResult.success) {
     nativeNpcStore.removeNativeEntityCascade(entityRecord.entityID);
     return controllerWriteResult;
   }
 
-  let materializeResult = {
-    success: true,
-    data: {
-      entity: null,
-      controller: null,
-    },
-  };
-  if (options.materializeRuntime !== false) {
-    materializeResult = materializeNativeRuntimeEntity(
-      scene,
-      entityRecord,
-      controllerRecord,
-      definition,
-      options,
-    );
-    if (!materializeResult.success || !materializeResult.data) {
-      nativeNpcStore.removeNativeEntityCascade(entityRecord.entityID);
-      return materializeResult;
-    }
-
-    if (
-      options.skipInitialBehaviorTick !== true &&
-      options.deferInitialBehaviorTick !== true
-    ) {
-      tickBehaviorScene(
+  const materializeRuntime = Reflect.get(options || {}, "materializeRuntime") !== false;
+  const materializeResult = materializeRuntime
+    ? materializeNativeRuntimeEntity(
         scene,
-        scene.getCurrentSimTimeMs(),
-      );
-    }
+        entityRecord,
+        controllerRecord,
+        definition,
+        options,
+      )
+    : {
+        success: true,
+        data: {
+          entity: null,
+          controller: null,
+        },
+      };
+  if (!materializeResult.success || !materializeResult.data) {
+    nativeNpcStore.removeNativeEntityCascade(entityRecord.entityID);
+    return materializeResult;
+  }
+
+  if (
+    materializeRuntime &&
+    Reflect.get(options || {}, "skipInitialBehaviorTick") !== true &&
+    Reflect.get(options || {}, "deferInitialBehaviorTick") !== true
+  ) {
+    tickBehaviorScene(
+      scene,
+      scene.getCurrentSimTimeMs(),
+    );
   }
 
   return {
@@ -1660,7 +2292,7 @@ function spawnNativeNpcEntityInContext(context, definition, options = {}) {
     data: {
       entity: materializeResult.data.entity,
       controller: materializeResult.data.controller,
-      virtualizedRuntime: options.materializeRuntime === false,
+      virtualizedRuntime: Reflect.get(options || {}, "materializeRuntime") === false,
       entityRecord,
       shipItem: null,
       modules: moduleResult.data || [],
@@ -1673,8 +2305,9 @@ function spawnNativeNpcEntityInContext(context, definition, options = {}) {
 }
 
 function spawnNativeDefinitionsInContext(context, selectionResult, options = {}) {
-  const spawned = [];
-  let partialFailure = null;
+  /** @type {any[]} */
+  const spawned = new Array(0);
+  let partialFailure = { failedAt: 0, errorMsg: "" };
   const scene = context && context.scene
     ? context.scene
     : spaceRuntime.ensureScene(toPositiveInt(context && context.systemID, 0));
@@ -1685,72 +2318,41 @@ function spawnNativeDefinitionsInContext(context, selectionResult, options = {})
   )
     ? selectionResult.data.definitions
     : [];
+  const scopeMetadata = Reflect.get(options, "entityScopeMetadata") || {};
+  const encounterKey = String(
+    Reflect.get(scopeMetadata, "dungeonEncounterKey") || "",
+  ).trim();
+  const rawMemberStartIndex = Number.parseInt(
+    Reflect.get(options, "dungeonEncounterMemberStartIndex"),
+    10,
+  );
+  const memberStartIndex = Number.isSafeInteger(rawMemberStartIndex)
+    ? Math.max(0, rawMemberStartIndex)
+    : 0;
 
   for (let index = 0; index < definitions.length; index += 1) {
-    const indexedSpawnStateOverride = Array.isArray(options.spawnStateOverrides)
-      ? options.spawnStateOverrides[index]
-      : null;
-    const indexedOwnerIDOverride = Array.isArray(options.ownerIDOverrides)
-      ? options.ownerIDOverrides[index]
-      : null;
-    const indexedCorporationIDOverride = Array.isArray(options.corporationIDOverrides)
-      ? options.corporationIDOverrides[index]
-      : null;
-    const indexedAllianceIDOverride = resolveIndexedNonNegativeIDOverride(
-      options,
-      "allianceIDOverride",
-      "allianceIDOverrides",
-      index,
-    );
-    const indexedWarFactionIDOverride = resolveIndexedNonNegativeIDOverride(
-      options,
-      "warFactionIDOverride",
-      "warFactionIDOverrides",
-      index,
-    );
-    const indexedNameIDOverride = Array.isArray(options.nameIDOverrides)
-      ? options.nameIDOverrides[index]
-      : null;
-    const indexedCargoOverride = Array.isArray(options.cargoOverrides)
-      ? options.cargoOverrides[index]
-      : undefined;
     const spawnResult = spawnNativeNpcEntityInContext(
       context,
       definitions[index],
       {
         ...options,
-        ownerIDOverride: toPositiveInt(
-          indexedOwnerIDOverride,
-          toPositiveInt(options.ownerIDOverride, 0),
-        ),
-        corporationIDOverride: toPositiveInt(
-          indexedCorporationIDOverride,
-          toPositiveInt(options.corporationIDOverride, 0),
-        ),
-        allianceIDOverride: indexedAllianceIDOverride,
-        warFactionIDOverride: indexedWarFactionIDOverride,
-        nameIDOverride: toPositiveInt(
-          indexedNameIDOverride,
-          toPositiveInt(options.nameIDOverride ?? options.nameID, 0),
-        ),
-        cargoOverride: Array.isArray(indexedCargoOverride)
-          ? indexedCargoOverride
-          : options.cargoOverride,
-        spawnStateOverride:
-          indexedSpawnStateOverride && typeof indexedSpawnStateOverride === "object"
-            ? indexedSpawnStateOverride
-            : options.spawnStateOverride,
         broadcast: false,
         deferInitialBehaviorTick: true,
         batchIndex: index + 1,
         batchTotal: definitions.length,
-        selectionKind: String(options.selectionKind || (
+        entityScopeMetadata: encounterKey
+          ? {
+              ...scopeMetadata,
+              dungeonEncounterMemberKey: `${encounterKey}:member:${memberStartIndex + index}`,
+            }
+          : scopeMetadata,
+        selectionKind: String(Reflect.get(options || {}, "selectionKind") || (
           selectionResult.data && selectionResult.data.selectionKind
         ) || "").trim() || null,
-        selectionID: String(options.selectionID || (
+        selectionID: String(Reflect.get(options || {}, "selectionID") || (
           selectionResult.data && selectionResult.data.selectionID
         ) || "").trim() || null,
-        selectionName: String(options.selectionName || (
+        selectionName: String(Reflect.get(options || {}, "selectionName") || (
           selectionResult.data && selectionResult.data.selectionName
         ) || "").trim() || null,
       },
@@ -1768,31 +2370,32 @@ function spawnNativeDefinitionsInContext(context, selectionResult, options = {})
   if (spawned.length === 0) {
     return {
       success: false,
-      errorMsg: partialFailure ? partialFailure.errorMsg : "NPC_NATIVE_SPAWN_FAILED",
+      errorMsg: partialFailure.failedAt > 0 ? partialFailure.errorMsg : "NPC_NATIVE_SPAWN_FAILED",
       suggestions: selectionResult && selectionResult.suggestions
         ? selectionResult.suggestions
         : [],
     };
   }
 
-  if (scene && options.broadcast !== false) {
+  if (scene && Reflect.get(options || {}, "broadcast") !== false) {
     scene.broadcastAddBalls(
       spawned
         .map((entry) => entry && entry.entity)
         .filter(Boolean),
-      options.excludedSession || null,
+      Reflect.get(options || {}, "excludedSession") || null,
       {
         freshAcquire: true,
         minimumLeadFromCurrentHistory: 2,
+        publisherPath: "nativeNpcService.spawnNativeDefinitionsInContext",
       },
     );
   }
 
   if (
     scene &&
-    options.materializeRuntime !== false &&
-    options.skipInitialBehaviorTick !== true &&
-    options.deferGroupBehaviorTick !== true
+    Reflect.get(options || {}, "materializeRuntime") !== false &&
+    Reflect.get(options || {}, "skipInitialBehaviorTick") !== true &&
+    Reflect.get(options || {}, "deferGroupBehaviorTick") !== true
   ) {
     tickBehaviorScene(
       scene,
@@ -1803,12 +2406,12 @@ function spawnNativeDefinitionsInContext(context, selectionResult, options = {})
   return {
     success: true,
     data: {
-      selectionKind: String(options.selectionKind || (selectionResult.data && selectionResult.data.selectionKind) || "").trim() || null,
-      selectionID: String(options.selectionID || (selectionResult.data && selectionResult.data.selectionID) || "").trim() || null,
-      selectionName: String(options.selectionName || (selectionResult.data && selectionResult.data.selectionName) || "").trim() || null,
+      selectionKind: String(Reflect.get(options || {}, "selectionKind") || (selectionResult.data && selectionResult.data.selectionKind) || "").trim() || null,
+      selectionID: String(Reflect.get(options || {}, "selectionID") || (selectionResult.data && selectionResult.data.selectionID) || "").trim() || null,
+      selectionName: String(Reflect.get(options || {}, "selectionName") || (selectionResult.data && selectionResult.data.selectionName) || "").trim() || null,
       requestedAmount: definitions.length,
       spawned,
-      partialFailure,
+      partialFailure: partialFailure.failedAt > 0 ? partialFailure : null,
     },
     suggestions: selectionResult && selectionResult.suggestions
       ? selectionResult.suggestions
@@ -1823,8 +2426,8 @@ function spawnNativeNpcEntityInSystem(systemID, options = {}) {
   }
 
   const profileResolution = resolveNpcProfile(
-    options.profileQuery,
-    String(options.fallbackProfileID || ""),
+    Reflect.get(options || {}, "profileQuery"),
+    String(Reflect.get(options || {}, "fallbackProfileID") || ""),
   );
   if (!profileResolution.success || !profileResolution.data) {
     return {
@@ -1847,7 +2450,7 @@ function spawnNativeNpcEntityInSystem(systemID, options = {}) {
     selectionKind: "profile",
     selectionID: definition.profile.profileID,
     selectionName: definition.profile.name || definition.profile.profileID,
-    entityType: options.entityType || definition.profile.entityType,
+    entityType: Reflect.get(options || {}, "entityType") || definition.profile.entityType,
     anchorKind: contextResult.data.anchorKind,
     anchorName: contextResult.data.anchorLabel,
     anchorID: toPositiveInt(contextResult.data.anchorEntity && contextResult.data.anchorEntity.itemID, 0),
@@ -1861,10 +2464,10 @@ function spawnNativeNpcGroupInSystem(systemID, options = {}) {
   }
 
   const groupResult = resolveNpcSpawnGroupPlan(
-    options.spawnGroupQuery || options.groupQuery,
+    Reflect.get(options || {}, "spawnGroupQuery") || Reflect.get(options || {}, "groupQuery"),
     {
-      entityType: String(options.entityType || ENTITY_TYPE.NPC),
-      fallbackSpawnGroupID: String(options.fallbackSpawnGroupID || ""),
+      entityType: String(Reflect.get(options || {}, "entityType") || ENTITY_TYPE.NPC),
+      fallbackSpawnGroupID: String(Reflect.get(options || {}, "fallbackSpawnGroupID") || ""),
     },
   );
   if (!groupResult.success || !groupResult.data) {
@@ -1928,8 +2531,64 @@ function destroyNativeNpcController(controller, options = {}) {
     };
   }
 
-  const scene = spaceRuntime.ensureScene(systemID);
+  const sceneDescriptor =
+    options.sceneDescriptor ||
+    (
+      controller && controller.sceneKind && controller.sceneKey
+        ? {
+          sceneKey: controller.sceneKey,
+          sceneKind: controller.sceneKind,
+          instanceID: controller.instanceID,
+          locationID: controller.locationID || systemID,
+          solarSystemID: controller.locationID || systemID,
+        }
+        : null
+    );
+  const scene =
+    options.scene ||
+    (
+      sceneDescriptor && typeof spaceRuntime.getSceneByDescriptor === "function"
+        ? spaceRuntime.getSceneByDescriptor(sceneDescriptor)
+        : null
+    ) ||
+    (
+      typeof spaceRuntime.findSceneContainingDynamicEntity === "function"
+        ? spaceRuntime.findSceneContainingDynamicEntity(entityID)
+        : null
+    ) ||
+    spaceRuntime.ensureScene(systemID);
   const runtimeEntity = scene ? scene.getEntityByID(entityID) : null;
+  const destructionContext = captureNativeNpcDestructionContext(
+    entityID,
+    controller,
+    runtimeEntity,
+    scene,
+    options,
+  );
+  if (runtimeEntity && (runtimeEntity.destructionState === "destroyed" || runtimeEntity.destroyed === true)) {
+    const alreadyResult = normalizeNpcObjectiveNotificationResult(null, "already-destroyed");
+    logNpcObjectiveNotificationDiagnostic(destructionContext, alreadyResult, options);
+    return {
+      success: true,
+      data: {
+        entityID,
+        systemID,
+        removedFighterCount: 0,
+        removedRuntimeEntity: false,
+        alreadyDestroyed: true,
+        objectiveNotificationResult: alreadyResult,
+      },
+    };
+  }
+  if (runtimeEntity) {
+    runtimeEntity.destructionState = "destroying";
+    runtimeEntity.destroying = true;
+    runtimeEntity.destroyingAtMs = Date.now();
+    log.info(
+      `[NpcDestruction] npc=${entityID} sceneKey=${scene && scene.sceneKey || "unknown"} ` +
+        `state=destroying suppressWreck=${options.suppressWreck === true}`,
+    );
+  }
   let removedFighterCount = 0;
   if (
     scene &&
@@ -1960,17 +2619,69 @@ function destroyNativeNpcController(controller, options = {}) {
       cleanupResult.data.destroyedCount,
     ) || 0;
   }
+  let sceneRemoved = false;
   if (runtimeEntity) {
-    spaceRuntime.removeDynamicEntity(systemID, entityID, {
-      allowSessionOwned: true,
-      broadcast: options.broadcast === true,
-      excludedSession: options.excludedSession || null,
-      nowMs: options.nowMs,
-    });
+    const removeResult = spaceRuntime.removeDynamicEntity(
+      scene && scene.sceneDescriptor || sceneDescriptor || systemID,
+      entityID,
+      {
+        sceneDescriptor: scene && scene.sceneDescriptor || sceneDescriptor || undefined,
+        allowSessionOwned: true,
+        broadcast: options.broadcast === true,
+        excludedSession: options.excludedSession || null,
+        nowMs: options.nowMs,
+        terminalDestructionEffectID: options.terminalDestructionEffectID,
+      },
+    );
+    sceneRemoved = Boolean(removeResult && removeResult.success === true);
+    runtimeEntity.destructionState = "destroyed";
+    runtimeEntity.destroying = false;
+    runtimeEntity.destroyed = true;
+    runtimeEntity.destroyedAtMs = Date.now();
   }
 
   unregisterController(entityID);
   nativeNpcStore.removeNativeEntityCascade(entityID);
+  let objectiveNotificationResult = normalizeNpcObjectiveNotificationResult(null, "not-tracked");
+  if (destructionContext.abyssalAuthorityValid !== true) {
+    objectiveNotificationResult = normalizeNpcObjectiveNotificationResult(
+      null,
+      destructionContext.abyssalAuthorityPresent === true
+        ? "metadata-invalid"
+        : "metadata-missing",
+    );
+  } else if (typeof options.notifyNpcDestroyed !== "function") {
+    objectiveNotificationResult = normalizeNpcObjectiveNotificationResult(null, "callback-missing");
+  } else {
+    try {
+      objectiveNotificationResult = normalizeNpcObjectiveNotificationResult(
+        options.notifyNpcDestroyed(destructionContext),
+        "notified",
+      );
+    } catch (error) {
+      objectiveNotificationResult = {
+        handled: false,
+        newlyRecorded: false,
+        objectiveComplete: false,
+        result: "callback-error",
+        pending: false,
+        errorMsg: error && error.message || "UNKNOWN_ERROR",
+      };
+      log.warn(
+        `[NpcDestruction] Abyssal objective notify failed npc=${entityID} ` +
+          `runID=${destructionContext.abyssalRunID || "none"} ` +
+          `room=${destructionContext.abyssalRoomIndex || "none"} ` +
+          `sceneKey=${destructionContext.sceneKey || "none"} ` +
+          `reason=${objectiveNotificationResult.errorMsg}`,
+      );
+    }
+  }
+  logNpcObjectiveNotificationDiagnostic(destructionContext, objectiveNotificationResult, options);
+  log.info(
+    `[NpcDestruction] npc=${entityID} state=destroyed ` +
+      `sceneRemoved=${sceneRemoved} controllerRemoved=true ` +
+      `removeBallsRecipients=${sceneRemoved ? 1 : 0} objectiveNotified=${objectiveNotificationResult.handled === true}`,
+  );
   return {
     success: true,
     data: {
@@ -1978,64 +2689,11 @@ function destroyNativeNpcController(controller, options = {}) {
       systemID,
       removedFighterCount,
       removedRuntimeEntity: Boolean(runtimeEntity),
-    },
-  };
-}
-
-function destroyNativeNpcControllersBulk(controllers, options = {}) {
-  const eligibleControllers = (Array.isArray(controllers) ? controllers : [])
-    .filter((controller) => controller && controller.capitalNpc !== true)
-    .filter((controller) => toPositiveInt(controller.entityID || controller.itemID, 0) > 0)
-    .filter((controller) => toPositiveInt(controller.systemID, 0) > 0);
-  const entityIDs = [];
-  const affectedScenes = new Set();
-  let removedRuntimeEntities = 0;
-
-  for (const controller of eligibleControllers) {
-    const entityID = toPositiveInt(controller.entityID || controller.itemID, 0);
-    const systemID = toPositiveInt(controller.systemID, 0);
-    const scene = spaceRuntime.ensureScene(systemID);
-    const runtimeEntity = scene ? scene.getEntityByID(entityID) : null;
-    if (runtimeEntity) {
-      const removeResult = spaceRuntime.removeDynamicEntity(systemID, entityID, {
-        allowSessionOwned: true,
-        broadcast: options.broadcast !== false,
-        deferPublicGridComposition: true,
-      });
-      if (removeResult && removeResult.success) {
-        removedRuntimeEntities += 1;
-        affectedScenes.add(scene);
-      }
-    }
-    unregisterController(entityID);
-    entityIDs.push(entityID);
-  }
-
-  for (const scene of affectedScenes) {
-    if (scene && typeof scene.ensurePublicGridComposition === "function") {
-      scene.ensurePublicGridComposition();
-    }
-  }
-
-  const storeResult = options.deferStoreRemoval === true
-    ? {
-        success: true,
-        data: {
-          deferred: true,
-          entityIDs,
-        },
-      }
-    : nativeNpcStore.removeNativeEntitiesCascade(entityIDs);
-  if (!storeResult.success) {
-    return storeResult;
-  }
-  return {
-    success: true,
-    data: {
-      entityIDs,
-      removedControllers: entityIDs.length,
-      removedRuntimeEntities,
-      store: storeResult.data,
+      sceneRemoved,
+      controllerRemoved: true,
+      objectiveNotified: objectiveNotificationResult.handled === true,
+      objectiveNotificationResult,
+      destructionContext,
     },
   };
 }
@@ -2050,5 +2708,8 @@ module.exports = {
   spawnNativeNpcGroupInSystem,
   cleanupStaleNativeStartupControllers,
   destroyNativeNpcController,
-  destroyNativeNpcControllersBulk,
+  __testing: {
+    applyNativeNpcHullCombatOverrides,
+    shouldSuppressNativeNpcSlimName,
+  },
 };

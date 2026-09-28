@@ -2,6 +2,8 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
@@ -109,6 +111,14 @@ struct OrderEventsParams {
     limit: Option<usize>,
 }
 
+/// Internal daemon callers may supply a deterministic point-in-time when
+/// driving durable expiry in tests. Game clients never reach this RPC.
+#[derive(Debug, Deserialize, Default)]
+struct SweepExpiredOrdersParams {
+    #[serde(default)]
+    as_of: Option<String>,
+}
+
 pub async fn serve(runtime: MarketRuntime, config: RpcConfig) -> Result<()> {
     let address = format!("{}:{}", config.host, config.port);
     let listener = TcpListener::bind(&address)
@@ -210,6 +220,7 @@ async fn dispatch_request(runtime: MarketRuntime, method: &str, params: Value) -
           "status": "ok",
           "started_at": runtime.started_at,
           "database_path": runtime.database_path.to_string_lossy(),
+          "capabilities": ["idempotent-fill-v1"],
         })),
         "GetManifest" => Ok(serde_json::to_value(&*runtime.manifest)?),
         "GetDiagnostics" => Ok(serde_json::to_value(runtime.diagnostics().await?)?),
@@ -322,7 +333,19 @@ async fn dispatch_request(runtime: MarketRuntime, method: &str, params: Value) -
                 )?)
                 .await?,
         )?),
-        "SweepExpiredOrders" => Ok(serde_json::to_value(runtime.sweep_expired_orders().await?)?),
+        "SweepExpiredOrders" => {
+            let params = serde_json::from_value::<SweepExpiredOrdersParams>(params)?;
+            let result = match params.as_of {
+                Some(value) => {
+                    let as_of = OffsetDateTime::parse(&value, &Rfc3339).with_context(|| {
+                        format!("invalid market expiry as_of timestamp: {value}")
+                    })?;
+                    runtime.sweep_expired_orders_at(as_of).await?
+                }
+                None => runtime.sweep_expired_orders().await?,
+            };
+            Ok(serde_json::to_value(result)?)
+        }
         "GetOrderEvents" => {
             let params = serde_json::from_value::<OrderEventsParams>(params)?;
             Ok(serde_json::to_value(

@@ -1,3 +1,5 @@
+"use strict";
+
 const path = require("path");
 
 const BaseService = require(path.join(__dirname, "../baseService"));
@@ -12,7 +14,7 @@ const {
 } = require(path.join(__dirname, "../../common/machoErrors"));
 const {
   JOURNAL_ENTRY_TYPE,
-  adjustCharacterBalance,
+  adjustCharacterBalanceAsync,
   buildNotEnoughMoneyUserErrorValues,
   getCharacterWallet,
 } = require(path.join(__dirname, "../account/walletState"));
@@ -27,7 +29,11 @@ const {
   notifyKillRightAvailable,
   notifyKillRightUnavailable,
 } = require(path.join(__dirname, "./killRightNotifications"));
-const { buildDict, buildKeyVal, buildList } = require(path.join(
+const { buildKeyVal } = require(path.join(
+  __dirname,
+  "../_shared/serviceHelpers",
+));
+const { buildList } = require(path.join(
   __dirname,
   "../_shared/serviceHelpers",
 ));
@@ -369,7 +375,7 @@ class BountyProxyService extends BaseService {
     super("bountyProxy");
   }
 
-  Handle_AddToBounty(args, session) {
+  async Handle_AddToBounty(args, session) {
     const targetID = args && args.length > 0 ? args[0] : 0;
     const amount = args && args.length > 1 ? args[1] : 0;
     const characterID = getSessionCharacterID(session);
@@ -392,7 +398,7 @@ class BountyProxyService extends BaseService {
     if (wallet.balance < numericAmount) {
       throwNotEnoughMoney(numericAmount, wallet.balance);
     }
-    const debitResult = adjustCharacterBalance(characterID, -numericAmount, {
+    const debitResult = await adjustCharacterBalanceAsync(characterID, -numericAmount, {
       description: `Bounty placed on ${Number(targetID) || 0}`,
       ownerID1: characterID,
       ownerID2: Number(targetID) || 0,
@@ -413,7 +419,7 @@ class BountyProxyService extends BaseService {
       contributorID: characterID,
     });
     if (!placeResult.success) {
-      adjustCharacterBalance(characterID, numericAmount, {
+      await adjustCharacterBalanceAsync(characterID, numericAmount, {
         description: `Refund failed bounty placement on ${Number(targetID) || 0}`,
         ownerID1: characterID,
         ownerID2: Number(targetID) || 0,
@@ -459,7 +465,7 @@ class BountyProxyService extends BaseService {
     log.debug(
       `[BountyProxy] GetBounties: ${JSON.stringify(requestedIds)}`,
     );
-    return buildDict(buildBountyEntries(requestedIds));
+    return buildList(buildBountyEntries(requestedIds));
   }
 
   Handle_GetBountiesAndKillRights(args, session) {
@@ -471,7 +477,7 @@ class BountyProxyService extends BaseService {
       `[BountyProxy] GetBountiesAndKillRights: ${JSON.stringify(requestedIds)}`,
     );
     return [
-      buildDict(buildBountyEntries(requestedIds)),
+      buildList(buildBountyEntries(requestedIds)),
       buildList(
         killRightState
           .listAvailableKillRightsOnCharacters(

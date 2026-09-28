@@ -1,33 +1,33 @@
 use serde::{Deserialize, Serialize};
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 mod string_i64 {
-  use serde::de::Error as _;
-  use serde::{Deserialize, Deserializer, Serializer};
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer, Serializer};
 
-  pub fn serialize<S>(value: &i64, serializer: S) -> Result<S::Ok, S::Error>
-  where
-    S: Serializer,
-  {
-    serializer.serialize_str(&value.to_string())
-  }
-
-  pub fn deserialize<'de, D>(deserializer: D) -> Result<i64, D::Error>
-  where
-    D: Deserializer<'de>,
-  {
-    let value = serde_json::Value::deserialize(deserializer)?;
-    match value {
-      serde_json::Value::String(text) => text
-        .parse::<i64>()
-        .map_err(|error| D::Error::custom(format!("invalid i64 string: {error}"))),
-      serde_json::Value::Number(number) => number
-        .as_i64()
-        .ok_or_else(|| D::Error::custom("invalid i64 number")),
-      _ => Err(D::Error::custom("expected string or number for i64 value")),
+    pub fn serialize<S>(value: &i64, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&value.to_string())
     }
-  }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<i64, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            serde_json::Value::String(text) => text
+                .parse::<i64>()
+                .map_err(|error| D::Error::custom(format!("invalid i64 string: {error}"))),
+            serde_json::Value::Number(number) => number
+                .as_i64()
+                .ok_or_else(|| D::Error::custom("invalid i64 number")),
+            _ => Err(D::Error::custom("expected string or number for i64 value")),
+        }
+    }
 }
 
 pub const MARKET_SCHEMA_VERSION: u32 = 1;
@@ -312,212 +312,216 @@ DROP INDEX IF EXISTS idx_market_order_events_type_id;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketManifest {
-  pub schema_version: u32,
-  pub generated_at: String,
-  pub static_data_dir: String,
-  pub database_path: String,
-  #[serde(default)]
-  pub selection_mode: String,
-  #[serde(default)]
-  pub selection_label: String,
-  #[serde(default)]
-  pub selected_solar_system_ids: Vec<u32>,
-  #[serde(default)]
-  pub selected_solar_system_names: Vec<String>,
-  pub region_count: u32,
-  pub solar_system_count: u32,
-  pub station_count: u32,
-  pub market_type_count: u32,
-  pub seed_row_count: u64,
-  pub default_quantity_per_station_type: u32,
-  pub seed_buy_orders_enabled: bool,
-  pub history_days_seeded: u32,
-  pub seed_markup_percent: f64,
-  pub station_jitter_percent: f64,
-  pub region_jitter_percent: f64,
+    pub schema_version: u32,
+    pub generated_at: String,
+    pub static_data_dir: String,
+    pub database_path: String,
+    #[serde(default)]
+    pub selection_mode: String,
+    #[serde(default)]
+    pub selection_label: String,
+    #[serde(default)]
+    pub selected_solar_system_ids: Vec<u32>,
+    #[serde(default)]
+    pub selected_solar_system_names: Vec<String>,
+    pub region_count: u32,
+    pub solar_system_count: u32,
+    pub station_count: u32,
+    pub market_type_count: u32,
+    pub seed_row_count: u64,
+    pub default_quantity_per_station_type: u32,
+    pub seed_buy_orders_enabled: bool,
+    pub history_days_seeded: u32,
+    pub seed_markup_percent: f64,
+    pub station_jitter_percent: f64,
+    pub region_jitter_percent: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SummaryRow {
-  pub type_id: u32,
-  pub best_ask_price: Option<f64>,
-  pub total_ask_quantity: u64,
-  pub best_ask_station_id: Option<u64>,
-  pub best_bid_price: Option<f64>,
-  pub total_bid_quantity: u64,
-  pub best_bid_station_id: Option<u64>,
+    pub type_id: u32,
+    pub best_ask_price: Option<f64>,
+    pub total_ask_quantity: u64,
+    pub best_ask_station_id: Option<u64>,
+    pub best_bid_price: Option<f64>,
+    pub total_bid_quantity: u64,
+    pub best_bid_station_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderRow {
-  #[serde(with = "string_i64")]
-  pub order_id: i64,
-  pub price: f64,
-  pub vol_remaining: u64,
-  pub type_id: u32,
-  pub range_value: i32,
-  pub vol_entered: u64,
-  pub min_volume: u64,
-  pub bid: bool,
-  pub issued_at: String,
-  pub duration_days: u32,
-  pub station_id: u64,
-  pub region_id: u32,
-  pub solar_system_id: u32,
-  pub constellation_id: u32,
-  pub source: String,
+    #[serde(with = "string_i64")]
+    pub order_id: i64,
+    pub price: f64,
+    pub vol_remaining: u64,
+    pub type_id: u32,
+    pub range_value: i32,
+    pub vol_entered: u64,
+    pub min_volume: u64,
+    pub bid: bool,
+    pub issued_at: String,
+    pub duration_days: u32,
+    pub station_id: u64,
+    pub region_id: u32,
+    pub solar_system_id: u32,
+    pub constellation_id: u32,
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderBookResponse {
-  pub region_id: u32,
-  pub type_id: u32,
-  pub sells: Vec<OrderRow>,
-  pub buys: Vec<OrderRow>,
-  pub cached_at: String,
+    pub region_id: u32,
+    pub type_id: u32,
+    pub sells: Vec<OrderRow>,
+    pub buys: Vec<OrderRow>,
+    pub cached_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryRow {
-  pub day: String,
-  pub low_price: f64,
-  pub high_price: f64,
-  pub avg_price: f64,
-  pub volume: u64,
-  pub order_count: u32,
+    pub day: String,
+    pub low_price: f64,
+    pub high_price: f64,
+    pub avg_price: f64,
+    pub volume: u64,
+    pub order_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryResponse {
-  pub type_id: u32,
-  pub rows: Vec<HistoryRow>,
+    pub type_id: u32,
+    pub rows: Vec<HistoryRow>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OwnerOrderRow {
-  #[serde(with = "string_i64")]
-  pub order_id: i64,
-  pub owner_id: u64,
-  pub is_corp: bool,
-  pub state: String,
-  pub source: String,
-  pub last_state_change_at: Option<String>,
-  pub row: OrderRow,
+    #[serde(with = "string_i64")]
+    pub order_id: i64,
+    pub owner_id: u64,
+    pub is_corp: bool,
+    pub state: String,
+    pub source: String,
+    pub last_state_change_at: Option<String>,
+    pub row: OrderRow,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketOrderEvent {
-  #[serde(with = "string_i64")]
-  pub event_id: i64,
-  pub event_type: String,
-  pub occurred_at: String,
-  pub order: OwnerOrderRow,
+    #[serde(with = "string_i64")]
+    pub event_id: i64,
+    pub event_type: String,
+    pub occurred_at: String,
+    pub order: OwnerOrderRow,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiagnosticsResponse {
-  pub started_at: String,
-  pub database_path: String,
-  pub host: String,
-  pub port: u16,
-  pub rpc_enabled: bool,
-  pub rpc_host: String,
-  pub rpc_port: u16,
-  pub region_summary_cache_regions: usize,
-  pub region_summary_rows: usize,
-  pub system_summary_cache_entries: usize,
-  pub station_summary_cache_entries: usize,
-  pub order_book_cache_entries: usize,
-  pub manifest: MarketManifest,
+    pub started_at: String,
+    pub database_path: String,
+    pub host: String,
+    pub port: u16,
+    pub rpc_enabled: bool,
+    pub rpc_host: String,
+    pub rpc_port: u16,
+    pub region_summary_cache_regions: usize,
+    pub region_summary_rows: usize,
+    pub system_summary_cache_entries: usize,
+    pub station_summary_cache_entries: usize,
+    pub order_book_cache_entries: usize,
+    pub manifest: MarketManifest,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlaceOrderRequest {
-  pub owner_id: u64,
-  pub is_corp: bool,
-  pub wallet_division: Option<u32>,
-  pub station_id: u64,
-  pub type_id: u32,
-  pub price: f64,
-  pub quantity: u64,
-  pub min_volume: Option<u64>,
-  pub duration_days: Option<u32>,
-  pub range_value: Option<i32>,
-  pub bid: bool,
-  pub source: Option<String>,
+    pub owner_id: u64,
+    pub is_corp: bool,
+    pub wallet_division: Option<u32>,
+    pub station_id: u64,
+    pub type_id: u32,
+    pub price: f64,
+    pub quantity: u64,
+    pub min_volume: Option<u64>,
+    pub duration_days: Option<u32>,
+    pub range_value: Option<i32>,
+    pub bid: bool,
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlaceOrderResponse {
-  #[serde(with = "string_i64")]
-  pub order_id: i64,
-  pub region_id: u32,
-  pub solar_system_id: u32,
-  pub station_id: u64,
-  pub type_id: u32,
-  pub cached_regions_invalidated: usize,
+    #[serde(with = "string_i64")]
+    pub order_id: i64,
+    pub region_id: u32,
+    pub solar_system_id: u32,
+    pub station_id: u64,
+    pub type_id: u32,
+    pub cached_regions_invalidated: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModifyOrderRequest {
-  #[serde(with = "string_i64")]
-  pub order_id: i64,
-  pub new_price: f64,
+    #[serde(with = "string_i64")]
+    pub order_id: i64,
+    pub new_price: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModifyOrderResponse {
-  #[serde(with = "string_i64")]
-  pub order_id: i64,
-  pub region_id: u32,
-  pub solar_system_id: u32,
-  pub station_id: u64,
-  pub type_id: u32,
-  pub bid: bool,
-  pub price: f64,
-  pub vol_remaining: u64,
-  pub state: String,
-  pub invalidated: bool,
+    #[serde(with = "string_i64")]
+    pub order_id: i64,
+    pub region_id: u32,
+    pub solar_system_id: u32,
+    pub station_id: u64,
+    pub type_id: u32,
+    pub bid: bool,
+    pub price: f64,
+    pub vol_remaining: u64,
+    pub state: String,
+    pub invalidated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CancelOrderResponse {
-  #[serde(with = "string_i64")]
-  pub order_id: i64,
-  pub state: String,
-  pub invalidated: bool,
+    #[serde(with = "string_i64")]
+    pub order_id: i64,
+    pub state: String,
+    pub invalidated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CancelStationOrdersResponse {
-  pub station_id: u64,
-  pub cancelled_count: usize,
-  pub orders: Vec<OwnerOrderRow>,
+    pub station_id: u64,
+    pub cancelled_count: usize,
+    pub orders: Vec<OwnerOrderRow>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FillOrderRequest {
-  #[serde(with = "string_i64")]
-  pub order_id: i64,
-  pub fill_quantity: u64,
+    #[serde(with = "string_i64")]
+    pub order_id: i64,
+    pub fill_quantity: u64,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FillOrderResponse {
-  #[serde(with = "string_i64")]
-  pub order_id: i64,
-  pub owner_id: u64,
-  pub is_corp: bool,
-  pub region_id: u32,
-  pub solar_system_id: u32,
-  pub station_id: u64,
-  pub type_id: u32,
-  pub bid: bool,
-  pub price: f64,
-  pub filled_quantity: u64,
-  pub vol_remaining: u64,
-  pub state: String,
-  pub invalidated: bool,
+    #[serde(with = "string_i64")]
+    pub order_id: i64,
+    pub owner_id: u64,
+    pub is_corp: bool,
+    pub region_id: u32,
+    pub solar_system_id: u32,
+    pub station_id: u64,
+    pub type_id: u32,
+    pub bid: bool,
+    pub price: f64,
+    pub filled_quantity: u64,
+    pub vol_remaining: u64,
+    pub state: String,
+    pub invalidated: bool,
+    #[serde(default)]
+    pub duplicate: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -581,86 +585,111 @@ pub struct SeedStockRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheRebuildResponse {
-  pub region_id: Option<u32>,
-  pub rebuilt_rows: usize,
-  pub rebuilt_at: String,
+    pub region_id: Option<u32>,
+    pub rebuilt_rows: usize,
+    pub rebuilt_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordTradeRequest {
-  pub type_id: u32,
-  pub price: f64,
-  pub quantity: u64,
+    pub type_id: u32,
+    pub price: f64,
+    pub quantity: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordTradeResponse {
-  pub type_id: u32,
-  pub day: String,
-  pub price: f64,
-  pub quantity: u64,
+    pub type_id: u32,
+    pub day: String,
+    pub price: f64,
+    pub quantity: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SweepExpiredOrdersResponse {
-  pub expired_count: usize,
-  pub swept_at: String,
+    pub expired_count: usize,
+    pub swept_at: String,
 }
 
 pub fn now_rfc3339() -> String {
-  OffsetDateTime::now_utc()
-    .format(&Rfc3339)
-    .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
 pub fn round_isk(value: f64) -> f64 {
-  (value * 100.0).round() / 100.0
+    (value * 100.0).round() / 100.0
 }
 
 pub fn fallback_base_price(type_id: u32) -> f64 {
-  let base = 10_000.0 + f64::from(type_id % 250) * 250.0;
-  round_isk(base.max(DEFAULT_PRICE_FLOOR))
+    let base = 10_000.0 + f64::from(type_id % 250) * 250.0;
+    round_isk(base.max(DEFAULT_PRICE_FLOOR))
 }
 
 pub fn seed_sell_order_id(station_id: u64, type_id: u32) -> i64 {
-  let encoded = (((station_id as i128) << 32) | i128::from(type_id)) as i64;
-  SEED_SELL_ORDER_ID_BASE + encoded
+    let encoded = (((station_id as i128) << 32) | i128::from(type_id)) as i64;
+    SEED_SELL_ORDER_ID_BASE + encoded
 }
 
 pub fn seed_buy_order_id(station_id: u64, type_id: u32) -> i64 {
-  let encoded = (((station_id as i128) << 32) | i128::from(type_id)) as i64;
-  SEED_BUY_ORDER_ID_BASE + encoded
+    let encoded = (((station_id as i128) << 32) | i128::from(type_id)) as i64;
+    SEED_BUY_ORDER_ID_BASE + encoded
+}
+
+pub fn try_decode_seed_sell_order_id(order_id: i64) -> Option<(u64, u32)> {
+    if !(SEED_SELL_ORDER_ID_BASE..SEED_BUY_ORDER_ID_BASE).contains(&order_id) {
+        return None;
+    }
+
+    let encoded = u64::try_from(order_id - SEED_SELL_ORDER_ID_BASE).ok()?;
+    Some((encoded >> 32, encoded as u32))
 }
 
 pub fn try_decode_seed_buy_order_id(order_id: i64) -> Option<(u64, u32)> {
-  if order_id < SEED_BUY_ORDER_ID_BASE {
-    return None;
-  }
+    if order_id < SEED_BUY_ORDER_ID_BASE {
+        return None;
+    }
 
-  let encoded = u64::try_from(order_id - SEED_BUY_ORDER_ID_BASE).ok()?;
-  Some((encoded >> 32, encoded as u32))
+    let encoded = u64::try_from(order_id - SEED_BUY_ORDER_ID_BASE).ok()?;
+    Some((encoded >> 32, encoded as u32))
 }
 
 #[cfg(test)]
 mod tests {
-  use super::{seed_buy_order_id, seed_sell_order_id, try_decode_seed_buy_order_id};
+    use super::{
+        seed_buy_order_id, seed_sell_order_id, try_decode_seed_buy_order_id,
+        try_decode_seed_sell_order_id,
+    };
 
-  #[test]
-  fn seed_order_ids_are_positive_and_distinct() {
-    let sell_id = seed_sell_order_id(60_015_169, 263);
-    let buy_id = seed_buy_order_id(60_015_169, 263);
+    #[test]
+    fn seed_order_ids_are_positive_and_distinct() {
+        let sell_id = seed_sell_order_id(60_015_169, 263);
+        let buy_id = seed_buy_order_id(60_015_169, 263);
 
-    assert!(sell_id > 0);
-    assert!(buy_id > 0);
-    assert_ne!(sell_id, buy_id);
-  }
+        assert!(sell_id > 0);
+        assert!(buy_id > 0);
+        assert_ne!(sell_id, buy_id);
+    }
 
-  #[test]
-  fn seed_buy_order_ids_decode_to_station_and_type() {
-    let order_id = seed_buy_order_id(60_015_169, 263);
-    let decoded = try_decode_seed_buy_order_id(order_id);
+    #[test]
+    fn seed_buy_order_ids_decode_to_station_and_type() {
+        let order_id = seed_buy_order_id(60_015_169, 263);
+        let decoded = try_decode_seed_buy_order_id(order_id);
 
-    assert_eq!(decoded, Some((60_015_169, 263)));
-    assert_eq!(try_decode_seed_buy_order_id(12345), None);
-  }
+        assert_eq!(decoded, Some((60_015_169, 263)));
+        assert_eq!(try_decode_seed_buy_order_id(12345), None);
+    }
+
+    #[test]
+    fn seed_sell_order_ids_decode_to_station_and_type() {
+        let order_id = seed_sell_order_id(60_015_169, 263);
+        let decoded = try_decode_seed_sell_order_id(order_id);
+
+        assert_eq!(decoded, Some((60_015_169, 263)));
+        assert_eq!(
+            try_decode_seed_sell_order_id(seed_buy_order_id(60_015_169, 263)),
+            None,
+        );
+        assert_eq!(try_decode_seed_sell_order_id(12345), None);
+    }
 }

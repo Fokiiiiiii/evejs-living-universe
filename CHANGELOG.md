@@ -1,5 +1,16 @@
 # Changelog
 
+## [v0.4.0] - 2026-09-28
+
+Compatible with EVEJS v0.12.9 at baseline commit
+`828823a75f211fdecb945b087a26c225f111491f`.
+
+- Rebase the Living Universe overlays onto the modular v0.12.9 server and
+  market sources while preserving v0.12.9 startup, scene, and persistence
+  contracts.
+- Pin the exact supported baseline archive and per-file hashes in the release
+  manifest.
+
 ## [v0.3.0] - 2026-07-31
 
 Compatible with EVEJS v0.12.3.1.

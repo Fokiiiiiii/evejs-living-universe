@@ -9,10 +9,14 @@ const {
   buildRowset,
 } = require(path.join(__dirname, "../../services/_shared/serviceHelpers"));
 const {
+  toClientSafeText,
+} = require(path.join(__dirname, "../../services/_shared/clientNameUtils"));
+const {
   buildDamageState,
   hasDamageableHealth,
 } = require(path.join(__dirname, "../combat/damage"));
 const {
+  STRUCTURE_GROUP_ID,
   STRUCTURE_STATE,
 } = require(path.join(__dirname, "../../services/structure/structureConstants"));
 const actions = require(path.join(__dirname, "./stream/actions"));
@@ -30,6 +34,7 @@ const {
 const {
   BALL_FLAG,
   BALL_MODE,
+  RUNTIME_CORPSE_KIND,
   RUNTIME_UNANCHORED_STRUCTURE_HULL_KIND,
 } = require(path.join(__dirname, "./constants"));
 
@@ -191,11 +196,50 @@ function buildStructureSlimDamage(entity) {
         : toFiniteNumber(conditionState.shieldCharge, 1),
     ),
   );
+  // V24.01 SlimItem.damage is remaining health in shield, armor, hull order.
   return buildList([
-    structureDamage,
-    armorDamage,
-    1 - shieldCharge,
+    shieldCharge,
+    1 - armorDamage,
+    1 - structureDamage,
   ]);
+}
+
+// Retail sends an Upwell structure's damage as None while it is at full
+// health, which keeps the client's integrity ring hidden until it is damaged.
+function buildUpwellStructureSlimDamage(entity) {
+  const damage = buildStructureSlimDamage(entity);
+  const [shield, armor, hull] = damage.items;
+  return shield >= 1 && armor >= 1 && hull >= 1 ? null : damage;
+}
+
+function buildEntosisScoreSlimValue(entity) {
+  const capture =
+    entity && entity.entosisCapture && typeof entity.entosisCapture === "object"
+      ? entity.entosisCapture
+      : null;
+  if (!capture) {
+    return null;
+  }
+  const controllingTeamID =
+    capture.controllingTeamID ?? capture.controllingTeamId ?? null;
+  const scoringTeamID =
+    capture.scoringTeamID ?? capture.scoringTeamId ?? null;
+  const defenderTeamID =
+    capture.defenderTeamID ?? capture.defenderTeamId ?? null;
+  return [
+    controllingTeamID === null ? null : toInt32(controllingTeamID, 0),
+    scoringTeamID === null ? null : toInt32(scoringTeamID, 0),
+    [
+      toFiniteNumber(
+        capture.scoreAtLastUpdateTime ?? capture.score,
+        0,
+      ),
+      buildFiletimeLong(capture.lastUpdatedScoreTime ?? 0),
+      toFiniteNumber(capture.scoringRate, 0),
+      capture.isBlocked === true,
+    ],
+    defenderTeamID === null ? null : toInt32(defenderTeamID, 0),
+  ];
 }
 
 function appendEntityStandings(entries, entity, slimTypeID) {
@@ -268,6 +312,15 @@ function buildSlimNameIDValue(value) {
   if (!value) {
     return null;
   }
+  // A dungeon-authored object carries its mission name as a bare localization message ID -
+  // TQ's slim for the Amarr-Caldari Mediation Center is nameID=186555 with name="". The
+  // (label, args) tuple below is the other wire form, used for names the client formats
+  // itself (UI/Inflight/WreckNameTypeID). Without the bare-ID case the field was dropped and
+  // the client fell back to the type name.
+  if (typeof value === "number" || (typeof value === "string" && /^\s*\d+\s*$/.test(value))) {
+    const messageID = toInt32(value, 0);
+    return messageID > 0 ? messageID : null;
+  }
   if (Array.isArray(value) && value.length >= 2) {
     const label = String(value[0] || "").trim();
     if (!label) {
@@ -335,7 +388,7 @@ function buildSlimItemDict(entity) {
   const slimNameID = buildSlimNameIDValue(entity && entity.nameID);
 
   if (slimName && !slimNameID) {
-    entries.push(["name", slimName]);
+    entries.push(["name", toClientSafeText(slimName)]);
   }
   if (slimNameID) {
     entries.push(["nameID", slimNameID]);
@@ -383,13 +436,44 @@ function buildSlimItemDict(entity) {
   if (
     Array.isArray(entity && entity.dunRotation) &&
     entity.dunRotation.length === 3 &&
-    !["station", "structure", "orbital", "stargate"].includes(String(entity && entity.kind || ""))
+    !["station", "structure", "orbital", "stargate", "container", "wreck"]
+      .includes(String(entity && entity.kind || ""))
   ) {
     entries.push(["dunRotation", entity.dunRotation]);
+  }
+  if (
+    entity &&
+    entity.kind === "siteAccelerationGate" &&
+    entity.dungeonMaterializedGate === true &&
+    Array.isArray(entity.dunDirection) &&
+    entity.dunDirection.length === 3 &&
+    entity.dunDirection.every((value) => Number.isFinite(Number(value)))
+  ) {
+    entries.push(["dunDirection", entity.dunDirection.map((value) => Number(value))]);
   }
   const gateActivationRange = toFiniteNumber(entity && entity.gateActivationRange, 0);
   if (gateActivationRange > 0) {
     entries.push(["gateActivationRange", gateActivationRange]);
+  }
+  const perimeterRadius = toFiniteNumber(entity && entity.perimeterRadius, 0);
+  if (perimeterRadius > 0) {
+    entries.push(["perimeterRadius", perimeterRadius]);
+  }
+  const perimeterLook = toInt32(entity && entity.perimeterLook, 0);
+  if (perimeterLook > 0) {
+    entries.push(["perimeterLook", perimeterLook]);
+  }
+  if (hasEntityField("gameModeID")) {
+    entries.push(["gameModeID", toInt32(entity.gameModeID, 0)]);
+  }
+  if (hasEntityField("abyssFilamentTypeID")) {
+    entries.push(["abyssFilamentTypeID", toInt32(entity.abyssFilamentTypeID, 0)]);
+  }
+  if (hasEntityField("isAbyssGateOpen")) {
+    entries.push(["isAbyssGateOpen", entity.isAbyssGateOpen === true]);
+  }
+  if (hasEntityField("animationState")) {
+    entries.push(["animationState", toInt32(entity.animationState, 0)]);
   }
   if (entity && Object.prototype.hasOwnProperty.call(entity, "dunMusicUrl")) {
     entries.push(["dunMusicUrl", entity.dunMusicUrl || null]);
@@ -415,13 +499,12 @@ function buildSlimItemDict(entity) {
   }
 
   if (entity.kind === "ship") {
-    entries.push(["corpID", entity.corporationID || 0]);
-    entries.push(["allianceID", entity.allianceID || 0]);
-    entries.push(["warFactionID", entity.warFactionID || 0]);
-    entries.push([
-      "charID",
-      entity.npcPilotCharacterID || entity.characterID || 0,
-    ]);
+    if (entity.suppressSlimShipAffiliationFields !== true) {
+      entries.push(["corpID", entity.corporationID || 0]);
+      entries.push(["allianceID", entity.allianceID || 0]);
+      entries.push(["warFactionID", entity.warFactionID || 0]);
+      entries.push(["charID", entity.characterID || 0]);
+    }
     const dirtState = resolveShipSlimDirtTime(entity);
     if (dirtState.explicit || dirtState.dirtTime > 0n) {
       entries.push(["dirtTime", buildFiletimeLong(dirtState.dirtTime)]);
@@ -481,6 +564,25 @@ function buildSlimItemDict(entity) {
     entries.push(["corpID", entity.corporationID || 0]);
     entries.push(["allianceID", entity.allianceID || null]);
     entries.push(["warFactionID", entity.warFactionID || null]);
+    const entosisScore = buildEntosisScoreSlimValue(entity);
+    if (entosisScore) {
+      // Raw JavaScript arrays marshal as Python tuples. entosisController.py
+      // unpacks this exact four-part tuple and its nested scoring-attributes
+      // tuple; buildList() would produce a protocol-level list instead.
+      entries.push(["entosis_score", entosisScore]);
+    }
+    const campaignSourceInfo =
+      entity && Array.isArray(entity.campaignSourceInfo)
+        ? entity.campaignSourceInfo
+        : entity && Array.isArray(entity.campaign_sourceInfo)
+          ? entity.campaign_sourceInfo
+          : null;
+    if (campaignSourceInfo && campaignSourceInfo.length >= 4) {
+      // Command-node clients unpack this exact four-part tuple. As with
+      // entosis_score, a raw array is intentional: the marshal layer turns it
+      // into a Python tuple rather than a list.
+      entries.push(["campaign_sourceInfo", campaignSourceInfo.slice(0, 4)]);
+    }
     entries.push(["state", entity.state ?? null]);
     entries.push(["upkeepState", entity.upkeepState ?? null]);
     entries.push([
@@ -516,7 +618,21 @@ function buildSlimItemDict(entity) {
       buildList(Array.isArray(entity.modules) ? entity.modules : []),
     ]);
     entries.push(["docked", toInt32(entity.docked, 0)]);
-    entries.push(["damage", buildStructureSlimDamage(entity)]);
+    entries.push(["damage", buildUpwellStructureSlimDamage(entity)]);
+    // Moon drills aim at their moon. A refinery's drill turret reads
+    // closestMoonID (structureDrillingPlatform.py); the Metenox beam reads
+    // moonID and fires when component_autoMoonMiner_lastHarvest changes
+    // (spacecomponents/client/components/autoMoonMiner.py).
+    const structureGroupID = toInt32(entity.groupID, 0);
+    if (structureGroupID === STRUCTURE_GROUP_ID.REFINERY) {
+      entries.push(["closestMoonID", entity.moonID || null]);
+    } else if (structureGroupID === STRUCTURE_GROUP_ID.METENOX) {
+      entries.push(["moonID", entity.moonID || null]);
+      entries.push([
+        "component_autoMoonMiner_lastHarvest",
+        buildWallclockFiletimeFromMs(entity.autoMoonMinerLastHarvestAt),
+      ]);
+    }
     if (Array.isArray(entity.dunRotation) && entity.dunRotation.length === 3) {
       entries.push(["dunRotation", entity.dunRotation]);
     }
@@ -540,6 +656,32 @@ function buildSlimItemDict(entity) {
     if (Array.isArray(entity.dunRotation) && entity.dunRotation.length === 3) {
       entries.push(["dunRotation", entity.dunRotation]);
     }
+  } else if (entity.kind === "starbase") {
+    entries.push(["corpID", entity.corporationID || entity.ownerID || 0]);
+    entries.push(["allianceID", entity.allianceID || 0]);
+    // invControllers.py:989-1007 asks Michelle whether the ship is inside the
+    // module's control-tower shield when it is beyond operational range;
+    // michelle.py:1041-1057 resolves that tower through this slim-item field.
+    const controlTowerID = toInt32(
+      entity.controlTowerID ??
+        (entity.spaceState && entity.spaceState.controlTowerID),
+      0,
+    );
+    if (controlTowerID > 0) {
+      entries.push(["controlTowerID", controlTowerID]);
+    }
+    // playerOwned.py:407 and the current control menu compare this to charid.
+    // It is a live session grant, never a persisted change of item ownership.
+    entries.push(["controllerID", Number(entity.controllerID) > 0 ? Number(entity.controllerID) : null]);
+    entries.push(["warFactionID", entity.warFactionID || 0]);
+    entries.push(["online", entity.online ? 1 : 0]);
+    entries.push(["incapacitated", entity.incapacitated ? 1 : 0]);
+    entries.push(["posState", toInt32(entity.posState, 0)]);
+    entries.push([
+      "posTimestamp",
+      buildWallclockFiletimeFromMs(entity.posTimestampMs),
+    ]);
+    entries.push(["posDelayTime", toInt32(entity.posDelayTimeMs, 0)]);
   } else if (entity.kind === "stargate") {
     entries.push(["nameID", null]);
     entries.push(["activationState", entity.activationState ?? 2]);
@@ -585,6 +727,8 @@ function buildSlimItemDict(entity) {
       entries.push(["dunRotation", entity.dunRotation]);
     }
     entries.push(["jumps", buildStargateJumps(entity)]);
+  } else if (entity.evejsAbyssalTrace === true && hasEntityField("activationState")) {
+    entries.push(["activationState", toInt32(entity.activationState, 0)]);
   } else if (entity.kind === "wormhole") {
     entries.push(["nebulaType", entity.nebulaType ?? null]);
     entries.push(["wormholeSize", toFiniteNumber(entity.wormholeSize, 1)]);
@@ -604,6 +748,12 @@ function buildSlimItemDict(entity) {
       toFiniteNumber(entity.securityStatus, 0.0),
     ]);
     entries.push(["isEmpty", entity.isEmpty ? 1 : 0]);
+    if (
+      entity.kind === "container" &&
+      entity.cargoContainerAnchorable === true
+    ) {
+      entries.push(["isAnchored", entity.isAnchored ? 1 : 0]);
+    }
     // Loot rights drive the client's looting/abandon UI: the tuple is
     // (ownerID, corpID, fleetID, abandoned). Michelle.HaveLootRight /
     // IsAbandoned read this to decide whether a pilot may loot freely and
@@ -636,6 +786,15 @@ function buildSlimItemDict(entity) {
           : [],
       ),
     ]);
+  } else if (entity.kind === "drone") {
+    // The overview resolves friendly/hostile state from the slim affiliation
+    // fields, not the separate drone-control row. Keep the owning pilot's
+    // identity visible to the owner and to other pilots on the grid.
+    // No charID: the client reads the pilot from ownerID for drones, and a
+    // charID here makes a selected drone show the owner's bounty and kill rights.
+    entries.push(["corpID", entity.corporationID || 0]);
+    entries.push(["allianceID", entity.allianceID || 0]);
+    entries.push(["warFactionID", entity.warFactionID || 0]);
   } else if (entity.kind === "fighter") {
     entries.push([
       "fighter.squadronSize",
@@ -847,6 +1006,7 @@ function buildSetStatePayload(
 module.exports = {
   BALL_FLAG,
   BALL_MODE,
+  RUNTIME_CORPSE_KIND,
   RUNTIME_UNANCHORED_STRUCTURE_HULL_KIND,
   ...actions,
   buildAddBalls2Payload,

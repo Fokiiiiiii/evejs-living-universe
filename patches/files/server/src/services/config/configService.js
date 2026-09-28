@@ -1,3 +1,5 @@
+"use strict";
+
 /**
  * Config Service
  *
@@ -16,7 +18,10 @@ const BaseService = require(path.join(__dirname, "../baseService"));
 
 const log = require(path.join(__dirname, "../../utils/logger"));
 const database = require("../../gameStore")
-const { toClientSafeDisplayName } = require(path.join(
+const {
+  toClientSafeDisplayName,
+  toClientSafeText,
+} = require(path.join(
   __dirname,
   "../_shared/clientNameUtils",
 ));
@@ -28,7 +33,11 @@ const { normalizeCharacterGender } = require(path.join(
   __dirname,
   "../character/characterIdentity",
 ));
-const { findShipItemById } = require(path.join(
+const {
+  findItemById,
+  findShipItemById,
+  isCargoContainerInventoryItem,
+} = require(path.join(
   __dirname,
   "../inventory/itemStore",
 ));
@@ -61,6 +70,9 @@ const structureState = require(path.join(
 const {
   getAgentByID,
 } = require(path.join(__dirname, "../agent/agentAuthority"));
+const {
+  resolveSessionCharacterID,
+} = require(path.join(__dirname, "../_shared/sessionIdentity"));
 const {
   getPilotRecord: getLivingUniversePilotRecord,
 } = require(path.join(
@@ -138,6 +150,96 @@ function buildLocationRow(
     Number(position && position.z) || 0.0,
     null,
   ];
+}
+
+function canSessionSeeSpaceEntity(scene, entity, session) {
+  if (!scene || !entity || !session || !session._space) {
+    return false;
+  }
+
+  try {
+    if (
+      scene.dynamicEntities instanceof Map &&
+      scene.dynamicEntities.get(entity.itemID) === entity
+    ) {
+      return (
+        typeof scene.canSessionSeeDynamicEntity === "function" &&
+        scene.canSessionSeeDynamicEntity(session, entity) === true
+      );
+    }
+    if (
+      scene.staticEntitiesByID instanceof Map &&
+      scene.staticEntitiesByID.get(entity.itemID) === entity
+    ) {
+      return (
+        typeof scene.canSessionSeeStaticEntityForSession === "function" &&
+        scene.canSessionSeeStaticEntityForSession(session, entity) === true
+      );
+    }
+    if (typeof scene.getVisibleEntitiesForSession === "function") {
+      const visibleEntities = scene.getVisibleEntitiesForSession(session);
+      return Array.isArray(visibleEntities) && visibleEntities.includes(entity);
+    }
+  } catch {
+    // ignored: a visibility check that throws means not visible (false, fail closed)
+    return false;
+  }
+
+  return false;
+}
+
+/**
+ * Resolve a runtime object's client-visible name and position without making
+ * the scene a general location oracle. The client only needs this row for an
+ * object in the pilot's current ballpark, so hidden and off-grid entities must
+ * continue to receive the ordinary numeric placeholder.
+ */
+function buildVisibleSpaceEntityLocationRow(
+  itemID,
+  session,
+  fallbackSolarSystemID,
+) {
+  let spaceRuntime = null;
+  try {
+    spaceRuntime = require(path.join(__dirname, "../../space/runtime"));
+  } catch {
+    // ignored: the space runtime is not loaded in this process; the ordinary placeholder is used (null)
+    return null;
+  }
+
+  let scene = null;
+  try {
+    scene =
+      spaceRuntime && typeof spaceRuntime.getSceneForSession === "function"
+        ? spaceRuntime.getSceneForSession(session)
+        : null;
+  } catch {
+    // ignored: a session whose scene cannot be read gets the ordinary placeholder (null)
+    return null;
+  }
+
+  const entity =
+    scene && typeof scene.getEntityByID === "function"
+      ? scene.getEntityByID(itemID)
+      : null;
+  if (!canSessionSeeSpaceEntity(scene, entity, session)) {
+    return null;
+  }
+
+  const entityName = [entity.slimName, entity.itemName, entity.name].find(
+    (candidate) => typeof candidate === "string" && candidate.trim(),
+  );
+  if (!entityName) {
+    return null;
+  }
+
+  return buildLocationRow(
+    itemID,
+    entityName,
+    normalizeSolarSystemID(scene.systemID, fallbackSolarSystemID),
+    entity.position,
+    `Location ${itemID}`,
+  );
 }
 
 function getStaticLocationRowsById() {
@@ -289,6 +391,7 @@ class ConfigService extends BaseService {
     const characterResult = database.read("characters", "/")
     const characters = characterResult.success ? characterResult.data : {}
 
+    
     const rows = [];
 
     for (const id of requestedIds) {
@@ -300,26 +403,19 @@ class ConfigService extends BaseService {
 
       // Check if this is a character ID we know about
       const charData = normalizedId > 0 ? characters[String(normalizedId)] : null;
-      if (charData) {
-        rows.push([
-          normalizedId, // ownerID
-          charData.characterName || "Unknown", // ownerName
-          charData.typeID || 1373, // typeID
-          normalizeCharacterGender(charData.gender, 1), // gender
-          null, // ownerNameID
-        ]);
-        continue;
-      }
-
-      const syntheticPilot = normalizedId > 0
+      const syntheticPilot = !charData && normalizedId > 0
         ? getLivingUniversePilotRecord(normalizedId)
         : null;
-      if (syntheticPilot) {
+      if (charData || syntheticPilot) {
         rows.push([
           normalizedId,
-          syntheticPilot.characterName || String(normalizedId),
-          Number(syntheticPilot.typeID) || 1373,
-          normalizeCharacterGender(syntheticPilot.gender, 1),
+          charData
+            ? toClientSafeText(charData.characterName || "Unknown")
+            : syntheticPilot.characterName || String(normalizedId),
+          charData
+            ? charData.typeID || 1373
+            : Number(syntheticPilot.typeID) || 1373,
+          normalizeCharacterGender((charData || syntheticPilot).gender, 1),
           null,
         ]);
         continue;
@@ -351,7 +447,10 @@ class ConfigService extends BaseService {
       if (ownerRecord) {
         rows.push([
           ownerRecord.ownerID,
-          ownerRecord.ownerName,
+          // A missing name keeps going out as None rather than empty unicode.
+          ownerRecord.ownerName
+            ? toClientSafeText(ownerRecord.ownerName)
+            : ownerRecord.ownerName,
           ownerRecord.typeID,
           ownerRecord.gender,
           null,
@@ -412,6 +511,7 @@ class ConfigService extends BaseService {
       session,
       normalizeSolarSystemID(station && station.solarSystemID, null),
     );
+    const sessionCharacterID = resolveSessionCharacterID(session);
     const locationRowsById = new Map();
     const staticRowsById = getStaticLocationRowsById();
 
@@ -556,14 +656,110 @@ class ConfigService extends BaseService {
           ),
         );
       } else {
+        const inventoryItem = findItemById(numericId);
+        // shipNameById above is built by sweeping every character's own ships,
+        // so a hull owned by anything else has no name at all: one parked in a
+        // corporation hangar division, or delivered straight into one by a
+        // corporation industry job, fell through this whole chain to the
+        // "Location <itemID>" fallback below. The name is on the row, and who
+        // holds a hull does not change what it is called -- that sweep already
+        // hands every character's ship names to every session, so reading the
+        // row here adds no reach.
+        //
+        // Stowed hulls only. flagID 0 means the hull is an entity in space, and
+        // those still go to buildVisibleSpaceEntityLocationRow below, which
+        // asks the scene whether this session may see it at all -- naming one
+        // straight off the row would answer that question without asking.
+        const namedShipItem = findShipItemById(numericId);
+        const persistedShipName =
+          namedShipItem &&
+          Number(namedShipItem.flagID) !== 0 &&
+          typeof namedShipItem.itemName === "string" &&
+          namedShipItem.itemName.trim()
+            ? namedShipItem.itemName
+            : null;
+        // A container parked in a corporation hangar is owned by the
+        // CORPORATION, not by the member who put it there, so the
+        // character-owned test alone sent every one of them to the
+        // "Location <itemID>" fallback below. The client only asks for this
+        // name once the container is singleton (uix.IsValidNamedItem), which
+        // is why assembling one appears to rename it while the stack it came
+        // from still shows its type name, and why renaming it looks like it
+        // does not stick -- SetLabel does persist the name, but the next
+        // cfg.evelocations prime asks here again and gets the placeholder.
+        //
+        // Widened to the session's own corporation rather than to any owner:
+        // unlike hulls, which shipNameById above already hands to every
+        // session, nothing broadcasts container names, so naming an arbitrary
+        // owner's container would be reach this handler does not have today.
+        //
+        // The corporation case is restricted to STOWED containers. flagID 0
+        // is a container floating in space, and those must keep going to
+        // buildVisibleSpaceEntityLocationRow, which asks the scene whether
+        // this session may see the object at all -- naming one off the row
+        // would answer that question without asking. The character-owned case
+        // deliberately keeps its existing behaviour: a pilot's own jettisoned
+        // can is already named off the row from anywhere, and narrowing that
+        // here would be an unrelated change.
+        const containerOwnerID = inventoryItem
+          ? Number(inventoryItem.ownerID)
+          : 0;
+        const sessionCorporationID = Number(
+          (session && (session.corporationID || session.corpid)) || 0,
+        );
+        const persistedItemName =
+          persistedShipName ||
+          (
+            sessionCharacterID > 0 &&
+            inventoryItem &&
+            isCargoContainerInventoryItem(inventoryItem) &&
+            (
+              containerOwnerID === sessionCharacterID ||
+              (
+                sessionCorporationID > 0 &&
+                containerOwnerID === sessionCorporationID &&
+                Number(inventoryItem.flagID) !== 0
+              )
+            ) &&
+            typeof inventoryItem.itemName === "string" &&
+            inventoryItem.itemName.trim()
+              ? inventoryItem.itemName
+              : null
+          );
+        const itemSpaceState =
+          persistedItemName &&
+          inventoryItem.spaceState &&
+          typeof inventoryItem.spaceState === "object"
+            ? inventoryItem.spaceState
+            : null;
+        const spaceEntityRow =
+          sessionCharacterID > 0 && !persistedItemName
+            ? buildVisibleSpaceEntityLocationRow(
+                numericId,
+                session,
+                sessionSolarSystemID,
+              )
+            : null;
         rows.push(
-          buildLocationRow(
-            numericId,
-            `Location ${numericId}`,
-            sessionSolarSystemID,
-            null,
-            `Location ${numericId}`,
-          ),
+          persistedItemName
+            ? buildLocationRow(
+                numericId,
+                persistedItemName,
+                normalizeSolarSystemID(
+                  itemSpaceState && itemSpaceState.systemID,
+                  sessionSolarSystemID,
+                ),
+                itemSpaceState && itemSpaceState.position,
+                `Item ${numericId}`,
+              )
+            : spaceEntityRow ||
+              buildLocationRow(
+                numericId,
+                `Location ${numericId}`,
+                sessionSolarSystemID,
+                null,
+                `Location ${numericId}`,
+              ),
         );
       }
     }
@@ -587,7 +783,7 @@ class ConfigService extends BaseService {
     const rows = allianceIDs
       .map((allianceID) => getAllianceShortNameRecord(allianceID))
       .filter(Boolean)
-      .map((record) => [record.allianceID, record.shortName]);
+      .map((record) => [record.allianceID, toClientSafeText(record.shortName)]);
 
     if (rows.length === 0) {
       return [];
@@ -622,7 +818,9 @@ class ConfigService extends BaseService {
       const ownerRecord = dynamicOwner || staticOwner;
       rows.push([
         numericId,
-        ownerRecord && ownerRecord.tickerName ? ownerRecord.tickerName : "CORP",
+        toClientSafeText(
+          ownerRecord && ownerRecord.tickerName ? ownerRecord.tickerName : "CORP",
+        ),
         corporationRecord ? corporationRecord.shape1 ?? null : null,
         corporationRecord ? corporationRecord.shape2 ?? null : null,
         corporationRecord ? corporationRecord.shape3 ?? null : null,
@@ -692,3 +890,4 @@ class ConfigService extends BaseService {
 }
 
 module.exports = ConfigService;
+

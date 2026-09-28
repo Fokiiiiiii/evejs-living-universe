@@ -1,3 +1,10 @@
+"use strict";
+
+const {
+  round6,
+  toFiniteNumber,
+} = require("../../common/numbers");
+
 const path = require("path");
 
 const {
@@ -16,6 +23,8 @@ const {
   appendSelfItemModifierEntries,
   appendLocationModifierEntries,
   buildEffectiveItemAttributeMap,
+  indexOverloadEffectRecordsByModuleID,
+  buildProjectedModuleSourceAttributeMap,
   isStructureDogmaHost,
   isChargeCompatibleWithModule,
   resolveDogmaSkillMapForHost,
@@ -25,6 +34,10 @@ const {
 const {
   buildNpcEffectiveModuleItem,
 } = require(path.join(__dirname, "../npc/npcCapabilityResolver"));
+const {
+  TABLE,
+  readStaticRows,
+} = require(path.join(__dirname, "../../services/_shared/referenceData"));
 const {
   getActiveImplantCharacterModifierEntries,
   getActiveImplantLocationModifierSources,
@@ -69,8 +82,12 @@ const HYBRID_CHARGE_GROUP_ID = 85;
 const FREQUENCY_CRYSTAL_GROUP_ID = 86;
 const EXOTIC_PLASMA_GROUP_ID = 1987;
 const ADVANCED_EXOTIC_PLASMA_GROUP_ID = 1989;
-// Vorton projectors declare both condenser pack groups on the module
-// (chargeGroup1 = 4062, chargeGroup2 = 4061).
+// Every vorton projector declares chargeGroup1 = 4062 (Condenser Pack). Only
+// the T2 and Consortium types add chargeGroup2 = 4061 (Advanced Condenser
+// Pack), so an "Ultra" pack is a T2/faction privilege - the T1, Compact and
+// Scoped projectors cannot load one. Both groups map to the vorton family here
+// because either one identifies the weapon; fitment is gated separately by
+// isChargeCompatibleWithModule.
 const CONDENSER_PACK_GROUP_ID = 4061;
 const ADVANCED_CONDENSER_PACK_GROUP_ID = 4062;
 const LIGHT_MISSILE_GROUP_ID = 384;
@@ -105,6 +122,9 @@ const TORPEDO_DEPLOYMENT_GUID = "effects.TorpedoDeployment";
 const ACTIVATABLE_EFFECT_CATEGORIES = new Set([1, 2, 3]);
 const PASSIVE_SLOT_EFFECTS = new Set([
   "online",
+  "onlineforstructures",
+  "anchordropforstructures",
+  "anchorliftforstructures",
   "hipower",
   "medpower",
   "lopower",
@@ -171,19 +191,11 @@ const CHARACTER_DIRECT_MODIFIER_OPTIONS = Object.freeze({
 const DEFAULT_MISSILE_DAMAGE_REDUCTION_SENSITIVITY = 5.5;
 let cachedSkillEffectiveAttributes = null;
 let cachedShipModifierAttributes = null;
+let cachedSkillLevelShipBonusScalers = null;
 
 function toInt(value, fallback = 0) {
   const numeric = Number(value);
   return Number.isFinite(numeric) ? Math.trunc(numeric) : fallback;
-}
-
-function toFiniteNumber(value, fallback = 0) {
-  const numeric = Number(value);
-  return Number.isFinite(numeric) ? numeric : fallback;
-}
-
-function round6(value) {
-  return Number(toFiniteNumber(value, 0).toFixed(6));
 }
 
 function clamp(value, min, max) {
@@ -202,6 +214,95 @@ function ensureShipModifierAttributeCache() {
     cachedShipModifierAttributes = new Map();
   }
   return cachedShipModifierAttributes;
+}
+
+// A hull's `shipBonus*` attribute is a PER-LEVEL coefficient, not a bonus. It
+// only becomes a real number once the racial skill's `ItemModifier` / `shipID`
+// effect multiplies it by that skill's level — effect 460
+// `caldariFrigateSkillLevelPreMulShipBonusCFShip` turns the Griffin Navy
+// Issue's `shipBonusCF` 10 into 10 x level. Walking only the skills PRESENT in
+// the map skips that multiply for a skill the pilot has not trained, which
+// leaves the raw coefficient standing and makes the hull read exactly as if the
+// skill were at level 1.
+//
+// The correct default is 0 on every authority: `skillState`'s own
+// DEFAULT_MISSING_SKILL_LEVEL is 0, and the client coerces a missing level the
+// same way (`characterskills.GetSkillLevelRaw(0 sp) === 0`,
+// `GetEffectiveLevel(...) or 0`, `if skillLevel is None: skillLevel = 0`).
+//
+// This index is the exact population: attributeID -> the rows that scale it by
+// skillLevel (280) through ItemModifier / shipID. In this SDE build that is 364
+// attributes over 91 skills, one scaler skill each, every one operation 0 or 4
+// (multiply). So evaluating an absent scaler at level 0 can only zero a
+// coefficient the hull already declares — it can never create or set an
+// attribute, and it can never overwrite a scaling a PRESENT skill applied.
+function getSkillLevelShipBonusScalerIndex() {
+  if (cachedSkillLevelShipBonusScalers) {
+    return cachedSkillLevelShipBonusScalers;
+  }
+
+  const index = new Map();
+  for (const skillType of readStaticRows(TABLE.SKILL_TYPES)) {
+    const skillTypeID = toInt(skillType && skillType.typeID, 0);
+    if (skillTypeID <= 0) {
+      continue;
+    }
+    for (const effectRecord of getTypeEffectRecords(skillTypeID)) {
+      for (const modifier of effectRecord.modifierInfo || []) {
+        if (
+          !modifier ||
+          modifier.func !== "ItemModifier" ||
+          modifier.domain !== "shipID" ||
+          toInt(modifier.modifyingAttributeID, 0) !== ATTRIBUTE_SKILL_LEVEL
+        ) {
+          continue;
+        }
+        const modifiedAttributeID = toInt(modifier.modifiedAttributeID, 0);
+        if (modifiedAttributeID <= 0) {
+          continue;
+        }
+        if (!index.has(modifiedAttributeID)) {
+          index.set(modifiedAttributeID, []);
+        }
+        index.get(modifiedAttributeID).push({
+          skillTypeID,
+          operation: toInt(modifier.operation, 0),
+        });
+      }
+    }
+  }
+
+  cachedSkillLevelShipBonusScalers = index;
+  return index;
+}
+
+// Run the scalers whose skill is MISSING from the pilot's sheet at level 0.
+//
+// Gated on a non-empty skill map on purpose. An empty map is not "a pilot who
+// trained nothing", it is "there is no pilot" — an NPC or synthetic hull, whose
+// bonus attributes are the only stats it has. Zeroing those would delete the
+// hull's profile outright, which is the failure mode this audit has already
+// paid for once. A structure host is covered by the same gate plus the fact
+// that no structure type declares a skill-scaled bonus attribute at all.
+function applyAbsentSkillLevelShipBonusScalers(shipAttributes, resolvedSkillMap) {
+  if (!(resolvedSkillMap instanceof Map) || resolvedSkillMap.size <= 0) {
+    return;
+  }
+
+  const index = getSkillLevelShipBonusScalerIndex();
+  for (const attributeID of Object.keys(shipAttributes)) {
+    const numericAttributeID = toInt(attributeID, 0);
+    const scalers = numericAttributeID > 0 ? index.get(numericAttributeID) : null;
+    if (!scalers) {
+      continue;
+    }
+    for (const scaler of scalers) {
+      if (resolvedSkillMap.has(scaler.skillTypeID)) {
+        continue;
+      }
+      applyDirectModifier(shipAttributes, numericAttributeID, 0, scaler.operation);
+    }
+  }
 }
 
 function resolveSkillLevel(skillRecord) {
@@ -372,6 +473,26 @@ function isChargeOptionalTurretWeapon(moduleItem, chargeItem = null) {
   );
 }
 
+// A drone or a fighter is its OWN entity. It sits in the character's location,
+// not the ship's, so it must not receive the ship location's modifiers. CCP's
+// own rule, and the SDE bears it out exactly: `shipID` means "the modules
+// fitted to this ship", and everything meant to reach an owned entity is
+// written `charID` + OwnerRequiredSkillModifier.
+//
+// Cross-tabbed over this SDE build, the ONLY `shipID` rows gated on a drone
+// skill are effects 8217/8220 `expeditionFrigateBonus*Drones*_DEPRICATED`,
+// which no type carries. Every live drone or fighter bonus is `charID`: the
+// drone-side skills (Drone Navigation, Mining/Repair/Salvage/Ice Drone
+// Operation, the racial specializations), every hull drone damage / tracking /
+// HP / range bonus, the Omnidirectional Tracking Link and Enhancer, the Drone
+// Damage Amplifier, and the system-wide drone effects (Magnetar, Triglavian
+// Invasion, Plasma Firestorm). What arrives through `shipID` instead is
+// ship-MODULE skills that a drone happens to list as a required skill —
+// Signal Dispersion leaking +25 % into ECM drone jam strength, Mining +
+// Astrogeology into mining-drone yield, Salvaging into salvage drones — plus
+// the module-side halves of the wormhole and storm effects.
+const OWNED_ENTITY_LOCATION_MODIFIER_DOMAINS = Object.freeze(new Set(["charID"]));
+
 function buildLocationModifiedAttributeMap(
   targetItem,
   shipItem,
@@ -400,12 +521,21 @@ function buildLocationModifiedAttributeMap(
     ? activeModuleContexts
     : [];
   const excludeItemID = toInt(options.excludeItemID, 0);
-  const locationModifierDomains = isStructureHost
-    ? new Set(["structureID", "charID"])
-    : new Set(["shipID", "charID"]);
-  const fittedModuleLocationModifierDomains = isStructureHost
-    ? new Set(["structureID", "shipID", "charID"])
-    : locationModifierDomains;
+  // Drones and fighters pass ownedEntityTarget; see the note on
+  // OWNED_ENTITY_LOCATION_MODIFIER_DOMAINS. Nothing structure-side reaches a
+  // fighter through `structureID` either (zero rows in the SDE), so an owned
+  // entity reads `charID` only on both host kinds.
+  const isOwnedEntityTarget = options.ownedEntityTarget === true;
+  const locationModifierDomains = isOwnedEntityTarget
+    ? OWNED_ENTITY_LOCATION_MODIFIER_DOMAINS
+    : isStructureHost
+      ? new Set(["structureID", "charID"])
+      : new Set(["shipID", "charID"]);
+  const fittedModuleLocationModifierDomains = isOwnedEntityTarget
+    ? OWNED_ENTITY_LOCATION_MODIFIER_DOMAINS
+    : isStructureHost
+      ? new Set(["structureID", "shipID", "charID"])
+      : locationModifierDomains;
   const additionalLocationModifierSources = Array.isArray(
     options.additionalLocationModifierSources,
   )
@@ -456,6 +586,12 @@ function buildLocationModifiedAttributeMap(
     );
   }
 
+  // An overloaded module must project the strength it actually has, not the
+  // strength its type declares cold.
+  const overloadEffectRecordsByModuleID = indexOverloadEffectRecordsByModuleID(
+    resolvedActiveModuleContexts,
+  );
+
   for (const activeModuleContext of resolvedActiveModuleContexts) {
     const activeModuleItem = buildNpcEffectiveModuleItem(
       activeModuleContext && activeModuleContext.moduleItem,
@@ -492,9 +628,10 @@ function buildLocationModifiedAttributeMap(
 
     appendLocationModifierEntries(
       modifierEntries,
-      buildEffectiveItemAttributeMap(
+      buildProjectedModuleSourceAttributeMap(
         activeModuleItem,
         activeModuleContext && activeModuleContext.chargeItem,
+        overloadEffectRecordsByModuleID.get(toInt(activeModuleItem.itemID, 0)),
       ),
       [activeEffectRecord],
       "fittedModule",
@@ -733,6 +870,9 @@ function collectShipModifierAttributes(
           }
         }
       }
+      // A skill missing from a pilot's sheet is untrained, which is level 0 —
+      // not level 1. Run the scalers the loop above could not reach.
+      applyAbsentSkillLevelShipBonusScalers(shipAttributes, resolvedSkillMap);
       const frozen = Object.freeze(shipAttributes);
       cache.set(cacheKey, frozen);
       return cloneAttributeMap(frozen);
@@ -785,29 +925,6 @@ function collectShipModifierAttributes(
       isStructureHost ? STRUCTURE_ITEM_MODIFIER_OPTIONS : SHIP_ITEM_MODIFIER_OPTIONS,
     );
   }
-
-  // Category-5 overload effects modify the module that owns them. Index
-  // those contexts so an active module can derive its ship modifiers from
-  // the hot module attributes once the active cycle reaches its boundary.
-  const overloadContextsByModuleID = new Map();
-  for (const candidateContext of resolvedActiveModuleContexts) {
-    if (
-      !candidateContext ||
-      !candidateContext.effectState ||
-      candidateContext.effectState.isOverload !== true
-    ) {
-      continue;
-    }
-    const overloadModuleID = toInt(
-      candidateContext.effectState.moduleID ??
-        (candidateContext.moduleItem && candidateContext.moduleItem.itemID),
-      0,
-    );
-    if (overloadModuleID > 0) {
-      overloadContextsByModuleID.set(overloadModuleID, candidateContext);
-    }
-  }
-
   for (const activeModuleContext of resolvedActiveModuleContexts) {
     const activeModuleItem = buildNpcEffectiveModuleItem(
       activeModuleContext && activeModuleContext.moduleItem,
@@ -819,40 +936,12 @@ function collectShipModifierAttributes(
       continue;
     }
 
-    const sourceAttributes = buildEffectiveItemAttributeMap(
-      activeModuleItem,
-      activeModuleContext && activeModuleContext.chargeItem,
-    );
-    const activeEffectState =
-      activeModuleContext && activeModuleContext.effectState;
-    const overloadContext =
-      activeEffectState &&
-      activeEffectState.isOverload !== true &&
-      activeEffectState.overloadAppliedToAttrs === true
-        ? overloadContextsByModuleID.get(toInt(activeModuleItem.itemID, 0))
-        : null;
-    if (overloadContext) {
-      const overloadEffectRecord =
-        overloadContext.effectRecord ||
-        getEffectTypeRecord(
-          overloadContext.effectID ??
-            (overloadContext.effectState && overloadContext.effectState.effectID),
-        );
-      if (overloadEffectRecord) {
-        const overloadSelfModifierEntries = [];
-        appendSelfItemModifierEntries(
-          overloadSelfModifierEntries,
-          sourceAttributes,
-          [overloadEffectRecord],
-          "fittedModule",
-        );
-        applyModifierGroups(sourceAttributes, overloadSelfModifierEntries);
-      }
-    }
-
     appendDirectModifierEntries(
       modifierEntries,
-      sourceAttributes,
+      buildEffectiveItemAttributeMap(
+        activeModuleItem,
+        activeModuleContext && activeModuleContext.chargeItem,
+      ),
       [activeEffectRecord],
       "fittedModule",
       SHIP_ITEM_MODIFIER_OPTIONS,
@@ -882,6 +971,16 @@ function resolveWeaponFamily(moduleItem, chargeItem = null) {
     return null;
   }
   const moduleGroupID = toInt(effectiveModuleItem && effectiveModuleItem.groupID, 0);
+  // Current POS batteries have entity/structure firing effects, not the
+  // turretFitted/useMissiles effects used by ship modules. Their ammunition
+  // still goes through the ordinary compatibility and weapon snapshot path.
+  if (toInt(effectiveModuleItem.categoryID, 0) === 23) {
+    const batteryFamilies = {
+      426: "projectileTurret", 449: "hybridTurret", 430: "laserTurret",
+      417: "missileLauncher",
+    };
+    if (batteryFamilies[moduleGroupID]) return batteryFamilies[moduleGroupID];
+  }
   const chargeGroupID = toInt(chargeItem && chargeItem.groupID, 0);
   const isMissileLauncher =
     typeHasEffectName(moduleTypeID, "useMissiles") &&
@@ -1086,7 +1185,9 @@ function buildMissileModuleSnapshot({
       chargeItem,
       activationEffect,
     }),
-    durationMs: Math.max(1, round6(toFiniteNumber(moduleAttributes[ATTRIBUTE_SPEED], 1000))),
+    durationMs: Math.max(1, round6(toFiniteNumber(moduleAttributes[
+      toInt(activationEffect && activationEffect.durationAttributeID, ATTRIBUTE_SPEED)
+    ], 1000))),
     capNeed: Math.max(0, round6(toFiniteNumber(moduleAttributes[ATTRIBUTE_CAPACITOR_NEED], 0))),
     damageMultiplier: missileDamageMultiplier,
     baseDamage,
@@ -1155,6 +1256,16 @@ function buildWeaponModuleSnapshot({
     return null;
   }
 
+  // A gunner commands the battery, but their hull, skills and implants are
+  // never its fitted dogma host (Client moondefencebutton activates the source
+  // structure's own effect). Keep this true for direct snapshot callers too.
+  if (toInt(shipItem.categoryID, 0) === 23) {
+    characterID = 0;
+    skillMap = new Map();
+    activeModuleContexts = [];
+    additionalLocationModifierSources = [];
+    hiddenModifierItems = [];
+  }
   const numericCharacterID = toInt(characterID, 0);
   const isStructureHost = isStructureDogmaHost(shipItem);
   const effectiveModuleItem = buildNpcEffectiveModuleItem(moduleItem);
@@ -1340,6 +1451,13 @@ function buildWeaponModuleSnapshot({
     );
   }
 
+  // An overloaded projector — a Tracking Computer feeding this turret, say —
+  // must project the strength it actually has, not the strength its type
+  // declares cold.
+  const overloadEffectRecordsByModuleID = indexOverloadEffectRecordsByModuleID(
+    resolvedActiveModuleContexts,
+  );
+
   for (const activeModuleContext of resolvedActiveModuleContexts) {
     const activeModuleItem = buildNpcEffectiveModuleItem(
       activeModuleContext && activeModuleContext.moduleItem,
@@ -1377,9 +1495,10 @@ function buildWeaponModuleSnapshot({
 
     appendLocationModifierEntries(
       modifierEntries,
-      buildEffectiveItemAttributeMap(
+      buildProjectedModuleSourceAttributeMap(
         activeModuleItem,
         activeModuleContext && activeModuleContext.chargeItem,
+        overloadEffectRecordsByModuleID.get(toInt(activeModuleItem.itemID, 0)),
       ),
       [activeEffectRecord],
       "fittedModule",

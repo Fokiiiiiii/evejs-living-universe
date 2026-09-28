@@ -1,345 +1,177 @@
+"use strict";
+
 /**
  * EVE.js — Main Entry Point
  *
- * Initializes the service manager, registers core game services,
- * and starts the TCP server.
+ * Boots the world with every stage enabled and starts the TCP server.
+ * The startup sequence itself lives in bootstrap.js so other callers — the
+ * gameplay test harness in particular — can boot the same world with the
+ * listeners and durable owners switched off.
  */
 
-const fs = require("fs");
+// This process is the durable owner for every runtime table not delegated to
+// the wallet or scheduler authority. Set the role before any dependency can
+// import gameStore transitively.
+process.env.EVEJS_GAMESTORE_OWNER_ROLE = "world";
+process.env.EVEJS_GAMESTORE_OWNER_INSTANCE =
+  `world-supervisor:${process.pid}:${require("node:crypto").randomUUID()}`;
+
 const path = require("path");
-const log = require(path.join(__dirname, "./src/utils/logger"));
-const {
-  installProcessLifecycleLogging,
-} = require(path.join(__dirname, "./src/utils/processLifecycle"));
-const config = require(path.join(__dirname, "./src/config"));
-const {
-  installSharedOverviewMotd,
-} = require(path.join(__dirname, "./src/services/overview/overviewMotdBootstrap"));
-const presenceReconciler = require(path.join(
-  __dirname,
-  "./src/services/_shared/presenceReconciler",
-));
 
-// Service framework
-const ServiceManager = require(
-  path.join(__dirname, "./src/services/serviceManager"),
-);
+// Logs used to be written to server/logs. Move them to the data root's logs folder before
+// anything below writes a log. After the first start there is nothing left to move, and an
+// EVEJS_DATA_ROOT set on purpose is never filled from the checkout.
 const {
-  createRuntimeContext,
-} = require(path.join(__dirname, "./src/runtimeContext"));
-const {
-  createEvejsWebGatewayRuntime,
-} = require(path.join(
-  __dirname,
-  "./src/_secondary/express/evejsWebGatewayRuntime",
-));
-const {
-  loadSecondaryServices,
-} = require(path.join(__dirname, "./src/secondaryServiceLoader"));
+  adoptLegacyDataDir,
+  describeAdoption,
+} = require(path.join(__dirname, "./src/config/dataRootMigration"));
+const legacyLogsAdoption = adoptLegacyDataDir("logs", path.join(__dirname, "logs"));
 
-// network
-const startTCPServer = require(path.join(__dirname, "./src/network/tcp"));
-
-// database
+const { bootWorld } = require(path.join(__dirname, "./bootstrap"));
 const database = require(path.join(__dirname, "./src/gameStore"));
+const {
+  installOwnerProcessShutdown,
+} = require(path.join(__dirname, "./src/gameStore/ownerProcessShutdown"));
+const rotatingLog = require(path.join(__dirname, "./src/utils/rotatingLog"));
+const log = require(path.join(__dirname, "./src/utils/logger"));
+
+const legacyLogsMessage = describeAdoption("server/logs", legacyLogsAdoption);
+if (legacyLogsMessage) {
+  if (legacyLogsAdoption.status === "moved") {
+    log.info(legacyLogsMessage);
+  } else {
+    log.warn(legacyLogsMessage);
+  }
+}
+
+// This process owns its signals and exit codes. The store only shuts down when
+// asked; Ctrl+C, a lost owner lease and process exit all come through here.
+installOwnerProcessShutdown(database);
+
+// Longest wait for the log files before a failed start exits anyway.
+const FAILED_START_LOG_FLUSH_MS = 2000;
 
 // main startup
 
-installProcessLifecycleLogging({ appName: "eve.js server" });
+let bootedWorld;
 
-log.logAsciiLogo();
-log.spacer();
-log.info("starting eve.js...");
-log.spacer();
+// Defer the final listener stage until optional runtimes recover.
+void bootWorld({ appName: "eve.js server", startTCP: false })
+  .then(async (world) => {
+    bootedWorld = world;
+    const config = require(path.join(__dirname, "./src/config"));
 
-// Display version info
-log.debug(`Project: ${config.projectVersion}`);
-log.debug(`Client Version: ${config.clientVersion}`);
-log.debug(`Client Build: ${config.clientBuild}`);
-log.debug(`MachoNet Version: ${config.machoVersion}`);
-log.line();
-
-// Preload database into memory before services initialize
-database.preloadAll();
-log.line();
-
-// Recreate any canonical fixtures (bootstrap characters, the player
-// corporation 98000000 and its alliance 99000000) that a pruned or
-// regenerated local database may be missing. Idempotent.
-try {
-  const {
-    ensureCoreFixtures,
-  } = require(path.join(__dirname, "./src/services/corporation/coreFixtureSeeder"));
-  const fixtureSummary = ensureCoreFixtures();
-  const seededCount =
-    fixtureSummary.charactersCreated.length +
-    (fixtureSummary.corporationCreated ? 1 : 0) +
-    (fixtureSummary.allianceCreated ? 1 : 0);
-  if (seededCount > 0) {
-    log.info(
-      `[CoreFixtures] Seeded missing fixtures: ${fixtureSummary.charactersCreated.length} character(s)` +
-        `${fixtureSummary.corporationCreated ? ", player corporation" : ""}` +
-        `${fixtureSummary.allianceCreated ? ", player alliance" : ""}.`,
-    );
-  }
-  log.line();
-} catch (err) {
-  log.err(`[CoreFixtures] Failed startup fixture seeding: ${err.message}`);
-  log.line();
-}
-
-// Recreate the canonical recurring global calendar events ("Make a wish") that
-// a pruned/regenerated calendar table may be missing. Idempotent.
-try {
-  const calendarRuntime = require(path.join(
-    __dirname,
-    "./src/services/calendar/calendarRuntimeState",
-  ));
-  const calendarSeed = calendarRuntime.ensureSeededGlobalEvents();
-  if (calendarSeed.created > 0) {
-    log.info(`[CalendarSeed] Seeded ${calendarSeed.created} global calendar event(s).`);
-  }
-  log.line();
-} catch (err) {
-  log.err(`[CalendarSeed] Failed startup calendar seeding: ${err.message}`);
-  log.line();
-}
-
-// Repopulate mined-out asteroid belts. Belt fields regenerate deterministically
-// whenever a scene is built, so this only has to drop the persisted depletion
-// state that would otherwise delete each rock again on spawn. Must run before
-// any scene exists. Ice sites respawn on their own lifecycle and are left alone.
-if (config.asteroidBeltStartupReset === true) {
-  try {
-    const miningRuntimeState = require(path.join(
-      __dirname,
-      "./src/services/mining/miningRuntimeState",
-    ));
-    const beltResetStartedAtMs = Date.now();
-    const beltReset = miningRuntimeState.resetPersistedBeltAsteroidState();
-    const beltResetTookMs = Date.now() - beltResetStartedAtMs;
-    if (beltReset.entitiesCleared > 0) {
-      log.info(
-        `[BeltReset] Repopulated ${beltReset.entitiesCleared} mined belt asteroid(s) across ` +
-          `${beltReset.systemsTouched} system(s) in ${beltResetTookMs}ms.`,
-      );
-    }
-    log.line();
-  } catch (err) {
-    log.err(`[BeltReset] Failed startup belt asteroid reset: ${err.message}`);
-    log.line();
-  }
-}
-
-// create and populate service manager
-const serviceManager = new ServiceManager();
-const gatewayRuntime = createEvejsWebGatewayRuntime({ serviceManager });
-const runtimeContext = createRuntimeContext({ serviceManager, gatewayRuntime });
-
-// register services
-const servicesDir = path.join(__dirname, "./src/services");
-
-function loadServices(dir) {
-  const files = fs.readdirSync(dir, { withFileTypes: true });
-  for (const file of files) {
-    const fullPath = path.join(dir, file.name);
-    if (file.isDirectory()) {
-      loadServices(fullPath);
-    } else if (
-      file.isFile() &&
-      file.name.endsWith("Service.js") &&
-      file.name !== "baseService.js" &&
-      file.name !== "serviceManager.js"
-    ) {
-      try {
-        const exported = require(fullPath);
-        if (typeof exported === "function") {
-          serviceManager.register(new exported());
-        } else if (typeof exported === "object" && exported !== null) {
-          for (const key in exported) {
-            if (typeof exported[key] === "function") {
-              serviceManager.register(new exported[key]());
-            }
-          }
+    try {
+      const liveEventRuntime = require(path.join(
+        __dirname,
+        "./src/space/liveEvents/liveEventRuntime",
+      ));
+      database.registerShutdownHook("live-event-runtime", () => {
+        const result = liveEventRuntime.stop();
+        if (!result || result.success !== true) {
+          throw new Error(result && result.errorMsg || "LIVE_EVENT_STOP_FAILED");
         }
-      } catch (err) {
-        log.err(`failed to load service from ${fullPath}: ${err.message}`);
+        return result;
+      });
+      const liveEventStartOptions = config.liveEventsEnabled === true
+        ? { spaceRuntime: require(path.join(__dirname, "./src/space/runtime")) }
+        : {};
+      const liveEventStartResult = liveEventRuntime.start(liveEventStartOptions);
+      if (
+        liveEventStartResult &&
+        liveEventStartResult.success === true &&
+        liveEventStartResult.data &&
+        liveEventStartResult.data.enabled === true
+      ) {
+        log.info(
+          `[LiveEvents] Scheduler ready: queued=${Number(liveEventStartResult.data.queueSize) || 0}.`,
+        );
+        log.spacer();
+      }
+    } catch (error) {
+      log.err(`[LiveEvents] Failed startup: ${error.message}`);
+      log.spacer();
+    }
+
+    try {
+      const xEveRuntime = require(path.join(
+        __dirname,
+        "./src/services/xEve/xEveRuntime",
+      ));
+      database.registerShutdownHook("x-eve-runtime", () => {
+        const result = xEveRuntime.stop();
+        if (!result || result.success !== true) {
+          throw new Error(result && result.errorMsg || "X_EVE_STOP_FAILED");
+        }
+        return result;
+      });
+      const xEveStartOptions = config.xEveEnabled === true
+        ? { spaceRuntime: require(path.join(__dirname, "./src/space/runtime")) }
+        : {};
+      const xEveStartResult = xEveRuntime.start(xEveStartOptions);
+      if (
+        config.xEveEnabled === true &&
+        (
+          !xEveStartResult ||
+          xEveStartResult.success !== true ||
+          !xEveStartResult.data ||
+          xEveStartResult.data.started !== true
+        )
+      ) {
+        throw new Error(xEveStartResult && xEveStartResult.errorMsg || "X_EVE_RUNTIME_NOT_READY");
+      }
+      if (
+        xEveStartResult &&
+        xEveStartResult.success === true &&
+        xEveStartResult.data &&
+        xEveStartResult.data.enabled === true
+      ) {
+        const reconcileResult = require(path.join(
+          __dirname,
+          "./src/services/xEve/xEveEventBridge",
+        )).reconcileRecentLivingEconomyEvents();
+        if (!reconcileResult || reconcileResult.success !== true) {
+          throw new Error(
+            `Living Economy journal reconciliation failed: ` +
+            `${reconcileResult && reconcileResult.errorMsg || "UNKNOWN"}`,
+          );
+        }
+        log.info(
+          `[X-Eve] Economic kernel ready: queued=${Number(xEveStartResult.data.scheduler.backlogTotal) || 0}.`,
+        );
+        log.spacer();
+      }
+    } catch (error) {
+      if (config.xEveEnabled === true) {
+        throw error;
+      }
+      log.err(`[X-Eve] Failed startup: ${error.message}`);
+      log.spacer();
+    }
+
+    const startTCPServer = require(path.join(__dirname, "./src/network/tcp"));
+    world.tcpServer = await startTCPServer(world.serviceManager);
+    return world;
+  })
+  .catch(async (error) => {
+    if (bootedWorld && typeof bootedWorld.shutdown === "function") {
+      log.err(`[Startup] Failed after world initialization: ${error.message}`);
+      try {
+        const shutdownResult = await bootedWorld.shutdown();
+        if (!shutdownResult || shutdownResult.success !== true) {
+          log.err(
+            `[Startup] World cleanup failed: ${shutdownResult && shutdownResult.errorMsg || "UNKNOWN"}`,
+          );
+        }
+      } catch (shutdownError) {
+        log.err(`[Startup] World cleanup failed: ${shutdownError.message}`);
       }
     }
-  }
-}
-
-loadServices(servicesDir);
-
-if (serviceManager.lookup("trademgr") && !serviceManager.lookup("tradeMgr")) {
-  serviceManager.registerAlias("tradeMgr", "trademgr");
-}
-
-log.success(`registered ${serviceManager.count} services`);
-log.line();
-
-// register secondary services
-const secondaryServicesDir = path.join(__dirname, "./src/_secondary");
-loadSecondaryServices(secondaryServicesDir, runtimeContext);
-
-if (config.wormholesEnabled === true) {
-  try {
-    const seedStart = process.hrtime.bigint();
-    const wormholeRuntime = require(path.join(
-      __dirname,
-      "./src/services/exploration/wormholes/wormholeRuntime",
-    ));
-    const seedResult = wormholeRuntime.ensureUniverseStatics(Date.now());
-    const seedDurationMs = Number(process.hrtime.bigint() - seedStart) / 1e6;
-    if (seedResult && seedResult.success === true) {
-      const summary = wormholeRuntime.buildUniverseSummary({
-        includeCollapsed: false,
-        includeUndiscovered: true,
-      });
-      log.info(
-        `[Wormholes] Startup ready: ${summary.activePairCount} pair(s) | static ${summary.staticPairCount} | random ${summary.randomPairCount} | systems ${summary.systemCount} | env ${summary.environmentSystemCount} | revealed ${summary.revealedExitCount} | hidden ${summary.hiddenExitCount} | ${seedDurationMs.toFixed(1)} ms`,
-      );
-    } else {
-      log.warn(
-        `[Wormholes] Universe static seeding reported failure after ${seedDurationMs.toFixed(1)} ms`,
-      );
-    }
-    log.spacer();
-  } catch (err) {
-    log.err(`[Wormholes] Failed startup seeding: ${err.message}`);
-    log.spacer();
-  }
-}
-
-try {
-  installSharedOverviewMotd(serviceManager);
-  log.spacer();
-} catch (err) {
-  log.err(`[OverviewPresetMgr] Failed startup MOTD bootstrap: ${err.message}`);
-  log.spacer();
-}
-
-try {
-  const {
-    runStartupBillingMaintenance,
-  } = require(path.join(__dirname, "./src/services/account/billingMaintenance"));
-  const billingSummary = runStartupBillingMaintenance({
-    reason: "startup-downtime",
+    // bootWorld logs and unwinds its own failures; optional runtime and TCP
+    // failures above are unwound through the returned world shutdown handle.
+    await Promise.race([
+      rotatingLog.flushAll(),
+      new Promise((resolve) => setTimeout(resolve, FAILED_START_LOG_FLUSH_MS)),
+    ]).catch(() => null);
+    process.exit(1);
   });
-  const officeRental = billingSummary.officeRental || {};
-  const actionCounts = officeRental.actionCounts || {};
-  if (Number(officeRental.processedCount) > 0 || officeRental.capped === true) {
-    const actionSummary = Object.entries(actionCounts)
-      .map(([action, count]) => `${action}=${count}`)
-      .join(" ");
-    const message =
-      `[Billing] Startup office rental processing complete: ` +
-      `processed=${Number(officeRental.processedCount) || 0} ` +
-      `cycles=${Number(officeRental.cycleCount) || 0}/${Number(officeRental.maxCycles) || 0} ` +
-      `${actionSummary || "actions=0"} ` +
-      `elapsed=${Number(billingSummary.elapsedMs) || 0}ms`;
-    if (officeRental.capped === true) {
-      log.warn(`${message} capped=true`);
-    } else {
-      log.info(message);
-    }
-  }
-  log.spacer();
-} catch (err) {
-  log.err(`[Billing] Failed startup bill processing: ${err.message}`);
-  log.spacer();
-}
-
-// Start the presence reconciler (safety net that re-converges local-chat and
-// station/structure guest visibility for missed fire-and-forget deltas).
-try {
-  presenceReconciler.start();
-  log.spacer();
-} catch (err) {
-  log.err(`[PresenceReconcile] Failed to start: ${err.message}`);
-  log.spacer();
-}
-
-// Live events use their own bounded, deadline-driven scheduler. They are not
-// registered in the 100 ms space tick; observed content receives the shared
-// space-runtime reference only when the feature is enabled.
-try {
-  const liveEventRuntime = require(path.join(
-    __dirname,
-    "./src/space/liveEvents/liveEventRuntime",
-  ));
-  const liveEventStartOptions = config.liveEventsEnabled === true
-    ? { spaceRuntime: require(path.join(__dirname, "./src/space/runtime")) }
-    : {};
-  const startResult = liveEventRuntime.start(liveEventStartOptions);
-  if (
-    startResult &&
-    startResult.success === true &&
-    startResult.data &&
-    startResult.data.enabled === true
-  ) {
-    log.info(
-      `[LiveEvents] Scheduler ready: queued=${Number(startResult.data.queueSize) || 0}.`,
-    );
-    log.spacer();
-  }
-} catch (err) {
-  log.err(`[LiveEvents] Failed startup: ${err.message}`);
-  log.spacer();
-}
-
-// X-Eve runs outside the 100 ms space tick. Its admission governor reads
-// recent tick summaries and preserves queued economic work whenever gameplay
-// latency is under pressure.
-try {
-  const xEveRuntime = require(path.join(
-    __dirname,
-    "./src/services/xEve/xEveRuntime",
-  ));
-  const xEveStartOptions = config.xEveEnabled === true
-    ? { spaceRuntime: require(path.join(__dirname, "./src/space/runtime")) }
-    : {};
-  const startResult = xEveRuntime.start(xEveStartOptions);
-  if (
-    config.xEveEnabled === true &&
-    (
-      !startResult ||
-      startResult.success !== true ||
-      !startResult.data ||
-      startResult.data.started !== true
-    )
-  ) {
-    throw new Error(startResult && startResult.errorMsg || "X_EVE_RUNTIME_NOT_READY");
-  }
-  if (
-    startResult &&
-    startResult.success === true &&
-    startResult.data &&
-    startResult.data.enabled === true
-  ) {
-    const reconcileResult = require(path.join(
-      __dirname,
-      "./src/services/xEve/xEveEventBridge",
-    )).reconcileRecentLivingEconomyEvents();
-    if (!reconcileResult || reconcileResult.success !== true) {
-      xEveRuntime.stop();
-      throw new Error(
-        `Living Economy journal reconciliation failed: ` +
-        `${reconcileResult && reconcileResult.errorMsg || "UNKNOWN"}`,
-      );
-    }
-    log.info(
-      `[X-Eve] Economic kernel ready: queued=${Number(startResult.data.scheduler.backlogTotal) || 0}.`,
-    );
-    log.spacer();
-  }
-} catch (err) {
-  log.err(`[X-Eve] Failed startup: ${err.message}`);
-  log.spacer();
-  if (config.xEveEnabled === true) {
-    throw err;
-  }
-}
-
-// Start the TCP server with the service manager
-startTCPServer(serviceManager);

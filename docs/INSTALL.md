@@ -8,7 +8,8 @@ base independently.
 
 - A `xeve-patch` binary for your platform (from the release zip, or built with
   `make build`).
-- A clean, separately obtained compatible v0.12.3.1 server tree.
+- A clean EveJS v0.12.9 server tree from commit
+  `828823a75f211fdecb945b087a26c225f111491f`.
 - Node.js, Rust, and the Visual Studio C++ Build Tools required by EveJS's
   standalone market service.
 - A backup of any configuration, databases, certificates, and world state you
@@ -20,16 +21,26 @@ profile. It does not require Git on the target host.
 
 ## 1. Verify the base archive
 
-The v0.12.3.1 archive used for this patch has this SHA-256:
+The supported baseline is the clean EveJS v0.12.9 tree at commit
+`828823a75f211fdecb945b087a26c225f111491f`. Create the canonical archive from
+that commit with Git:
 
-```text
-1DEB61A51F808D9F2B330214DA64EC297D9EE5F96EE4B8265692A65F35EEFC1E
+```bash
+git archive --format=zip --prefix=EveJS-v0.12.9/ \
+  --output=EveJS-v0.12.9-828823a.zip \
+  828823a75f211fdecb945b087a26c225f111491f
 ```
 
-Verify your independently obtained archive:
+Its SHA-256 is:
+
+```text
+9A7F3F8901EDAB67DBC47B69E23CAD47D09980A49FA89EE08EF06E4A4310F96F
+```
+
+Verify the archive:
 
 ```powershell
-Get-FileHash -Algorithm SHA256 'C:\Downloads\EveJS-v0.12.3.1.zip'
+Get-FileHash -Algorithm SHA256 'C:\Downloads\EveJS-v0.12.9-828823a.zip'
 ```
 
 The hash must match exactly. A filename alone is not proof of compatibility.
@@ -45,7 +56,7 @@ Extract the archive to a new directory. Do not point the CLI at:
 - your only copy of important databases or configuration.
 
 Stop the game server, market service, and related tools before installing. The
-CLI checks the expected v0.12.3.1 file hashes and the absence of patch-added
+CLI checks the expected v0.12.9 file hashes and the absence of patch-added
 paths before it writes anything.
 
 ## 3. Install
@@ -55,7 +66,7 @@ its `patches/` data next to the binary). Double-click the executable for the
 interactive menu, or use the command line:
 
 ```bash
-xeve-patch install "C:\Games\EveJS-v0.12.3.1"
+xeve-patch install "C:\Games\EveJS-v0.12.9"
 ```
 
 The CLI:
@@ -79,7 +90,7 @@ target's `_local` directory to a public repository.
 Run the non-mutating installed-file verification:
 
 ```bash
-xeve-patch verify "C:\Games\EveJS-v0.12.3.1"
+xeve-patch verify "C:\Games\EveJS-v0.12.9"
 ```
 
 On an uninstalled tree the same command validates the clean baseline instead.
@@ -100,9 +111,9 @@ the local database, run the patch's own `server/scripts/verify*.js` tests. They
 execute in isolated `node` processes, grouped by subsystem module:
 
 ```bash
-xeve-patch verify "C:\Games\EveJS-v0.12.3.1" --module livingEconomy
-xeve-patch verify "C:\Games\EveJS-v0.12.3.1" --tests          # all modules
-xeve-patch verify "C:\Games\EveJS-v0.12.3.1" --module liveEvents --filter Deadline
+xeve-patch verify "C:\Games\EveJS-v0.12.9" --module livingEconomy
+xeve-patch verify "C:\Games\EveJS-v0.12.9" --tests          # all modules
+xeve-patch verify "C:\Games\EveJS-v0.12.9" --module liveEvents --filter Deadline
 ```
 
 Headless unit tests also pass on a freshly installed tree; any script that
@@ -113,7 +124,7 @@ fails exits nonzero. See [Module map](MODULES.md).
 If a patched file was edited or deleted, restore the exact installed state:
 
 ```bash
-xeve-patch repair "C:\Games\EveJS-v0.12.3.1"
+xeve-patch repair "C:\Games\EveJS-v0.12.9"
 ```
 
 This re-applies overlay content from the release package and re-verifies.
@@ -153,7 +164,7 @@ normal configuration changes do not invalidate patch verification.
 Stop the server and run:
 
 ```bash
-xeve-patch uninstall "C:\Games\EveJS-v0.12.3.1"
+xeve-patch uninstall "C:\Games\EveJS-v0.12.9"
 ```
 
 Uninstall is deliberately conservative. If a patched file has changed since
@@ -169,7 +180,7 @@ patch was running.
 
 Trees installed by the v0.2.3 PowerShell installer carry an old-format install
 record. Uninstall them with the retained legacy scripts before installing
-v0.3.0:
+v0.4.0:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\legacy\Uninstall-XEvePatch.ps1 `
@@ -181,5 +192,6 @@ Then install with `xeve-patch` normally. See [legacy](../legacy/README.md).
 ## Installation refusal is a safety result
 
 Do not bypass a baseline, hash, added-path, or changed-file refusal. Extract a
-fresh v0.12.3.1 copy, verify its archive hash, and try again. Manual partial
+fresh v0.12.9 copy at the supported commit, verify its archive hash, and try
+again. Manual partial
 application makes later verification and uninstall unreliable.

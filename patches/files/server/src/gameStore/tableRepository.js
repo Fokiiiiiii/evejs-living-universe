@@ -135,8 +135,11 @@ function createTableRepository(domain, options = {}) {
     // persists already-written cache to disk; it is not a data mutation, so a
     // domain may flush without owning the table. Lets the repo be a complete
     // drop-in for the raw gameStore in owner modules.
-    flushTableAsync: (table) => store.flushTableAsync(table),
     flushTableSync: (table) => store.flushTableSync(table),
+    flushTableAsync: (table) =>
+      typeof store.flushTableAsync === "function"
+        ? store.flushTableAsync(table)
+        : undefined,
     flushTablesSync: (tables) => store.flushTablesSync(tables),
     flushAllSync: () => store.flushAllSync(),
     registerTableFlushPrerequisite: (table, key, callback) =>
@@ -160,6 +163,16 @@ function createTableRepository(domain, options = {}) {
     // for `write(..., { transient: true })`).
     setTransientPath: (table, pathArg, enabled) =>
       store.setTransientPath(table, pathArg, enabled),
+    setTransientPaths: (table, pathArgs, enabled) =>
+      typeof store.setTransientPaths === "function"
+        ? store.setTransientPaths(table, pathArgs, enabled)
+        : (Array.isArray(pathArgs) ? pathArgs : [pathArgs]).forEach((pathArg) =>
+            store.setTransientPath(table, pathArg, enabled),
+          ),
+    isTransientPath: (table, pathArg) =>
+      typeof store.isTransientPath === "function"
+        ? store.isTransientPath(table, pathArg)
+        : false,
   };
 }
 

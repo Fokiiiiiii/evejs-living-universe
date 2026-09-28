@@ -1,3 +1,5 @@
+"use strict";
+
 const path = require("path");
 
 // Memoized resolver for lazy (circular-dependency-safe) requires that run on the
@@ -27,10 +29,15 @@ const { resolveItemByTypeID } = require(path.join(
   "../inventory/itemTypeRegistry",
 ));
 const {
-  listContainerItems,
   removeInventoryItem,
   updateInventoryItem,
 } = require(path.join(__dirname, "../inventory/itemStore"));
+const {
+  listContainerItems,
+} = require(path.join(
+  __dirname,
+  "../inventory/simulationInventoryProjection",
+));
 const { resolveShipByTypeID } = require(path.join(
   __dirname,
   "../chat/shipTypeRegistry",
@@ -63,6 +70,14 @@ const structureAutoMoonFuelRuntime = require(path.join(
   __dirname,
   "./structureAutoMoonFuelRuntime",
 ));
+const {
+  normalizePersistedMoonID,
+} = require(path.join(__dirname, "./moonResourceShadowRead"));
+const {
+  applyCanonicalBinding,
+  buildCanonicalBinding,
+  validateBindingTransition,
+} = require(path.join(__dirname, "./moonStructureBinding"));
 const {
   getAllianceOwnerRecord,
   getCharacterIDsInCorporation,
@@ -136,6 +151,7 @@ const ABANDONING_TIME_MIN_MS = 604800 * 1000;
 const ABANDONING_TIME_MAX_MS = 691200 * 1000;
 const ABANDONED_ADVANCE_WARNING_MS = 259200 * 1000;
 const ABANDONED_WARNING_DAY_MS = 86400 * 1000;
+const STRUCTURE_REPAIR_RESUME_DELAY_MS = 10_000;
 const TYPES_THAT_NEVER_GO_ABANDONED = Object.freeze(new Set([
   47512, // typeCitadelMoreauFortizar
   47513, // typeCitadelDraccousFortizar
@@ -630,7 +646,9 @@ function normalizeStructureTypeRecord(entry = {}) {
   const preset = STRUCTURE_TYPE_PRESETS[typeID] || null;
   const itemType = resolveItemByTypeID(typeID) || entry || {};
   const family = entry.structureFamily || deriveFamily(itemType.groupID, typeID);
-  const size = entry.structureSize || deriveSize(itemType.groupID, typeID);
+  // A preset's size wins over a saved structureTypes row, so a size corrected
+  // in the presets reaches stores that were seeded before the correction.
+  const size = (preset && preset.size) || entry.structureSize || deriveSize(itemType.groupID, typeID);
   const defaultQuantumCoreTypeID = toPositiveInt(
     entry.defaultQuantumCoreTypeID,
     (preset && preset.defaultQuantumCoreTypeID) || 0,
@@ -692,7 +710,14 @@ function ensureStructureTypes() {
     return typeCache;
   }
 
-  database.ensureTable(STRUCTURE_TYPES_TABLE);
+  // The rows below are derived from static item types, so a process that may
+  // not write structureTypes can still build the same cache; it just keeps it in
+  // memory. Only the durable owner creates or seeds the table. Without this a
+  // passive caller could not so much as name a structure type.
+  const maySeedStructureTypes = database.mayMutateTable(STRUCTURE_TYPES_TABLE);
+  if (maySeedStructureTypes) {
+    database.ensureTable(STRUCTURE_TYPES_TABLE);
+  }
   const payload = readTable(STRUCTURE_TYPES_TABLE, {
     _meta: { seedVersion: 1, generatedAt: null },
     structureTypes: [],
@@ -708,17 +733,19 @@ function ensureStructureTypes() {
       .filter((entry) => entry.typeID > 0)
       .sort((left, right) => left.typeID - right.typeID);
 
-    const writeResult = writeTable(STRUCTURE_TYPES_TABLE, {
-      _meta: {
-        seedVersion: 1,
-        generatedAt: new Date().toISOString(),
-      },
-      structureTypes: rows,
-    });
-    if (!writeResult.success) {
-      log.warn(
-        `[StructureState] Failed to persist structureTypes bootstrap: ${writeResult.errorMsg}`,
-      );
+    if (maySeedStructureTypes) {
+      const writeResult = writeTable(STRUCTURE_TYPES_TABLE, {
+        _meta: {
+          seedVersion: 1,
+          generatedAt: new Date().toISOString(),
+        },
+        structureTypes: rows,
+      });
+      if (!writeResult.success) {
+        log.warn(
+          `[StructureState] Failed to persist structureTypes bootstrap: ${writeResult.errorMsg}`,
+        );
+      }
     }
   }
 
@@ -734,22 +761,24 @@ function ensureStructureTypes() {
   }
   if (rowsChanged) {
     rows.sort((left, right) => left.typeID - right.typeID);
-    const writeResult = writeTable(STRUCTURE_TYPES_TABLE, {
-      _meta: {
-        seedVersion: 2,
-        generatedAt:
-          payload &&
-          payload._meta &&
-          payload._meta.generatedAt
-            ? String(payload._meta.generatedAt)
-            : new Date().toISOString(),
-      },
-      structureTypes: rows,
-    });
-    if (!writeResult.success) {
-      log.warn(
-        `[StructureState] Failed to persist required sovereignty structure types: ${writeResult.errorMsg}`,
-      );
+    if (maySeedStructureTypes) {
+      const writeResult = writeTable(STRUCTURE_TYPES_TABLE, {
+        _meta: {
+          seedVersion: 2,
+          generatedAt:
+            payload &&
+            payload._meta &&
+            payload._meta.generatedAt
+              ? String(payload._meta.generatedAt)
+              : new Date().toISOString(),
+        },
+        structureTypes: rows,
+      });
+      if (!writeResult.success) {
+        log.warn(
+          `[StructureState] Failed to persist required sovereignty structure types: ${writeResult.errorMsg}`,
+        );
+      }
     }
   }
 
@@ -787,8 +816,12 @@ function normalizeStructureRecord(entry = {}) {
     ownerCorpID: toPositiveInt(entry.ownerCorpID || entry.ownerID, 1),
     ownerID: toPositiveInt(entry.ownerCorpID || entry.ownerID, 1),
     allianceID: toPositiveInt(entry.allianceID, 0) || null,
+    moonID: normalizePersistedMoonID(entry.moonID),
+    moonMiningBinding:
+      entry.moonMiningBinding === undefined || entry.moonMiningBinding === null
+        ? null
+        : cloneValue(entry.moonMiningBinding),
     solarSystemID: toPositiveInt(entry.solarSystemID, toPositiveInt(system && system.solarSystemID, 30000142)),
-    moonID: toPositiveInt(entry.moonID, 0) || null,
     constellationID: toPositiveInt(entry.constellationID, toPositiveInt(system && system.constellationID, 20000020)),
     regionID: toPositiveInt(entry.regionID, toPositiveInt(system && system.regionID, 10000002)),
     position: normalizePosition(entry.position),
@@ -847,6 +880,15 @@ function normalizeStructureRecord(entry = {}) {
       ? entry.abandonmentWarningRecipients.map((recipient) => String(recipient))
       : [],
     liquidOzoneQty: Math.max(0, toInt(entry.liquidOzoneQty, 0)),
+    deliveryFuelReceipts: (Array.isArray(entry.deliveryFuelReceipts)
+      ? entry.deliveryFuelReceipts
+      : [])
+      .map((receipt) => ({
+        idempotencyKey: String(receipt && receipt.idempotencyKey || "").trim(),
+        quantity: Math.max(0, toInt(receipt && receipt.quantity, 0)),
+        completedAtMs: toPositiveInt(receipt && receipt.completedAtMs, 0),
+      }))
+      .filter((receipt) => receipt.idempotencyKey && receipt.quantity > 0),
     devFlags: entry.devFlags && typeof entry.devFlags === "object" ? cloneValue(entry.devFlags) : {},
     accessProfile: normalizeAccessProfile(entry.accessProfile),
     conditionState: normalizeConditionState(entry.conditionState),
@@ -903,6 +945,16 @@ function ensureStructureCache() {
 function persistStructures(rows, metaOverrides = {}, options = {}) {
   const previousRows = ensureStructureCache().rows.map((entry) => cloneValue(entry));
   const normalizedRows = rows.map((entry) => normalizeStructureRecord(entry));
+  const bindingTransition = validateBindingTransition(previousRows, normalizedRows, {
+    allowNewBindingStructureID: options.allowNewMoonBindingStructureID,
+  });
+  if (!bindingTransition.success) {
+    return {
+      success: false,
+      errorMsg: bindingTransition.code,
+      data: bindingTransition,
+    };
+  }
   const nextStructureID = Math.max(
     NEXT_STRUCTURE_ID_START,
     ...normalizedRows.map((entry) => toPositiveInt(entry && entry.structureID, 0) + 1),
@@ -1457,9 +1509,41 @@ function shouldNotifyStructureUnderAttack(previousStructure, nextStructure, dama
   if (!isStructureRepairLayerDamageApplied(previousStructure, beforeLayers, afterLayers)) {
     return null;
   }
+  if (toInt(nextStructure && nextStructure.state, 0) !== toInt(previousStructure && previousStructure.state, 0)) {
+    return null;
+  }
+  if (!canStructureRepairInState(previousStructure)) {
+    // With no repair countdown there is no repair window to space notices by.
+    // Retail sends one per aggression, which ends when the structure changes
+    // stage or the layer being shot is whole again.
+    const layer = resolveStructureRepairLayerName(previousStructure);
+    const condition = normalizeConditionState(previousStructure && previousStructure.conditionState);
+    const layerWasWhole =
+      layer === "shield"
+        ? condition.shieldCharge >= 1
+        : layer === "armor"
+          ? condition.armorDamage <= 0
+          : condition.damage <= 0;
+    const notifiedStageStartedAt = toPositiveInt(
+      previousStructure &&
+        previousStructure.devFlags &&
+        previousStructure.devFlags.underAttackNotifiedStageStartedAt,
+      0,
+    );
+    if (
+      !layerWasWhole &&
+      notifiedStageStartedAt === toPositiveInt(previousStructure.stateStartedAt, 0)
+    ) {
+      return null;
+    }
+    return {
+      ...attackContext,
+      activeUntilMs: null,
+      notifiedStageStartedAt: toPositiveInt(nextStructure.stateStartedAt, 0),
+    };
+  }
   const repairEndsAt = toPositiveInt(nextStructure && nextStructure.stateEndsAt, 0);
-  const repairPausedAt = toPositiveInt(nextStructure && nextStructure.timerPausedAt, 0);
-  if (repairEndsAt <= nowMs || repairPausedAt !== nowMs) {
+  if (repairEndsAt <= nowMs) {
     return null;
   }
   const previousNotificationActiveUntil = toPositiveInt(
@@ -1905,6 +1989,66 @@ function updateStructureRecord(structureID, updater, options = {}) {
   };
 }
 
+function incrementStructureLiquidOzoneIdempotent(
+  structureID,
+  quantity,
+  idempotencyKey,
+) {
+  const targetID = toPositiveInt(structureID, 0);
+  const normalizedQuantity = Math.max(0, toInt(quantity, 0));
+  const normalizedKey = String(idempotencyKey || "").trim();
+  if (!targetID || normalizedQuantity <= 0 || !normalizedKey) {
+    return { success: false, errorMsg: "STRUCTURE_FUEL_RECEIPT_INVALID" };
+  }
+  const current = getStructureByID(targetID, { refresh: false });
+  if (!current) {
+    return { success: false, errorMsg: "STRUCTURE_NOT_FOUND" };
+  }
+  const existingReceipt = (current.deliveryFuelReceipts || [])
+    .find((receipt) => receipt.idempotencyKey === normalizedKey);
+  if (existingReceipt) {
+    if (Number(existingReceipt.quantity) !== normalizedQuantity) {
+      return { success: false, errorMsg: "IDEMPOTENCY_KEY_REUSED" };
+    }
+    const flushResult = database.flushTableSync(STRUCTURES_TABLE);
+    return flushResult && flushResult.success
+      ? { success: true, duplicate: true, durable: true, data: current }
+      : {
+          success: false,
+          ambiguous: true,
+          errorMsg: flushResult && flushResult.errorMsg || "STRUCTURE_FUEL_FLUSH_FAILED",
+        };
+  }
+
+  const updateResult = updateStructureRecord(targetID, (record) => ({
+    ...record,
+    liquidOzoneQty:
+      Math.max(0, toInt(record && record.liquidOzoneQty, 0)) +
+      normalizedQuantity,
+    deliveryFuelReceipts: [
+      ...(Array.isArray(record && record.deliveryFuelReceipts)
+        ? record.deliveryFuelReceipts
+        : []),
+      {
+        idempotencyKey: normalizedKey,
+        quantity: normalizedQuantity,
+        completedAtMs: Date.now(),
+      },
+    ],
+  }));
+  if (!updateResult || updateResult.success !== true) {
+    return updateResult || { success: false, errorMsg: "STRUCTURE_FUEL_UPDATE_FAILED" };
+  }
+  const flushResult = database.flushTableSync(STRUCTURES_TABLE);
+  return flushResult && flushResult.success
+    ? { success: true, duplicate: false, durable: true, data: updateResult.data }
+    : {
+        success: false,
+        ambiguous: true,
+        errorMsg: flushResult && flushResult.errorMsg || "STRUCTURE_FUEL_FLUSH_FAILED",
+      };
+}
+
 function createStructure(record, options = {}) {
   const cache = ensureStructureCache();
   const structureID = Math.max(NEXT_STRUCTURE_ID_START, cache.meta.nextStructureID || NEXT_STRUCTURE_ID_START);
@@ -1925,11 +2069,69 @@ function createStructure(record, options = {}) {
   };
 }
 
-function upsertStructureRecord(record) {
+function bindStructureToMoon(structureID, authorityContext, options = {}) {
+  const targetID = toPositiveInt(structureID, 0);
+  const rows = listStructures({
+    includeDestroyed: true,
+    refresh: false,
+  });
+  const current = rows.find((entry) => entry.structureID === targetID);
+  if (!current) {
+    return {
+      success: false,
+      errorMsg: "STRUCTURE_NOT_FOUND",
+    };
+  }
+
+  const built = buildCanonicalBinding({
+    structure: current,
+    locationEligibility: authorityContext && authorityContext.locationEligibility,
+    miningPoint: authorityContext && authorityContext.miningPoint,
+  });
+  if (!built.success) {
+    return {
+      success: false,
+      errorMsg: built.code,
+      data: built,
+    };
+  }
+  const applied = applyCanonicalBinding({
+    structure: current,
+    binding: built.binding,
+    structures: rows,
+  });
+  if (!applied.success) {
+    return {
+      success: false,
+      errorMsg: applied.code,
+      data: applied,
+    };
+  }
+
+  const writeResult = persistStructures(
+    rows.map((entry) => (
+      entry.structureID === targetID ? applied.structure : entry
+    )),
+    {},
+    {
+      ...options,
+      allowNewMoonBindingStructureID: targetID,
+    },
+  );
+  if (!writeResult.success) {
+    return writeResult;
+  }
+  return {
+    success: true,
+    data: applied.structure,
+  };
+}
+
+function upsertStructureRecord(record, options = {}) {
   const next = normalizeStructureRecord(record || {});
   const structureID = toPositiveInt(next && next.structureID, 0);
   if (!structureID) {
-    return createStructure(record);
+    return createStructure(record, options);
   }
 
   const cache = ensureStructureCache();
@@ -1941,13 +2143,17 @@ function upsertStructureRecord(record) {
     rows.push(next);
   }
 
-  const writeResult = persistStructures(rows, {
-    nextStructureID: Math.max(
-      NEXT_STRUCTURE_ID_START,
-      cache.meta && cache.meta.nextStructureID ? cache.meta.nextStructureID : NEXT_STRUCTURE_ID_START,
-      structureID + 1,
-    ),
-  });
+  const writeResult = persistStructures(
+    rows,
+    {
+      nextStructureID: Math.max(
+        NEXT_STRUCTURE_ID_START,
+        cache.meta && cache.meta.nextStructureID ? cache.meta.nextStructureID : NEXT_STRUCTURE_ID_START,
+        structureID + 1,
+      ),
+    },
+    options,
+  );
   if (!writeResult.success) {
     return writeResult;
   }
@@ -2061,9 +2267,6 @@ function setStructureAbandonTimerRemaining(structureID, seconds, options = {}) {
 function hasStructureGmBypass(session) {
   if (!session) {
     return false;
-  }
-  if (config.upwellGmBypassRestrictions === true) {
-    return true;
   }
   const role = normalizeRoleValue(session && session.role, 0n);
   return role > 0n && (role & GM_BYPASS_ROLE_MASK) !== 0n;
@@ -2227,9 +2430,190 @@ function canCharacterDockAtStructure(session, structure, options = {}) {
   return shipTypeID > 0 ? canShipTypeDockAtStructure(shipTypeID, structure) : { success: true };
 }
 
-function resolveSecurityBand(structure) {
-  const system = getSolarSystemRecord(structure && structure.solarSystemID);
-  return toFloat(system && system.security, 0) >= 0.45 ? "high" : "low";
+const {
+  isTriglavianSolarSystemID,
+  isWormholeSolarSystemID,
+} = require(path.join(__dirname, "../chat/channelRules"));
+
+function resolveStructureSpaceBand(structure) {
+  const solarSystemID = structure && structure.solarSystemID;
+
+  if (isWormholeSolarSystemID(solarSystemID)) {
+    return "wormhole";
+  }
+
+  if (isTriglavianSolarSystemID(solarSystemID)) {
+    return "triglavian";
+  }
+
+  const system = getSolarSystemRecord(solarSystemID);
+  const security = toFloat(system && system.security, 0);
+
+  if (security >= 0.45) {
+    return "high";
+  }
+
+  if (security > 0) {
+    return "low";
+  }
+
+  return "null";
+}
+
+function isStructureActiveWarHQ(structure) {
+  const structureID = toPositiveInt(structure && structure.structureID, 0);
+
+  if (!structureID) {
+    return false;
+  }
+
+  try {
+    const {
+      listWarsForStructure,
+    } = lazyRequire("../corporation/warRuntimeState");
+
+    if (typeof listWarsForStructure !== "function") {
+      return false;
+    }
+
+    const wars = listWarsForStructure(structureID);
+
+    if (!Array.isArray(wars) || wars.length === 0) {
+      return false;
+    }
+
+    return wars.some((war) => {
+      if (!war) {
+        return false;
+      }
+
+      if (toPositiveInt(war.warHQID, 0) !== structureID) {
+        return false;
+      }
+
+      return !war.timeFinished;
+    });
+  } catch (error) {
+    log.warn(
+      `[StructureState] Failed to resolve War HQ state for ` +
+      `${structureID}: ${error.message}`,
+    );
+    return false;
+  }
+}
+
+const MEDIUM_ARMOR_REINFORCE_SECONDS_BY_BAND = Object.freeze({
+  wormhole: STRUCTURE_TIMER_SECONDS.ARMOR_REINFORCE_MEDIUM_WORMHOLE,
+  triglavian: STRUCTURE_TIMER_SECONDS.ARMOR_REINFORCE_MEDIUM_TRIGLAVIAN,
+  null: STRUCTURE_TIMER_SECONDS.ARMOR_REINFORCE_MEDIUM_NULL,
+  low: STRUCTURE_TIMER_SECONDS.ARMOR_REINFORCE_MEDIUM_LOW,
+  high: STRUCTURE_TIMER_SECONDS.ARMOR_REINFORCE_MEDIUM_HIGH,
+});
+
+const HULL_REINFORCE_SECONDS_BY_BAND = Object.freeze({
+  wormhole: STRUCTURE_TIMER_SECONDS.HULL_REINFORCE_WORMHOLE,
+  triglavian: STRUCTURE_TIMER_SECONDS.HULL_REINFORCE_TRIGLAVIAN,
+  null: STRUCTURE_TIMER_SECONDS.HULL_REINFORCE_NULL,
+  low: STRUCTURE_TIMER_SECONDS.HULL_REINFORCE_LOW,
+  high: STRUCTURE_TIMER_SECONDS.HULL_REINFORCE_HIGH,
+});
+
+// Every size gets a positive duration. A reinforce state with no end time
+// never advances, and weapons cannot damage a reinforced structure, so a
+// missing duration would leave the structure invulnerable for good.
+function resolveStructureReinforcementDurationSeconds(structure, reinforcementType) {
+  const size = structure && structure.structureSize;
+
+  if (reinforcementType === "hull") {
+    if (size === STRUCTURE_SIZE.FLEX) {
+      return STRUCTURE_TIMER_SECONDS.HULL_REINFORCE_FLEX;
+    }
+    if (isStructureActiveWarHQ(structure)) {
+      return STRUCTURE_TIMER_SECONDS.WAR_HQ_HULL_REINFORCE;
+    }
+    return HULL_REINFORCE_SECONDS_BY_BAND[resolveStructureSpaceBand(structure)];
+  }
+
+  if (isStructureActiveWarHQ(structure)) {
+    return STRUCTURE_TIMER_SECONDS.WAR_HQ_ARMOR_REINFORCE;
+  }
+  if (size === STRUCTURE_SIZE.MEDIUM) {
+    return MEDIUM_ARMOR_REINFORCE_SECONDS_BY_BAND[resolveStructureSpaceBand(structure)];
+  }
+  return STRUCTURE_TIMER_SECONDS.ARMOR_REINFORCE_DEFAULT;
+}
+
+function resolveStructureReinforcementJitterSeconds(structure) {
+  const size = structure && structure.structureSize;
+  if (size === STRUCTURE_SIZE.FLEX) {
+    return STRUCTURE_TIMER_SECONDS.REINFORCE_EXIT_JITTER_FLEX;
+  }
+  if (size === STRUCTURE_SIZE.MEDIUM) {
+    return STRUCTURE_TIMER_SECONDS.REINFORCE_EXIT_JITTER_MEDIUM;
+  }
+  return STRUCTURE_TIMER_SECONDS.REINFORCE_EXIT_JITTER_DEFAULT;
+}
+
+// Retail exit time: the base duration, then the first reinforce hour strictly
+// after it, then a random shift within the size's jitter range. The Upwell
+// timer scale shortens the whole wait, so GM and dev test cycles still work.
+function resolveStructureReinforcementEndTime(
+  structure,
+  reinforcementType,
+  nowMs = Date.now(),
+) {
+  const durationSeconds = resolveStructureReinforcementDurationSeconds(
+    structure,
+    reinforcementType,
+  );
+
+  const reinforceHour = Math.min(
+    23,
+    Math.max(
+      0,
+      toInt(
+        structure && structure.reinforceHour,
+        DEFAULT_REINFORCE_HOUR,
+      ),
+    ),
+  );
+
+  const minimumEndMs = nowMs + durationSeconds * 1000;
+  const minimumEndDate = new Date(minimumEndMs);
+
+  let reinforcementHourMs = Date.UTC(
+    minimumEndDate.getUTCFullYear(),
+    minimumEndDate.getUTCMonth(),
+    minimumEndDate.getUTCDate(),
+    reinforceHour,
+    0,
+    0,
+    0,
+  );
+
+  if (reinforcementHourMs <= minimumEndMs) {
+    reinforcementHourMs = Date.UTC(
+      minimumEndDate.getUTCFullYear(),
+      minimumEndDate.getUTCMonth(),
+      minimumEndDate.getUTCDate() + 1,
+      reinforceHour,
+      0,
+      0,
+      0,
+    );
+  }
+
+  const jitterSeconds = resolveStructureReinforcementJitterSeconds(structure);
+  const randomizedJitterSeconds =
+    Math.floor(Math.random() * (jitterSeconds * 2 + 1)) -
+    jitterSeconds;
+  const retailEndMs = reinforcementHourMs + randomizedJitterSeconds * 1000;
+
+  const timerScale = getTimerScale(structure);
+  if (timerScale === 1) {
+    return retailEndMs;
+  }
+  return nowMs + Math.max(0, Math.round((retailEndMs - nowMs) * timerScale));
 }
 
 function getTimerScale(structure) {
@@ -2319,17 +2703,27 @@ function isStructureFullyRepaired(structure) {
   );
 }
 
+// Retail IsShieldDamaged treats a shield above 99.5% as undamaged.
+const STRUCTURE_ALMOST_MAX_SHIELD_LEVEL = 0.995;
+
 function isStructureRepairLayerDamaged(structure) {
   const state = toInt(structure && structure.state, 0);
   const condition = normalizeConditionState(structure && structure.conditionState);
-  if (state === STRUCTURE_STATE.SHIELD_VULNERABLE) {
-    return condition.shieldCharge < 1;
-  }
-  if (state === STRUCTURE_STATE.ARMOR_VULNERABLE) {
-    return condition.armorDamage > 0;
+  if (
+    state === STRUCTURE_STATE.SHIELD_VULNERABLE ||
+    state === STRUCTURE_STATE.ARMOR_VULNERABLE ||
+    state === STRUCTURE_STATE.HULL_VULNERABLE
+  ) {
+    // Retail ShouldRepair asks whether any layer is damaged. The armor and hull
+    // stages begin with the layers above them at zero, so they repair from the
+    // moment they start, not only once their own layer is hit.
+    return (
+      condition.shieldCharge < STRUCTURE_ALMOST_MAX_SHIELD_LEVEL ||
+      condition.armorDamage > 0 ||
+      condition.damage > 0
+    );
   }
   if (
-    state === STRUCTURE_STATE.HULL_VULNERABLE ||
     state === STRUCTURE_STATE.ANCHOR_VULNERABLE ||
     state === STRUCTURE_STATE.DEPLOY_VULNERABLE
   ) {
@@ -2368,6 +2762,88 @@ function isStructureRepairLayerDamageApplied(structure, beforeLayers = {}, after
   return false;
 }
 
+// Per-type retail values from the static dogma. CanHaveAutoRepair (5770) is 0
+// on the Ansiblex and the Metenox, which their owners must repair by hand. The
+// damage limits (2034-2036) cap the damage each layer takes per second, and
+// the pause thresholds (3354-3356) are the damage a second must bring to a
+// layer before its repair countdown pauses.
+const STRUCTURE_STATES_THAT_REQUIRE_AUTO_REPAIR = new Set([
+  STRUCTURE_STATE.SHIELD_VULNERABLE,
+  STRUCTURE_STATE.ARMOR_VULNERABLE,
+  STRUCTURE_STATE.HULL_VULNERABLE,
+]);
+
+function readStructureTypeAttribute(structure, attributeName, fallback) {
+  const value = getTypeAttributeValue(
+    toPositiveInt(structure && structure.typeID, 0),
+    attributeName,
+  );
+  return value === null || value === undefined || !Number.isFinite(Number(value))
+    ? fallback
+    : Number(value);
+}
+
+function canStructureAutoRepair(structure) {
+  return readStructureTypeAttribute(structure, "CanHaveAutoRepair", 1) !== 0;
+}
+
+// Retail ShouldRepair: the shield, armor and hull stages count down a repair
+// only for a structure that can repair itself.
+function canStructureRepairInState(structure, state = toInt(structure && structure.state, 0)) {
+  return !STRUCTURE_STATES_THAT_REQUIRE_AUTO_REPAIR.has(state) || canStructureAutoRepair(structure);
+}
+
+function resolveStructureLayerDamageLimits(structure) {
+  return {
+    shield: Math.max(0, readStructureTypeAttribute(structure, "shieldDamageLimit", 0)),
+    armor: Math.max(0, readStructureTypeAttribute(structure, "armorDamageLimit", 0)),
+    structure: Math.max(0, readStructureTypeAttribute(structure, "structureDamageLimit", 0)),
+  };
+}
+
+function resolveStructureRepairPauseThresholds(structure) {
+  return {
+    shield: Math.max(0, readStructureTypeAttribute(structure, "pauseShieldRepairDpsThreshold", 0)),
+    armor: Math.max(0, readStructureTypeAttribute(structure, "pauseArmorRepairDpsThreshold", 0)),
+    structure: Math.max(0, readStructureTypeAttribute(structure, "pauseHullRepairDpsThreshold", 0)),
+  };
+}
+
+function resolveStructureRepairLayerName(structure) {
+  const state = toInt(structure && structure.state, 0);
+  if (state === STRUCTURE_STATE.SHIELD_VULNERABLE) {
+    return "shield";
+  }
+  if (state === STRUCTURE_STATE.ARMOR_VULNERABLE) {
+    return "armor";
+  }
+  if (
+    state === STRUCTURE_STATE.HULL_VULNERABLE ||
+    state === STRUCTURE_STATE.ANCHOR_VULNERABLE ||
+    state === STRUCTURE_STATE.DEPLOY_VULNERABLE ||
+    state === STRUCTURE_STATE.ONLINING_VULNERABLE
+  ) {
+    return "structure";
+  }
+  return null;
+}
+
+// A hit pauses the repair countdown only when the damage the layer has taken in
+// the current second reaches its threshold. Callers without a per-second
+// measure, such as GM damage, count the hit on its own.
+function isStructureRepairPauseDamage(structure, beforeLayers = {}, afterLayers = {}, options = {}) {
+  const layer = resolveStructureRepairLayerName(structure);
+  if (!layer) {
+    return false;
+  }
+  const measured =
+    options.layerDamageThisSecond &&
+    Number.isFinite(Number(options.layerDamageThisSecond[layer]))
+      ? Number(options.layerDamageThisSecond[layer])
+      : Math.max(0, toFloat(beforeLayers[layer], 0) - toFloat(afterLayers[layer], 0));
+  return measured > 0 && measured >= resolveStructureRepairPauseThresholds(structure)[layer];
+}
+
 function resolveStructureRepairingValue(structure) {
   const state = toInt(structure && structure.state, 0);
   if (!STRUCTURE_VULNERABLE_STATES.has(state)) {
@@ -2387,8 +2863,22 @@ function resolveStructureRepairingValue(structure) {
   return Number.isFinite(pauseAt) && pauseAt > 0 ? false : true;
 }
 
-function applyStructureRepairTimerForDamage(structure, beforeLayers, afterLayers, nowMs) {
+// Incoming damage pauses the repair countdown, which resumes
+// STRUCTURE_REPAIR_RESUME_DELAY_MS after the last hit. One pause never holds
+// the countdown longer than that delay, however far apart ticks or hits are,
+// so a stalled or restarted server does not stretch it by the gap.
+function resolveStructureRepairHoldMs(pausedAtMs, nowMs) {
+  return Math.min(
+    Math.max(0, nowMs - pausedAtMs),
+    STRUCTURE_REPAIR_RESUME_DELAY_MS,
+  );
+}
+
+function applyStructureRepairTimerForDamage(structure, beforeLayers, afterLayers, nowMs, options = {}) {
   if (!STRUCTURE_VULNERABLE_STATES.has(toInt(structure && structure.state, 0))) {
+    return structure;
+  }
+  if (!canStructureRepairInState(structure)) {
     return structure;
   }
   if (!isStructureRepairLayerDamageApplied(structure, beforeLayers, afterLayers)) {
@@ -2404,14 +2894,22 @@ function applyStructureRepairTimerForDamage(structure, beforeLayers, afterLayers
   if (repairSeconds <= 0) {
     return structure;
   }
+  const pausing = isStructureRepairPauseDamage(structure, beforeLayers, afterLayers, options);
   const currentStateStartedAt = toPositiveInt(structure.stateStartedAt, 0);
   const currentStateEndsAt = toPositiveInt(structure.stateEndsAt, 0);
   if (currentStateStartedAt > 0 && currentStateEndsAt > nowMs) {
-    const previousPauseAt = toPositiveInt(structure.timerPausedAt, currentStateStartedAt);
-    const elapsedSincePauseMs = Math.max(0, nowMs - previousPauseAt);
+    if (!pausing) {
+      return structure;
+    }
+    const previousPauseAt = toPositiveInt(structure.timerPausedAt, 0);
+    // A running countdown just pauses. An earlier hit's pause still on record
+    // held the countdown until now or until it would have resumed, whichever
+    // came first, so the end moves by that hold.
     return {
       ...structure,
-      stateEndsAt: currentStateEndsAt + elapsedSincePauseMs,
+      stateEndsAt: previousPauseAt > 0
+        ? currentStateEndsAt + resolveStructureRepairHoldMs(previousPauseAt, nowMs)
+        : currentStateEndsAt,
       timerPausedAt: nowMs,
     };
   }
@@ -2419,7 +2917,7 @@ function applyStructureRepairTimerForDamage(structure, beforeLayers, afterLayers
     ...structure,
     stateStartedAt: nowMs,
     stateEndsAt: nowMs + scaledTimerMs(repairSeconds, structure),
-    timerPausedAt: nowMs,
+    timerPausedAt: pausing ? nowMs : null,
   };
 }
 
@@ -2547,10 +3045,25 @@ function maybeAdvanceStructureState(structure, nowMs = Date.now()) {
         ...structure,
         state: nextState,
         stateStartedAt: nowMs,
-        stateEndsAt: nowMs + scaledTimerMs(
-          STRUCTURE_REPAIR_SECONDS_BY_STATE[nextState],
-          structure,
-        ),
+        stateEndsAt: canStructureRepairInState(structure, nextState)
+          ? nowMs + scaledTimerMs(
+            STRUCTURE_REPAIR_SECONDS_BY_STATE[nextState],
+            structure,
+          )
+          : null,
+        timerPausedAt: null,
+      },
+      changed: true,
+    };
+  }
+  if (!canStructureRepairInState(structure)) {
+    // A structure that cannot repair itself only drops a countdown left from
+    // before; it waits to be repaired by hand.
+    return {
+      structure: {
+        ...structure,
+        stateEndsAt: null,
+        timerPausedAt: null,
       },
       changed: true,
     };
@@ -2568,11 +3081,47 @@ function maybeAdvanceStructureState(structure, nowMs = Date.now()) {
   return { structure, changed: false };
 }
 
+const MOON_EXTRACTIONS_MODULE_ID = "./moonExtractionsService";
+let _moonExtractionsUnavailableWarned = false;
+let _moonExtractionsRecoveryLogged = false;
+
+// Resolve the moon extraction service for the structure tick, or null when it is
+// not usable. A resolution that does not expose tickExtractions is never memoized:
+// a circular require can hand back a partially initialised exports object, and
+// caching that would disable moon extraction for the life of the process.
+function resolveMoonExtractionsService() {
+  const resolved = lazyRequire(MOON_EXTRACTIONS_MODULE_ID);
+  if (resolved && typeof resolved.tickExtractions === "function") {
+    return resolved;
+  }
+  _lazyModuleCache.delete(MOON_EXTRACTIONS_MODULE_ID);
+  return null;
+}
+
 function tickMoonExtractions(nowMs = Date.now()) {
   try {
-    const MoonExtractionsService = lazyRequire("./moonExtractionsService");
-    if (typeof MoonExtractionsService.tickExtractions !== "function") {
+    const MoonExtractionsService = resolveMoonExtractionsService();
+    if (!MoonExtractionsService) {
+      // Warn once per process rather than once per tick. The structure tick runs
+      // ~5x/second, so an unconditional warning here drowns the log of record --
+      // but staying silent would hide a permanently dead subsystem, so the first
+      // occurrence is still reported loudly.
+      if (!_moonExtractionsUnavailableWarned) {
+        _moonExtractionsUnavailableWarned = true;
+        log.warn(
+          "[StructureState] Moon extraction subsystem UNAVAILABLE: " +
+            `${MOON_EXTRACTIONS_MODULE_ID} did not resolve to a module exposing ` +
+            "tickExtractions. Moon extraction ticks are being skipped and moon " +
+            "mining will not progress. This warning is emitted once per process.",
+        );
+      }
       return;
+    }
+    if (_moonExtractionsUnavailableWarned && !_moonExtractionsRecoveryLogged) {
+      _moonExtractionsRecoveryLogged = true;
+      log.warn(
+        "[StructureState] Moon extraction subsystem recovered; extraction ticks resumed.",
+      );
     }
     MoonExtractionsService.tickExtractions(nowMs);
   } catch (error) {
@@ -2582,6 +3131,10 @@ function tickMoonExtractions(nowMs = Date.now()) {
 
 function tickStructures(nowMs = Date.now()) {
   tickMoonExtractions(nowMs);
+  // Service modules own their fuel clocks on the fitted inventory items. Load
+  // their state lazily here because structureServiceModules itself depends on
+  // this module; a top-level import would preserve that circular dependency.
+  const structureServiceModules = lazyRequire("./structureServiceModules");
   const cache = ensureStructureCache();
   const nextRows = [];
   const pendingFuelAlerts = [];
@@ -2590,6 +3143,28 @@ function tickStructures(nowMs = Date.now()) {
   let changed = false;
   for (const structure of cache.rows) {
     let current = cloneValue(structure);
+    const onlineServiceModules = typeof structureServiceModules.listOnlineStructureServiceModules === "function"
+      ? structureServiceModules.listOnlineStructureServiceModules(current.structureID)
+      : [];
+    const hasDueServiceFuelCycle = onlineServiceModules.some((moduleItem) => {
+      const nextCycleAt = toPositiveInt(
+        moduleItem && moduleItem.moduleState && moduleItem.moduleState.serviceFuelNextCycleAt,
+        0,
+      );
+      return nextCycleAt <= 0 || nowMs >= nextCycleAt;
+    });
+    if (hasDueServiceFuelCycle && typeof structureServiceModules.syncStructureServiceModuleState === "function") {
+      const serviceSync = structureServiceModules.syncStructureServiceModuleState(
+        current.structureID,
+        { nowMs },
+      );
+      if (serviceSync && serviceSync.success === true && serviceSync.data) {
+        // syncStructureServiceModuleState persists its own service/upkeep
+        // transition. Continue this timer pass from that fresh row so a later
+        // lifecycle write cannot put the old service state back.
+        current = cloneValue(serviceSync.data);
+      }
+    }
     const flexFuelTick = structureFlexFuelRuntime.applyFlexServiceFuelCycle(
       current,
       nowMs,
@@ -2717,6 +3292,7 @@ function tickStructures(nowMs = Date.now()) {
       }
 
       removeJumpClonesForStructureLifecycle(current, "structureUnanchored");
+      moveHomeStationsForStructureLifecycle(current, "structureUnanchored");
       pendingWarHQLossStructures.push(cloneValue(current));
       changed = true;
       continue;
@@ -2725,6 +3301,22 @@ function tickStructures(nowMs = Date.now()) {
     const reinforcementTiming = maybeApplyQueuedReinforcementTiming(current, nowMs);
     current = reinforcementTiming.structure;
     changed = changed || reinforcementTiming.changed;
+    const repairPausedAt = toPositiveInt(current.timerPausedAt, 0);
+    if (
+      repairPausedAt > 0 &&
+      nowMs - repairPausedAt >= STRUCTURE_REPAIR_RESUME_DELAY_MS &&
+      STRUCTURE_VULNERABLE_STATES.has(toInt(current.state, 0)) &&
+      isStructureRepairLayerDamaged(current)
+    ) {
+      current = {
+        ...current,
+        stateEndsAt:
+          toPositiveInt(current.stateEndsAt, nowMs) +
+          resolveStructureRepairHoldMs(repairPausedAt, nowMs),
+        timerPausedAt: null,
+      };
+      changed = true;
+    }
 
     const next = maybeAdvanceStructureState(current, nowMs);
     nextRows.push(next.structure);
@@ -2803,7 +3395,7 @@ function seedStructureForSession(session, typeToken, options = {}) {
 }
 
 function startAnchoring(structureID, nowMs = Date.now(), options = {}) {
-  return updateStructureRecord(structureID, (current) => ({
+  const result = updateStructureRecord(structureID, (current) => ({
     ...current,
     state: STRUCTURE_STATE.ANCHOR_VULNERABLE,
     stateStartedAt: nowMs,
@@ -2818,6 +3410,26 @@ function startAnchoring(structureID, nowMs = Date.now(), options = {}) {
       shieldCharge: 0,
     }),
   }), options);
+  if (result && result.success === true) {
+    // A refinery or Metenox claims the moon it was deployed at. Moon mining
+    // must never block anchoring, so a failure here is logged and left for
+    // the next moon-mining read to retry.
+    try {
+      lazyRequire("./moonMiningBindingRuntime").bindStructureToDeploymentMoon(structureID, {
+        source: "anchoring",
+        emitLive: options.emitLive !== false,
+      });
+    } catch (error) {
+      log.warn(`[StructureState] moon binding after anchoring failed for ${structureID}: ${error.message}`);
+    }
+    // A Metenox is built with its drill module and its core.
+    try {
+      lazyRequire("./metenoxBuiltIns").ensureBuiltIns(structureID);
+    } catch (error) {
+      log.warn(`[StructureState] Metenox built-ins after anchoring failed for ${structureID}: ${error.message}`);
+    }
+  }
+  return result;
 }
 
 function startStructureUnanchoring(structureID, nowMs = Date.now()) {
@@ -2947,6 +3559,36 @@ function removeJumpClonesForStructureLifecycle(structure, reason, options = {}) 
     return {
       success: false,
       errorMsg: "JUMP_CLONE_CLEANUP_FAILED",
+    };
+  }
+}
+
+// A home station, where the medical clone waits, can be a structure. Retail
+// moves it to the character's school station when the structure is destroyed
+// or unanchored, so no home is left pointing at a structure that is gone.
+function moveHomeStationsForStructureLifecycle(structure, reason) {
+  const structureID = toPositiveInt(structure && structure.structureID, 0);
+  if (!structureID) {
+    return null;
+  }
+  try {
+    const {
+      moveHomeStationsOutOfStructure,
+    } = lazyRequire("../character/homeStationRuntime");
+    const result = moveHomeStationsOutOfStructure(structureID);
+    if (result && result.success === false) {
+      log.warn(
+        `[StructureState] Home station move failed structure=${structureID} reason=${reason} error=${result.errorMsg || "UNKNOWN"}`,
+      );
+    }
+    return result;
+  } catch (error) {
+    log.warn(
+      `[StructureState] Home station move threw structure=${structureID} reason=${reason} error=${error.message}`,
+    );
+    return {
+      success: false,
+      errorMsg: "HOME_STATION_MOVE_FAILED",
     };
   }
 }
@@ -3208,6 +3850,8 @@ function removeStructure(structureID, options = {}) {
 
   const writeResult = persistStructures(
     rows.filter((entry) => entry.structureID !== targetID),
+    {},
+    options,
   );
   if (!writeResult.success) {
     return writeResult;
@@ -3250,6 +3894,7 @@ function destroyStructure(structureID, options = {}) {
   let lootResult = null;
   let jumpCloneCleanupResult = null;
   let industryJobCancelResult = null;
+  let corporationOfficeRemovalResult = null;
   if (!current.destroyedAt) {
     recoveryResult = structureDockedRecoveryState.evacuateDockedCharactersFromStructure(
       current,
@@ -3285,6 +3930,11 @@ function destroyStructure(structureID, options = {}) {
     if (assetSafetyResult && !assetSafetyResult.success) {
       if (assetSafetyResult.errorMsg === "ASSET_SAFETY_DISABLED") {
         assetSafetyDisabled = true;
+      } else {
+        log.warn(
+          `[StructureState] Asset safety handoff failed for structure ${current.structureID}: ${assetSafetyResult.errorMsg}`,
+        );
+        return assetSafetyResult;
       }
       log.warn(
         `[StructureState] Asset safety handoff failed for structure ${current.structureID}: ${assetSafetyResult.errorMsg}`,
@@ -3292,19 +3942,50 @@ function destroyStructure(structureID, options = {}) {
     }
   }
   if (!current.destroyedAt) {
+    const includeStructureContents =
+      assetSafetyDisabled || options.skipAssetSafety === true;
     lootResult = structureDestructionLootState.handleStructureDestroyedLoot(
       current,
       {
         nowMs,
-        includeStructureContents: assetSafetyDisabled,
+        includeStructureContents,
         includeQuantumCore: true,
       },
     );
+    if (!lootResult || lootResult.success !== true) {
+      return lootResult || {
+        success: false,
+        errorMsg: "STRUCTURE_DESTRUCTION_LOOT_HANDOFF_FAILED",
+      };
+    }
+    if (includeStructureContents) {
+      const structureOffices =
+        lootResult.data && Array.isArray(lootResult.data.corporationOffices)
+          ? lootResult.data.corporationOffices
+          : structureAssetSafetyState.listCorporationOfficesAtStructure(
+              current.structureID,
+            );
+      corporationOfficeRemovalResult =
+        structureAssetSafetyState.removeCorporationOfficesAfterStructureDeparture(
+          current.structureID,
+          structureOffices,
+        );
+      if (
+        !corporationOfficeRemovalResult ||
+        corporationOfficeRemovalResult.success !== true
+      ) {
+        return corporationOfficeRemovalResult || {
+          success: false,
+          errorMsg: "CORPORATION_OFFICE_REMOVE_FAILED",
+        };
+      }
+    }
     jumpCloneCleanupResult = removeJumpClonesForStructureLifecycle(
       current,
       "structureDestroyed",
       options,
     );
+    moveHomeStationsForStructureLifecycle(current, "structureDestroyed");
   }
 
   const updateResult = updateStructureRecord(structureID, (currentStructure) => ({
@@ -3356,11 +4037,104 @@ function destroyStructure(structureID, options = {}) {
         industryJobCancelResult && industryJobCancelResult.success !== false
           ? industryJobCancelResult
           : null,
+      corporationOfficeRemoval:
+        corporationOfficeRemovalResult && corporationOfficeRemovalResult.success
+          ? corporationOfficeRemovalResult.data
+          : null,
     },
   };
 }
 
-function applyStructureDamageTransition(structure, damageResult, nowMs = Date.now()) {
+// Retail _CanHaveArmorReinforce and _CanHaveHullReinforce from the V24.01
+// client's packages/structures/structure.py. Abandoned structures never
+// reinforce. Flex structures skip the armor timer, Large and XL structures in
+// Low Power skip it too, and Medium structures and Insurgency FOBs never get a
+// hull timer. Flex structures in Low Power do not get one either.
+function isInsurgencyFobStructure(structure) {
+  const typeRecord = getStructureTypeByID(structure && structure.typeID);
+  return toPositiveInt(typeRecord && typeRecord.groupID, 0) === STRUCTURE_GROUP_ID.FOB;
+}
+
+function canStructureHaveArmorReinforce(structure) {
+  const upkeepState = toInt(structure && structure.upkeepState, 0);
+  const size = structure && structure.structureSize;
+  if (upkeepState === STRUCTURE_UPKEEP_STATE.ABANDONED) {
+    return false;
+  }
+  if (size === STRUCTURE_SIZE.FLEX) {
+    return false;
+  }
+  return !(size !== STRUCTURE_SIZE.MEDIUM && upkeepState === STRUCTURE_UPKEEP_STATE.LOW_POWER);
+}
+
+function canStructureHaveHullReinforce(structure) {
+  const upkeepState = toInt(structure && structure.upkeepState, 0);
+  const size = structure && structure.structureSize;
+  if (upkeepState === STRUCTURE_UPKEEP_STATE.ABANDONED) {
+    return false;
+  }
+  if (size === STRUCTURE_SIZE.FLEX && upkeepState === STRUCTURE_UPKEEP_STATE.LOW_POWER) {
+    return false;
+  }
+  if (size === STRUCTURE_SIZE.MEDIUM) {
+    return false;
+  }
+  return !isInsurgencyFobStructure(structure);
+}
+
+// Retail STATE_SHIELD_ARMOR_HULL: entering a state sets each layer to the
+// state's fixed ratio, so damage that spills past the layer that broke is
+// discarded and the hit that breaks a layer can never destroy the structure.
+const STRUCTURE_ARMOR_STAGE_CONDITION = Object.freeze({
+  damage: 0,
+  armorDamage: 0,
+  shieldCharge: 0,
+});
+const STRUCTURE_HULL_STAGE_CONDITION = Object.freeze({
+  damage: 0,
+  armorDamage: 1,
+  shieldCharge: 0,
+});
+
+function enterStructureDamageStage(structure, state, nowMs) {
+  const reinforcing =
+    state === STRUCTURE_STATE.ARMOR_REINFORCE ||
+    state === STRUCTURE_STATE.HULL_REINFORCE;
+  const armorStage =
+    state === STRUCTURE_STATE.ARMOR_REINFORCE ||
+    state === STRUCTURE_STATE.ARMOR_VULNERABLE;
+  const staged = {
+    ...structure,
+    state,
+    stateStartedAt: nowMs,
+    // A vulnerable stage starts its repair countdown at once, as retail does,
+    // unless the structure cannot repair itself.
+    stateEndsAt: reinforcing
+      ? resolveStructureReinforcementEndTime(
+        structure,
+        state === STRUCTURE_STATE.ARMOR_REINFORCE ? "armor" : "hull",
+        nowMs,
+      )
+      : canStructureRepairInState(structure, state)
+        ? nowMs + scaledTimerMs(STRUCTURE_REPAIR_SECONDS_BY_STATE[state], structure)
+        : null,
+    timerPausedAt: null,
+    conditionState: normalizeConditionState({
+      ...(armorStage ? STRUCTURE_ARMOR_STAGE_CONDITION : STRUCTURE_HULL_STAGE_CONDITION),
+      charge: structure.conditionState && structure.conditionState.charge,
+    }),
+  };
+  return {
+    structure: state === STRUCTURE_STATE.HULL_REINFORCE
+      ? offlineModuleBackedServicesForHullReinforce(staged)
+      : staged,
+    preventDestroy: true,
+    destroy: false,
+    changed: true,
+  };
+}
+
+function applyStructureDamageTransition(structure, damageResult, nowMs = Date.now(), options = {}) {
   if (!structure || !damageResult || !damageResult.success || !damageResult.data) {
     return { structure, preventDestroy: false, destroy: false, changed: false };
   }
@@ -3375,88 +4149,24 @@ function applyStructureDamageTransition(structure, damageResult, nowMs = Date.no
   const armorBroke = Number(before.armor || 0) > 0 && Number(after.armor || 0) <= 1e-9;
   const destroyed = damageResult.data.destroyed === true;
 
-  if (next.upkeepState === STRUCTURE_UPKEEP_STATE.ABANDONED) {
-    return { structure: next, preventDestroy: false, destroy: destroyed, changed: true };
-  }
-
   if (next.state === STRUCTURE_STATE.SHIELD_VULNERABLE && shieldBroke) {
-    const reinforceState =
-      next.structureSize === STRUCTURE_SIZE.MEDIUM ||
-      next.upkeepState === STRUCTURE_UPKEEP_STATE.FULL_POWER
+    return enterStructureDamageStage(
+      next,
+      canStructureHaveArmorReinforce(next)
         ? STRUCTURE_STATE.ARMOR_REINFORCE
-        : STRUCTURE_STATE.HULL_REINFORCE;
-    const reinforcedStructure = {
-      ...next,
-      state: reinforceState,
-      stateStartedAt: nowMs,
-      stateEndsAt: nowMs + scaledTimerMs(
-        reinforceState === STRUCTURE_STATE.ARMOR_REINFORCE
-          ? resolveSecurityBand(next) === "high"
-            ? STRUCTURE_TIMER_SECONDS.ARMOR_REINFORCE_HIGH
-            : next.structureSize === STRUCTURE_SIZE.MEDIUM
-            ? STRUCTURE_TIMER_SECONDS.ARMOR_REINFORCE_NULL_LOW
-            : STRUCTURE_TIMER_SECONDS.ARMOR_REINFORCE_DEFAULT
-          : resolveSecurityBand(next) === "high"
-          ? STRUCTURE_TIMER_SECONDS.HULL_REINFORCE_HIGH
-          : STRUCTURE_TIMER_SECONDS.HULL_REINFORCE_NULL_LOW,
-        next,
-      ),
-      conditionState: normalizeConditionState(
-        reinforceState === STRUCTURE_STATE.ARMOR_REINFORCE
-          ? { damage: 0, armorDamage: 0, shieldCharge: 0 }
-          : { damage: 0, armorDamage: 1, shieldCharge: 0 },
-      ),
-    };
-    return {
-      structure:
-        reinforceState === STRUCTURE_STATE.HULL_REINFORCE
-          ? offlineModuleBackedServicesForHullReinforce(reinforcedStructure)
-          : reinforcedStructure,
-      preventDestroy: true,
-      destroy: false,
-      changed: true,
-    };
+        : STRUCTURE_STATE.ARMOR_VULNERABLE,
+      nowMs,
+    );
   }
 
   if (next.state === STRUCTURE_STATE.ARMOR_VULNERABLE && armorBroke) {
-    if (
-      (next.structureSize === STRUCTURE_SIZE.LARGE || next.structureSize === STRUCTURE_SIZE.EXTRA_LARGE) &&
-      next.upkeepState === STRUCTURE_UPKEEP_STATE.FULL_POWER
-    ) {
-      const reinforcedStructure = {
-        ...next,
-        state: STRUCTURE_STATE.HULL_REINFORCE,
-        stateStartedAt: nowMs,
-        stateEndsAt: nowMs + scaledTimerMs(
-          resolveSecurityBand(next) === "high"
-            ? STRUCTURE_TIMER_SECONDS.HULL_REINFORCE_HIGH
-            : STRUCTURE_TIMER_SECONDS.HULL_REINFORCE_NULL_LOW,
-          next,
-        ),
-        conditionState: normalizeConditionState({ damage: 0, armorDamage: 1, shieldCharge: 0 }),
-      };
-      return {
-        structure: offlineModuleBackedServicesForHullReinforce(reinforcedStructure),
-        preventDestroy: true,
-        destroy: false,
-        changed: true,
-      };
-    }
-
-    return {
-      structure: {
-        ...next,
-        state: STRUCTURE_STATE.HULL_VULNERABLE,
-        stateStartedAt: nowMs,
-        stateEndsAt: nowMs + scaledTimerMs(
-          STRUCTURE_REPAIR_SECONDS_BY_STATE[STRUCTURE_STATE.HULL_VULNERABLE],
-          next,
-        ),
-      },
-      preventDestroy: false,
-      destroy: destroyed,
-      changed: true,
-    };
+    return enterStructureDamageStage(
+      next,
+      canStructureHaveHullReinforce(next)
+        ? STRUCTURE_STATE.HULL_REINFORCE
+        : STRUCTURE_STATE.HULL_VULNERABLE,
+      nowMs,
+    );
   }
 
   const repairTimedStructure = applyStructureRepairTimerForDamage(
@@ -3464,6 +4174,7 @@ function applyStructureDamageTransition(structure, damageResult, nowMs = Date.no
     before,
     after,
     nowMs,
+    options,
   );
   return {
     structure: repairTimedStructure,
@@ -3485,7 +4196,7 @@ function applyRuntimeStructureDamage(structureID, damageResult, nowMs = Date.now
     options.lifecycleNowMs,
     Date.now(),
   );
-  const transition = applyStructureDamageTransition(structure, damageResult, nowMs);
+  const transition = applyStructureDamageTransition(structure, damageResult, nowMs, options);
   const underAttackNotification = shouldNotifyStructureUnderAttack(
     structure,
     transition && transition.structure,
@@ -3496,10 +4207,15 @@ function applyRuntimeStructureDamage(structureID, damageResult, nowMs = Date.now
   if (underAttackNotification && transition && transition.structure) {
     transition.structure = {
       ...transition.structure,
-      devFlags: {
-        ...(transition.structure.devFlags || {}),
-        underAttackNotificationActiveUntilMs: underAttackNotification.activeUntilMs,
-      },
+      devFlags: underAttackNotification.activeUntilMs === null
+        ? {
+          ...(transition.structure.devFlags || {}),
+          underAttackNotifiedStageStartedAt: underAttackNotification.notifiedStageStartedAt,
+        }
+        : {
+          ...(transition.structure.devFlags || {}),
+          underAttackNotificationActiveUntilMs: underAttackNotification.activeUntilMs,
+        },
     };
   }
   const enteringHullReinforce =
@@ -3560,6 +4276,78 @@ function applyRuntimeStructureDamage(structureID, damageResult, nowMs = Date.now
       offlinedModuleIDs: offlinedModules.offlinedModuleIDs || [],
       moduleChanges: offlinedModules.changes || [],
       industryJobSync,
+    },
+  };
+}
+
+// Retail UpdateState for a structure repaired by hand. An armor stage returns
+// to shield vulnerable once nothing is damaged, and a hull stage once the
+// shield or the armor is whole. Shield vulnerable restores every layer.
+function applyStructureRepairTransition(structure, nowMs) {
+  const state = toInt(structure && structure.state, 0);
+  const condition = normalizeConditionState(structure && structure.conditionState);
+  const shieldWhole = condition.shieldCharge >= STRUCTURE_ALMOST_MAX_SHIELD_LEVEL;
+  const armorWhole = condition.armorDamage <= 0;
+  const hullWhole = condition.damage <= 0;
+  const healed =
+    (state === STRUCTURE_STATE.ARMOR_VULNERABLE && shieldWhole && armorWhole && hullWhole) ||
+    (state === STRUCTURE_STATE.HULL_VULNERABLE && (shieldWhole || armorWhole));
+  if (!healed) {
+    return structure;
+  }
+  return {
+    ...repairStructureState(structure),
+    stateStartedAt: nowMs,
+    stateEndsAt: null,
+    timerPausedAt: null,
+  };
+}
+
+// Remote repair that landed on a structure's space entity. A reinforced
+// structure keeps its layers, since entering the next stage would reset them
+// anyway.
+function applyRuntimeStructureRepair(structureID, conditionState, nowMs = Date.now()) {
+  const structure = getStructureByID(structureID, { refresh: false });
+  if (!structure) {
+    return {
+      success: false,
+      errorMsg: "STRUCTURE_NOT_FOUND",
+    };
+  }
+  const state = toInt(structure.state, 0);
+  if (
+    state === STRUCTURE_STATE.ARMOR_REINFORCE ||
+    state === STRUCTURE_STATE.HULL_REINFORCE
+  ) {
+    return {
+      success: true,
+      data: {
+        structure,
+        changed: false,
+      },
+    };
+  }
+  const repaired = applyStructureRepairTransition(
+    normalizeStructureRecord({
+      ...structure,
+      conditionState: normalizeConditionState({
+        ...(structure.conditionState || {}),
+        shieldCharge: conditionState && conditionState.shieldCharge,
+        armorDamage: conditionState && conditionState.armorDamage,
+        damage: conditionState && conditionState.damage,
+      }),
+    }),
+    nowMs,
+  );
+  const updateResult = updateStructureRecord(structureID, () => repaired, { nowMs });
+  if (!updateResult.success) {
+    return updateResult;
+  }
+  return {
+    success: true,
+    data: {
+      structure: updateResult.data,
+      changed: true,
     },
   };
 }
@@ -3797,8 +4585,10 @@ Object.assign(module.exports, {
   countCharactersDockedInStructure,
   clearStructureCaches,
   createStructure,
+  bindStructureToMoon,
   upsertStructureRecord,
   updateStructureRecord,
+  incrementStructureLiquidOzoneIdempotent,
   seedStructureForSession,
   startAnchoring,
   startStructureUnanchoring,
@@ -3826,6 +4616,9 @@ Object.assign(module.exports, {
   hasStructureOneWayUndockRestriction,
   applyAdminStructureDamage,
   applyRuntimeStructureDamage,
+  applyRuntimeStructureRepair,
+  canStructureAutoRepair,
+  resolveStructureLayerDamageLimits,
   resolveStructureRepairingValue,
   tickStructures,
   getStructureServices,
@@ -3848,3 +4641,7 @@ Object.assign(module.exports, {
     awaitPendingMarketOrderCancellationTasksForTests,
   },
 });
+
+// worldData reads structures through this, without requiring this module. It reads the
+// functions off these exports at call time, as a require of this module did.
+require(path.join(__dirname, "./loadedStructureState")).setLoadedStructureState(module.exports);

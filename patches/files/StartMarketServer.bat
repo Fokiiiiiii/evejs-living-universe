@@ -13,8 +13,6 @@ set "VSWHERE_EXE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.e
 set "VS_INSTALL_PATH="
 set "VCVARS64_BAT="
 set "EVEJS_STDARG_HEADER="
-set "EVEJS_NONINTERACTIVE=0"
-if not "%~1"=="" set "EVEJS_NONINTERACTIVE=1"
 
 if not exist "%MARKET_SERVER_DIR%\Cargo.toml" (
   echo.
@@ -31,11 +29,6 @@ call :ResolveCargo
 if errorlevel 1 exit /b 1
 call :InitializeMsvcBuildEnvironment
 if errorlevel 1 exit /b 1
-
-if /i "%~1"=="serve-release" goto StartRelease
-if /i "%~1"=="serve-debug" goto StartDebug
-if /i "%~1"=="doctor" goto Doctor
-if /i "%~1"=="build-release" goto BuildRelease
 
 echo.
 echo   ============================================================
@@ -123,7 +116,7 @@ exit /b 0
 if not "%EVEJS_EXIT%"=="0" (
   echo.
   echo   Market server command exited with code %EVEJS_EXIT%.
-  if "%EVEJS_NONINTERACTIVE%"=="0" pause
+  pause
 )
 exit /b %EVEJS_EXIT%
 

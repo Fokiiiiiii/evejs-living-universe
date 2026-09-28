@@ -1,4 +1,14 @@
+"use strict";
+
+const {
+  cloneValue,
+} = require("../../common/clone");
+const {
+  toFiniteNumber,
+} = require("../../common/numbers");
+
 const path = require("path");
+const log = require(path.join(__dirname, "../../utils/logger"));
 
 const config = require(path.join(__dirname, "../../config"));
 // Phase 0 / 0.C: mining runtime state via an ownership-scoped repository.
@@ -100,11 +110,6 @@ function toInt(value, fallback = 0) {
   return Number.isFinite(numeric) ? Math.trunc(numeric) : fallback;
 }
 
-function toFiniteNumber(value, fallback = 0) {
-  const numeric = Number(value);
-  return Number.isFinite(numeric) ? numeric : fallback;
-}
-
 function normalizeText(value, fallback = "") {
   const normalized = String(value == null ? "" : value).trim();
   return normalized || fallback;
@@ -119,10 +124,6 @@ function buildMarshalDict(entries = []) {
     type: "dict",
     entries,
   };
-}
-
-function cloneValue(value) {
-  return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
 }
 
 function clamp(value, minimum, maximum) {
@@ -500,6 +501,7 @@ function applyYieldPresentationToEntity(entity, state, summary = null) {
               radius: state.originalRadius || entity.radius,
             });
           } catch (_error) {
+            // ignored: no visual presentation for this ore; the rock keeps its default look (null)
             return null;
           }
         })()
@@ -602,6 +604,23 @@ function shouldPersistMineableState(entity) {
     entity.dungeonSiteContentMissionObjectiveTarget === true ||
     toInt(entity.dungeonSiteInstanceID, 0) > 0
   );
+}
+
+// A rock a dungeon placed keeps no mining row. Its quantities travel on the rock
+// itself: set from the site's record when the site materializes, and kept
+// current as it is mined. A rebuilt cache reads them back from there.
+function readDungeonRockQuantities(entity) {
+  if (!entity || shouldPersistMineableState(entity)) {
+    return null;
+  }
+  const originalQuantity = toInt(entity.miningOriginalQuantity, 0);
+  if (originalQuantity <= 0) {
+    return null;
+  }
+  const remainingQuantity = entity.miningRemainingQuantity === null
+    ? originalQuantity
+    : toInt(entity.miningRemainingQuantity, originalQuantity);
+  return { originalQuantity, remainingQuantity };
 }
 
 function isGeneratedIceMineableEntity(entity) {
@@ -799,6 +818,10 @@ function buildMineableState(scene, entity, persistedState = null) {
   )
     ? rawPersistedState
     : null;
+  // Without the rock's own quantities a rebuilt cache sized a dungeon rock from
+  // its model radius and set it full, so any player entering an ice system
+  // refilled every half-mined chunk.
+  const quantitySource = normalizedPersistedState || readDungeonRockQuantities(entity);
 
   const originalRadius = Math.max(
     1,
@@ -812,16 +835,16 @@ function buildMineableState(scene, entity, persistedState = null) {
   const originalQuantity = Math.max(
     1,
     toInt(
-      normalizedPersistedState
-        ? normalizedPersistedState.originalQuantity
+      quantitySource
+        ? quantitySource.originalQuantity
         : undefined,
       estimatedOriginalQuantity,
     ),
   );
   const remainingQuantity = clamp(
     toInt(
-      normalizedPersistedState
-        ? normalizedPersistedState.remainingQuantity
+      quantitySource
+        ? quantitySource.remainingQuantity
         : undefined,
       originalQuantity,
     ),
@@ -948,6 +971,8 @@ function updateMineableState(scene, entity, nextState, options = {}) {
         cache.persistedByEntityID[String(normalizedState.entityID)] || null,
       persistBaseline: true,
     });
+  } else if (readDungeonRockQuantities(entity)) {
+    entity.miningRemainingQuantity = normalizedState.remainingQuantity;
   }
   cache.byEntityID.set(normalizedState.entityID, normalizedState);
 
@@ -973,8 +998,9 @@ function updateMineableState(scene, entity, nextState, options = {}) {
           excludeDroneID: options.sourceDroneID,
         });
       }
-    } catch (_) {
+    } catch (error) {
       // Drone runtime may be unavailable during isolated mining-state tests.
+      log.debug(`[Mining] idling the drones that target mineable ${normalizedState.entityID} failed: ${error && error.message}`);
     }
     if (
       typeof scene.removeStaticEntity === "function" &&
@@ -1079,11 +1105,19 @@ function notifyOreMined(scene, entity, previousState, deltaData, options = {}) {
     0,
     toInt(options.amountWasted, toInt(options.wastedQuantity, 0)),
   );
+  // `quantity_removed` is the yield alone, not everything the cycle took off the
+  // rock: the client subtracts `quantity_removed + amountWasted` from the
+  // quantity its survey scan seeded (asteroid_scanning_service.on_ore_mined),
+  // and logs the two as separate lines. Sending the depleted total here counts
+  // the residue twice, so the bracket empties ahead of the rock and then runs
+  // negative — by exactly the residue mined so far — until the next scan
+  // reseeds it. depletedQuantity is normal + wasted by construction in
+  // applyMiningDelta, so subtracting the residue back out leaves the yield.
   const quantityRemoved = Math.max(
     0,
     toInt(
       options.quantityRemoved,
-      toInt(deltaData && deltaData.depletedQuantity, 0),
+      toInt(deltaData && deltaData.depletedQuantity, 0) - amountWasted,
     ),
   );
   if (quantityAdded <= 0 && quantityRemoved <= 0 && amountWasted <= 0) {
@@ -1135,6 +1169,58 @@ function notifyOreMined(scene, entity, previousState, deltaData, options = {}) {
 
   session.sendNotification("OnOreMined", "charid", [payload]);
   return true;
+}
+
+// `OnOreMined` is addressed to the pilot who ran the cycle, so every other client
+// watching the rock keeps the quantity its own survey scan seeded and never sees
+// it fall. `asteroid_scanning_service.on_ore_mined_by_other` decrements the same
+// table from `OnOreMinedByOther(asteroid_id, quantity)` — two positional
+// arguments, not a dict, and `quantity` is the whole amount taken off the rock
+// rather than the yield/residue split `OnOreMined` carries. The client dispatches
+// it by name through `OreMinedNotificationAdapter.__notifyevents__`, so this is a
+// broadcast send and not a service call.
+//
+// Bubble is the exact visibility bound: an asteroid registers with
+// `staticVisibilityScope: "bubble"`, and a bubble-scoped static entity is shown
+// only to sessions whose ego shares its `bubbleID`. A rock with no bubble is
+// visible to nobody, so there is nothing to fan out to.
+function notifyOreMinedByOther(scene, entity, deltaData, options = {}) {
+  if (options.notifyOreMined === false) {
+    return 0;
+  }
+  if (!scene || typeof scene.getSessionsInBubble !== "function") {
+    return 0;
+  }
+
+  const quantity = Math.max(0, toInt(deltaData && deltaData.depletedQuantity, 0));
+  if (quantity <= 0) {
+    return 0;
+  }
+
+  const asteroidID = toInt(entity && entity.itemID, 0);
+  const bubbleID = toInt(entity && entity.bubbleID, 0);
+  if (asteroidID <= 0 || bubbleID <= 0) {
+    return 0;
+  }
+
+  // Skip the miner's own session: it already subtracted this cycle from
+  // `OnOreMined`, and a second decrement here would double-count it.
+  const minerSession = resolveOreMinedSession(options);
+  let delivered = 0;
+  for (const session of scene.getSessionsInBubble(bubbleID)) {
+    if (!session || session === minerSession) {
+      continue;
+    }
+    if (typeof session.sendNotification !== "function") {
+      continue;
+    }
+    session.sendNotification("OnOreMinedByOther", "charid", [
+      asteroidID,
+      quantity,
+    ]);
+    delivered += 1;
+  }
+  return delivered;
 }
 
 function getDungeonRuntimeModule() {
@@ -1239,8 +1325,9 @@ function idleDronesTargetingMineable(scene, entityID, options = {}) {
         excludeDroneID: options.sourceDroneID,
       });
     }
-  } catch (_) {
+  } catch (error) {
     // Drone runtime may be unavailable during isolated mining-state tests.
+    log.debug(`[Mining] idling the drones that target mineable ${entityID} failed: ${error && error.message}`);
   }
 }
 
@@ -1293,8 +1380,9 @@ function notifyGeneratedMiningAnomalyDelta(scene) {
       });
       return true;
     }
-  } catch (_) {
+  } catch (error) {
     // Scan manager is not required in isolated mining-state tests.
+    log.debug(`[Mining] anomaly update for system ${systemID} failed: ${error && error.message}`);
   }
   return false;
 }
@@ -1405,6 +1493,55 @@ function syncGeneratedMiningInstanceAfterDelta(scene, entity, nextState, options
   return completeGeneratedIceSite(scene, entity, instance, members, options);
 }
 
+// A rock a dungeon placed keeps no mining row, so what is left in it has to live on its site.
+// Without that record, loading the site again (a warp back, a disposed scene, a restart) rebuilt a
+// mined rock at full ore from the template. Every mining cycle that changes a rock is saved. A save
+// rewrites the dungeon table's cache and, for a universe site, makes the site scheduler rescan every
+// site: about 0.8 ms with 100 site records, 1.2 ms with 200 and 11.5 ms with 563.
+// Generated ice keeps its own record, above.
+function recordDungeonRockRemainder(entity, nextState, options = {}) {
+  if (
+    !entity ||
+    entity.dungeonMaterializedMiningRock !== true ||
+    isGeneratedIceMineableEntity(entity)
+  ) {
+    return false;
+  }
+  const instanceID = toInt(entity.dungeonSiteInstanceID, 0);
+  const entityID = toInt(entity.itemID, 0);
+  if (instanceID <= 0 || entityID <= 0) {
+    return false;
+  }
+  const dungeonRuntime = getDungeonRuntimeModule();
+  const instance = dungeonRuntime.getInstance(instanceID);
+  if (!instance) {
+    return false;
+  }
+  const remainingQuantity = Math.max(0, toInt(nextState && nextState.remainingQuantity, 0));
+  const recorded =
+    instance.spawnState &&
+    instance.spawnState.miningRockRemainingByID &&
+    typeof instance.spawnState.miningRockRemainingByID === "object"
+      ? instance.spawnState.miningRockRemainingByID
+      : {};
+  if (toInt(recorded[String(entityID)], -1) === remainingQuantity) {
+    return false;
+  }
+  try {
+    dungeonRuntime.mergeSpawnState(instanceID, {
+      miningRockRemainingByID: {
+        ...recorded,
+        [String(entityID)]: remainingQuantity,
+      },
+    }, { nowMs: options.nowMs });
+  } catch (error) {
+    // Recording is best-effort; a failed write must not stop the mining cycle that caused it.
+    log.debug(`[Mining] saving the ore left in rock ${entityID} of site ${instanceID} failed: ${error && error.message}`);
+    return false;
+  }
+  return true;
+}
+
 function applyMiningDelta(scene, entity, minedQuantity, wastedQuantity, options = {}) {
   const currentState = getMineableState(scene, entity && entity.itemID);
   if (!currentState) {
@@ -1445,7 +1582,16 @@ function applyMiningDelta(scene, entity, minedQuantity, wastedQuantity, options 
   if (generatedMiningSite) {
     deltaData.generatedMiningSite = generatedMiningSite;
   }
+  recordDungeonRockRemainder(entity, nextState, options);
   notifyOreMined(scene, entity, currentState, deltaData, {
+    ...options,
+    wastedQuantity,
+  });
+  // Deliberately not gated on the send above. `notifyOreMined` bails when no
+  // player session resolves, which is the case for a native NPC mining
+  // operation — but the rock still depletes and every pilot who scanned it
+  // still needs to be told.
+  notifyOreMinedByOther(scene, entity, deltaData, {
     ...options,
     wastedQuantity,
   });

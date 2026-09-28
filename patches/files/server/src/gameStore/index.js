@@ -1,3 +1,5 @@
+"use strict";
+
 /**
  * DATABASE CONTROLLER:
  * In-memory cached database layer.
@@ -11,6 +13,7 @@
  * consumer in the codebase works without modification.
  */
 
+const crypto = require("node:crypto");
 const path = require("path");
 const fs = require("fs");
 const { isDeepStrictEqual } = require("util");
@@ -19,7 +22,13 @@ const pc = require("picocolors");
 const log = require("../utils/logger");
 const sqliteStore = require("./sqliteStore");
 const persistenceWorker = require("./persistenceWorker");
+const persistenceLeasePolicy = require("./persistenceLeasePolicy");
+const persistenceRoles = require("./persistenceRoles");
 const storePaths = require("./storeRoot");
+const {
+  stageFileAtomicSync,
+  stageFileCopyAtomicSync,
+} = require("../services/_shared/atomicFilePublication");
 
 // ── Config ──────────────────────────────────────────────────────────
 // Path resolution lives in ./storeRoot so non-database consumers (the runtime
@@ -29,8 +38,14 @@ const SOURCE_DATA_DIR = storePaths.SOURCE_DATA_DIR;
 const LOCAL_DATABASE_ROOT = storePaths.LOCAL_DATABASE_ROOT;
 const TEST_STORE_ATTESTATION_FILE = ".evejs-test-store-attestation.json";
 const CANONICAL_TEST_COMMAND = "npm run test:isolated -- server/tests/<file>.test.js";
-const TEST_STORE_CLEANUP_SYMBOL = Symbol.for("evejs.testStore.cleanupHooksInstalled");
 const TEST_STORE_CLEANUP_IN_PROGRESS_SYMBOL = Symbol.for("evejs.testStore.cleanupInProgress");
+const PROCESS_ROLE = persistenceRoles.configuredRole();
+const OWNS_PERSISTENCE = PROCESS_ROLE !== persistenceRoles.ROLE.READER;
+const PRODUCTION_OWNER_ROLES = new Set([
+  persistenceRoles.ROLE.WORLD,
+  persistenceRoles.ROLE.WALLET,
+  persistenceRoles.ROLE.SCHEDULER,
+]);
 
 function realpathExisting(filePath) {
   const resolved = path.resolve(filePath);
@@ -133,6 +148,7 @@ function verifyNodeTestStoreAttestation() {
     return !protectedGameStoreRoots(attestation).some((protectedRoot) =>
       pathsOverlap(storeRealpath, protectedRoot) || isSubpath(dataRealpath, realpathExisting(protectedRoot)));
   } catch (_) {
+    // ignored: an attestation that cannot be checked does not mark a test store (fail closed)
     return false;
   }
 }
@@ -156,18 +172,20 @@ function resolveDataDir() {
 }
 
 const DATA_DIR = resolveDataDir();
+if (
+  PROCESS_ROLE === persistenceRoles.ROLE.STANDALONE &&
+  !verifyNodeTestStoreAttestation()
+) {
+  const error = new Error(
+    "GameStore standalone ownership is restricted to an attested isolated test store; use maintenance for an explicit offline writer",
+  );
+  error.code = "GAMESTORE_STANDALONE_REQUIRES_ISOLATION";
+  throw error;
+}
 const FLUSH_DELAY_MS = 2000; // debounce: flush 2s after last write
-// A small number of transaction-oriented domains coordinate their own
-// durability barriers. Their writes still become dirty immediately, but an
-// ordinary debounce must not bypass the domain's source-before-sink ordering.
-const manualFlushTables = new Set();
-const tableFlushPrerequisites = new Map();
-const activeTableFlushPrerequisites = new Set();
 const RECOVERABLE_EMPTY_TABLES = new Set([
+  "crimewatchRuntime",
   "npcRuntimeState",
-  "liveEventRuntime",
-  "industrialHirelingContracts",
-  "xEveRuntime",
   "npcControlState",
   "npcEntities",
   "npcModules",
@@ -179,6 +197,7 @@ const RECOVERABLE_EMPTY_TABLES = new Set([
   "probeRuntimeState",
   "dungeonRuntimeState",
   "missionRuntimeState",
+  "researchRuntimeState",
   "planetRuntimeState",
   "planetOrbitalState",
 ]);
@@ -243,15 +262,32 @@ const SQLITE_TABLES = new Set([
   "characterExpertSystems",
   "characterNotes",
   "corpSkillPlans",
+  "contrabandPenalties",
+  "crimewatchRuntime",
+  "contractSettlements",
+  "reprocessingSettlements",
+  "missionRewardSettlements",
+  "planetaryCustomsSettlements",
+  "corporationLiquidations",
+  "corporationFoundings",
+  "allianceFoundings",
+  "allianceDepartures",
   "corporationVotes",
+  "achievements",
   "dailyGoals",
   "evermarkEntitlements",
+  "evermarkPurchases",
+  "lpStorePurchases",
   "industryFacilityState",
+  "industryInstallSettlements",
+  "jumpCloneActivationSettlements",
+  "jumpBridgeSettlements",
   "industryJobs",
   "lpWallets",
   "marketRuntime",
   "miningLedger",
   "newEdenStore",
+  "newEdenStorePurchaseSettlements",
   "newEdenStoreRuntime",
   "npcControlState",
   "npcRuntimeState",
@@ -259,9 +295,14 @@ const SQLITE_TABLES = new Set([
   "pendingNpcBounties",
   "probeRuntimeState",
   "reprocessingFacilityState",
+  "repairOperations",
   "sharedBookmarkFolders",
   "shipLogoFittings",
+  "scheduledJobs",
   "structureAssetSafety",
+  "structureDeliveryRuntime",
+  "tradeRuntime",
+  "walletAuthorityState",
   // Fourth wave: tables that appear in persistence-style tests (verified the
   // tests seed via data.json fixtures / assert via the service, not by reading
   // the file back, so auto-seed keeps them green).
@@ -276,6 +317,7 @@ const SQLITE_TABLES = new Set([
   "dungeonRuntimeState",
   "miningRuntimeState",
   "missionRuntimeState",
+  "researchRuntimeState",
   // Final pair: accountLoginPersistenceParity now proves persistence by reading
   // the SQLite row back instead of the legacy data.json file.
   "accounts",
@@ -301,31 +343,343 @@ const SQLITE_TABLES = new Set([
   "liveEventRuntime",
   "livingEconomyEventJournal",
   "xEveRuntime",
+  "abyssalFilamentCompensations",
+  "abyssalRecoveryTombstones",
+  "jumpCloneInstallSettlements",
+  // Moon ore fields left by fractured moon chunks, one row per field.
+  "moonMiningFields",
 ]);
 const SQLITE_DB_PATH = path.resolve(DATA_DIR, "..", "gamestore.sqlite");
+const PERSISTENCE_OWNER_LEASE_MS = persistenceLeasePolicy.configuredLeaseMs(
+  process.env.EVEJS_PERSISTENCE_OWNER_LEASE_MS,
+);
+const PERSISTENCE_OWNER_ACQUIRE_WAIT_MS =
+  persistenceLeasePolicy.configuredAcquisitionWaitMs(
+    process.env.EVEJS_PERSISTENCE_OWNER_ACQUIRE_WAIT_MS,
+    PERSISTENCE_OWNER_LEASE_MS,
+  );
+const PERSISTENCE_OWNER_RENEW_MS = Math.max(
+  1_000,
+  Math.floor(PERSISTENCE_OWNER_LEASE_MS / 3),
+);
+// Only supervised production roles need an identity that survives an ordered
+// child restart. Offline maintenance and isolated standalone processes must
+// never collapse into one owner merely because a shell exported a static ID.
+const PERSISTENCE_OWNER_INSTANCE = String(
+  PRODUCTION_OWNER_ROLES.has(PROCESS_ROLE)
+    ? process.env.EVEJS_GAMESTORE_OWNER_INSTANCE ||
+      `${PROCESS_ROLE}:${process.pid}:${crypto.randomUUID()}`
+    : `${PROCESS_ROLE}:${process.pid}:${crypto.randomUUID()}`,
+);
 let sqliteRecoveryRequired = true;
 let persistenceCallbacksReady = false;
-function ensureSqliteReady() {
-  if (SQLITE_TABLES.size > 0 && sqliteStore.getDatabasePath() !== SQLITE_DB_PATH) {
-    sqliteStore.init(SQLITE_DB_PATH);
-    sqliteRecoveryRequired = true;
+let persistenceOwnerFence = null;
+let persistenceOwnerRenewTimer = null;
+let persistenceOwnerFailure = null;
+const persistenceOwnerLostListeners = new Set();
+
+if (OWNS_PERSISTENCE) {
+  persistenceWorker.configureOwner({
+    role: PROCESS_ROLE,
+    instanceId: PERSISTENCE_OWNER_INSTANCE,
+  });
+}
+
+function stopPersistenceOwnerRenewal() {
+  if (persistenceOwnerRenewTimer) {
+    clearInterval(persistenceOwnerRenewTimer);
+    persistenceOwnerRenewTimer = null;
   }
+}
+
+function persistenceOwnerError(error, fallbackCode) {
+  const normalized = error instanceof Error
+    ? error
+    : new Error(String(error || "persistence owner failure"));
+  if (!normalized.code && fallbackCode) normalized.code = fallbackCode;
+  return normalized;
+}
+
+function failPersistenceOwner(error) {
+  if (persistenceOwnerFailure) return;
+  persistenceOwnerFailure = persistenceOwnerError(
+    error,
+    "PERSISTENCE_OWNER_LEASE_LOST",
+  );
+  dbErr(
+    `persistence owner lease lost for ${PROCESS_ROLE}: ` +
+      `${persistenceOwnerFailure.message}`,
+  );
+
+  // A fenced authority must not continue accepting state-changing traffic.
+  // The process entry point decides what that means for the process: the
+  // production owners shut down and exit 1 (ownerProcessShutdown.js); test
+  // and maintenance processes surface the stored error to their next mutation.
+  const failure = persistenceOwnerFailure;
+  setImmediate(() => {
+    for (const listener of persistenceOwnerLostListeners) {
+      try {
+        listener(failure);
+      } catch (listenerError) {
+        dbWarn(`persistence owner loss listener failed: ${listenerError.message}`);
+      }
+    }
+  });
+}
+
+// Subscribes to the loss of this process's persistence owner lease. A listener
+// added after the loss is told at once. Returns an unsubscribe function.
+function onPersistenceOwnerLost(listener) {
+  if (typeof listener !== "function") {
+    throw new TypeError("onPersistenceOwnerLost requires a function");
+  }
+  persistenceOwnerLostListeners.add(listener);
+  if (persistenceOwnerFailure) {
+    const failure = persistenceOwnerFailure;
+    setImmediate(() => {
+      if (persistenceOwnerLostListeners.has(listener)) listener(failure);
+    });
+  }
+  return () => persistenceOwnerLostListeners.delete(listener);
+}
+
+function renewPersistenceOwnerLeaseNow() {
+  assertPersistenceOwnerHealthy();
+  if (!OWNS_PERSISTENCE || !persistenceOwnerFence) {
+    throw persistenceOwnerError(
+      `persistence owner ${PROCESS_ROLE} has no acquired lease to renew`,
+      "PERSISTENCE_OWNER_FENCE_REQUIRED",
+    );
+  }
+  try {
+    persistenceOwnerFence = persistenceWorker.renewOwner(SQLITE_DB_PATH, {
+      leaseMs: PERSISTENCE_OWNER_LEASE_MS,
+    });
+  } catch (error) {
+    if (error && error.code === "PERSISTENCE_OWNER_STALE") {
+      failPersistenceOwner(error);
+      throw persistenceOwnerFailure;
+    }
+    throw error;
+  }
+  if (!persistenceOwnerFence) {
+    throw persistenceOwnerError(
+      `persistence owner ${PROCESS_ROLE} renewal returned no fence`,
+      "PERSISTENCE_OWNER_RENEW_FAILED",
+    );
+  }
+  return { ...persistenceOwnerFence };
+}
+
+function renewPersistenceOwnerLease() {
+  if (!persistenceOwnerFence || persistenceOwnerFailure) return;
+  try {
+    renewPersistenceOwnerLeaseNow();
+  } catch (error) {
+    const leaseExpiresAt = Number(
+      persistenceOwnerFence && persistenceOwnerFence.leaseExpiresAt,
+    );
+    if (
+      error &&
+      error.code !== "PERSISTENCE_OWNER_STALE" &&
+      Number.isFinite(leaseExpiresAt) &&
+      Date.now() < leaseExpiresAt
+    ) {
+      dbWarn(
+        `persistence owner lease renewal deferred for ${PROCESS_ROLE}: ` +
+          `${error.message}`,
+      );
+      return;
+    }
+    failPersistenceOwner(error);
+  }
+}
+
+function startPersistenceOwnerRenewal() {
+  if (persistenceOwnerRenewTimer || !persistenceOwnerFence) return;
+  persistenceOwnerRenewTimer = setInterval(
+    renewPersistenceOwnerLease,
+    PERSISTENCE_OWNER_RENEW_MS,
+  );
+  if (typeof persistenceOwnerRenewTimer.unref === "function") {
+    persistenceOwnerRenewTimer.unref();
+  }
+}
+
+// Long synchronous startup/shutdown loops prevent the interval above from
+// running. Refresh near expiry at explicit table boundaries so a healthy owner
+// does not self-fence merely because JavaScript could not service the timer.
+function renewPersistenceOwnerLeaseAtBoundary() {
+  if (!persistenceOwnerFence) return null;
+  assertPersistenceOwnerHealthy();
+  persistenceOwnerFence = persistenceWorker.getOwnerFence() || persistenceOwnerFence;
+  const leaseExpiresAt = Number(persistenceOwnerFence.leaseExpiresAt);
+  if (
+    Number.isFinite(leaseExpiresAt) &&
+    leaseExpiresAt - Date.now() <= PERSISTENCE_OWNER_RENEW_MS
+  ) {
+    return renewPersistenceOwnerLeaseNow();
+  }
+  return { ...persistenceOwnerFence };
+}
+
+function persistenceOwnerAcquireOptions() {
+  return {
+    leaseMs: PERSISTENCE_OWNER_LEASE_MS,
+    waitForAvailableMs: PRODUCTION_OWNER_ROLES.has(PROCESS_ROLE)
+      ? PERSISTENCE_OWNER_ACQUIRE_WAIT_MS
+      : 0,
+    // Standalone is available only for attested isolated tests. Those tests
+    // deliberately simulate hard process loss and need immediate disposable
+    // takeover; production roles always respect the durable lease.
+    forceTakeover: PROCESS_ROLE === persistenceRoles.ROLE.STANDALONE,
+    adoptLegacyTables: persistenceRoles.tablesOwnedByRole(
+      PROCESS_ROLE,
+      SQLITE_TABLES,
+    ),
+  };
+}
+
+function acquirePersistenceOwner(options = {}) {
+  if (!OWNS_PERSISTENCE) return null;
+  if (persistenceOwnerFailure) throw persistenceOwnerFailure;
+  if (persistenceOwnerFence) {
+    assertPersistenceOwnerHealthy();
+    if (options.validateDurable !== true) return persistenceOwnerFence;
+  }
+
+  const firstAcquisition = !persistenceOwnerFence;
+  persistenceOwnerFence = persistenceWorker.acquireOwner(
+    SQLITE_DB_PATH,
+    persistenceOwnerAcquireOptions(),
+  );
+  if (PRODUCTION_OWNER_ROLES.has(PROCESS_ROLE)) {
+    persistenceOwnerFence = persistenceWorker.startOwnerLease(
+      SQLITE_DB_PATH,
+      {
+        leaseMs: PERSISTENCE_OWNER_LEASE_MS,
+        renewMs: PERSISTENCE_OWNER_RENEW_MS,
+      },
+    );
+  }
+  startPersistenceOwnerRenewal();
+  if (firstAcquisition) {
+    dbLog(
+      `acquired persistence owner ${PROCESS_ROLE} epoch=${persistenceOwnerFence.epoch} ` +
+        `instance=${PERSISTENCE_OWNER_INSTANCE} leaseMs=${PERSISTENCE_OWNER_LEASE_MS}`,
+    );
+  }
+  return persistenceOwnerFence;
+}
+
+function requirePersistenceOwnerFence() {
+  assertPersistenceOwnerHealthy();
+  const fence = persistenceWorker.getOwnerFence();
+  if (!fence) {
+    throw persistenceOwnerError(
+      `persistence owner ${PROCESS_ROLE} has not been acquired`,
+      "PERSISTENCE_OWNER_FENCE_REQUIRED",
+    );
+  }
+  return fence;
+}
+
+function assertPersistenceOwnerHealthy() {
+  if (persistenceOwnerFailure) throw persistenceOwnerFailure;
+  const ownerError = persistenceWorker.getOwnerError();
+  if (ownerError) {
+    failPersistenceOwner(ownerError);
+    throw persistenceOwnerFailure;
+  }
+  const fence = persistenceWorker.getOwnerFence();
+  const leaseExpiresAt = Number(fence && fence.leaseExpiresAt);
+  if (
+    fence &&
+    Number.isFinite(leaseExpiresAt) &&
+    Date.now() >= leaseExpiresAt
+  ) {
+    const error = persistenceOwnerError(
+      new Error(
+        `persistence owner ${PROCESS_ROLE} epoch ${fence.epoch} lease expired`,
+      ),
+      "PERSISTENCE_OWNER_STALE",
+    );
+    error.ownerRole = PROCESS_ROLE;
+    error.ownerEpoch = fence.epoch;
+    error.leaseExpiresAt = leaseExpiresAt;
+    failPersistenceOwner(error);
+    throw persistenceOwnerFailure;
+  }
+}
+
+// Once per process, and only from the world owner (or a standalone process),
+// so a clustered boot says it once rather than once per owner role.
+let freePageUsageChecked = false;
+function warnOnceWhenMostlyFreePages() {
+  if (
+    freePageUsageChecked ||
+    (
+      PROCESS_ROLE !== persistenceRoles.ROLE.WORLD &&
+      PROCESS_ROLE !== persistenceRoles.ROLE.STANDALONE
+    )
+  ) {
+    return;
+  }
+  freePageUsageChecked = true;
+  let warning;
+  try {
+    warning = sqliteStore.freeSpaceWarning(sqliteStore.readPageUsage());
+  } catch (error) {
+    dbWarn(`could not read gamestore.sqlite page usage: ${error.message}`);
+    return;
+  }
+  if (warning) {
+    dbWarn(warning);
+  }
+}
+
+function openSqliteForProcessRole() {
+  const readOnly = !OWNS_PERSISTENCE;
+  if (
+    SQLITE_TABLES.size > 0 &&
+    (
+      sqliteStore.getDatabasePath() !== SQLITE_DB_PATH ||
+      sqliteStore.isReadOnly() !== readOnly
+    )
+  ) {
+    sqliteStore.init(SQLITE_DB_PATH, { readOnly });
+    sqliteRecoveryRequired = !readOnly;
+    if (!readOnly) {
+      warnOnceWhenMostlyFreePages();
+    }
+  }
+  if (!OWNS_PERSISTENCE) {
+    // Passive readers may load durable rows, but never acquire a journal lease
+    // and never recover or acknowledge another process's outbox.
+    sqliteRecoveryRequired = false;
+    return null;
+  }
+  return sqliteStore.getDatabasePath();
+}
+
+function recoverPersistenceOwnerOperations() {
   if (SQLITE_TABLES.size > 0 && sqliteRecoveryRequired) {
-    // Clear the recursion guard before a recovery callback rebuilds a baseline
-    // from this same connection. On initial module load there cannot yet be an
-    // in-memory flight, so direct recovery is correct; after callback wiring,
-    // route reopen recovery through the controller so its exact table leases and
-    // the index's in-flight baseline are released together.
+    if (!persistenceCallbacksReady) {
+      throw new Error(
+        "persistence recovery requested before callbacks were installed",
+      );
+    }
+    // Clear the recursion guard before the callback rebuilds a baseline from
+    // this same connection. All recovery now routes through the controller: it
+    // applies only this role's rows, invokes the exact callback, and only then
+    // acknowledges/deletes them.
     sqliteRecoveryRequired = false;
     let recovered;
     try {
-      recovered = persistenceCallbacksReady
-        ? persistenceWorker.recover(SQLITE_DB_PATH)
-        : sqliteStore.recoverPersistenceOperations();
+      recovered = persistenceWorker.recover(SQLITE_DB_PATH);
     } catch (error) {
-      // The controller retains any already-committed recovery batch when its
-      // baseline callback fails, so the next readiness check can safely retry
-      // exact callback delivery even though SQLite has no remaining outbox row.
+      // Applied rows remain journaled until callback acceptance, so the next
+      // readiness check can retry the exact batch without process-local state.
       sqliteRecoveryRequired = true;
       throw error;
     }
@@ -339,8 +693,33 @@ function ensureSqliteReady() {
   }
 }
 
-if (SQLITE_TABLES.size > 0) {
-  ensureSqliteReady();
+/**
+ * Explicitly acquire this process's durable persistence lease without loading
+ * or seeding any application table. Offline maintenance tools call this before
+ * taking a backup so exclusivity is proven before their first mutable action.
+ * Recovery remains opt-in because the durable outbox itself belongs in that
+ * pre-mutation backup.
+ */
+function acquirePersistenceOwnerLease(options = {}) {
+  if (!OWNS_PERSISTENCE) {
+    throw persistenceOwnerError(
+      `gameStore reader ${PROCESS_ROLE} cannot acquire a persistence owner lease`,
+      "PERSISTENCE_OWNER_FENCE_REQUIRED",
+    );
+  }
+  openSqliteForProcessRole();
+  const fence = acquirePersistenceOwner({ validateDurable: true });
+  if (options && options.recover === true) {
+    recoverPersistenceOwnerOperations();
+  }
+  return { ...fence };
+}
+
+function ensureSqliteReady() {
+  openSqliteForProcessRole();
+  if (!OWNS_PERSISTENCE) return;
+  acquirePersistenceOwner();
+  recoverPersistenceOwnerOperations();
 }
 
 function isSqliteTable(table) {
@@ -351,9 +730,12 @@ function isSqliteTable(table) {
 // ── Cache state ─────────────────────────────────────────────────────
 const cache = {};            // table name → parsed JS object
 const dirty = new Set();     // tables that need flushing
-const tableMutationRevisions = Object.create(null);
+const tableMutationRevisions = new Map();
+const manualFlushTables = new Set();
+const tableFlushPrerequisites = new Map();
+const activeTableFlushPrerequisites = new Set();
+const suspendedTableFlushes = new Map();
 const flushTimers = {};      // table name → pending setTimeout id
-const suspendedTableFlushes = new Map(); // table name → fail-closed reason
 const transientPaths = {};   // table name → Set of cache paths excluded from disk flush
 const flushBaselines = {};   // sqlite table → Map(key → last-persisted JSON string)
 const inFlightFlushes = new Map(); // sqlite table → exact unacknowledged operation
@@ -388,16 +770,51 @@ function timestamp() {
   return pc.dim(new Date().toISOString().slice(11, 19));
 }
 
+// gameStore diagnostics go to BOTH lanes.
+//
+// The console keeps its coloured " DB  " tag — that is what the operator reads
+// live. The same record is additionally appended to the server log (logs/server.log in the data root) in
+// plain text, because until 2026-08-08 the entire persistence layer (including
+// write failures and data-loss warnings) existed on the console ONLY: nothing
+// dbLog/dbWarn/dbErr ever emitted was reachable by log tailing, by ErrorWatch,
+// or by a post-mortem grep of server/logs.
+//
+// No lazy require is needed: `log` is already imported at the top of this
+// module and the logger depends only on config + rotatingLog (fs/path), never
+// on gameStore, so there is no cycle in either direction.
+//
+// The `[GameStore]` prefix is the bracketed tag ErrorWatch's signature
+// normaliser keys on (tools/ErrorWatch/watch.js signatureOf), and the levels
+// match its WATCHED_LEVELS: dbErr => ERR, dbWarn => WRN, dbLog => LOG.
+const ANSI_STYLE_CODES = new RegExp("\\u001B\\[[0-9;]*m", "g");
+
+function plainDbRecord(message) {
+  const text =
+    message instanceof Error
+      ? message.stack || message.message
+      : String(message);
+  // Callers colour some messages inline (pc.cyan(table), pc.green("flushed")).
+  // Colour belongs on the console lane only; the file lane gets plain text.
+  return `[GameStore] role=${PROCESS_ROLE} pid=${process.pid} ` +
+    text.replace(ANSI_STYLE_CODES, "");
+}
+
 function dbLog(message) {
-  console.log(`${timestamp()} ${dbTag()} ${message}`);
+  log.flushStack();
+  log.print(`${timestamp()} ${dbTag()} ${message}`);
+  log.writeServerLog("LOG", plainDbRecord(message));
 }
 
 function dbWarn(message) {
-  console.log(`${timestamp()} ${dbTag()} ${pc.yellow(message)}`);
+  log.flushStack();
+  log.print(`${timestamp()} ${dbTag()} ${pc.yellow(message)}`);
+  log.writeServerLog("WRN", plainDbRecord(message));
 }
 
 function dbErr(message) {
-  console.error(`${timestamp()} ${dbTag()} ${pc.red(message)}`);
+  log.flushStack();
+  log.printError(`${timestamp()} ${dbTag()} ${pc.red(message)}`);
+  log.writeServerLog("ERR", plainDbRecord(message));
 }
 
 function dataFilePath(table) {
@@ -406,10 +823,6 @@ function dataFilePath(table) {
 
 function backupFilePath(table) {
   return `${dataFilePath(table)}.bak`;
-}
-
-function tempFilePath(filePath) {
-  return `${filePath}.tmp-${process.pid}`;
 }
 
 function isSameValue(left, right) {
@@ -435,30 +848,84 @@ function getTransientPathSet(table) {
   return transientPaths[table];
 }
 
-function clearTransientPathsForPrefix(table, pathKey) {
-  const normalizedPath = normalizeTransientPath(pathKey);
+function clearTransientPathsForPrefixes(table, pathKeys) {
+  const normalizedPaths = new Set(
+    (Array.isArray(pathKeys) ? pathKeys : [pathKeys])
+      .map(normalizeTransientPath),
+  );
   const pathSet = transientPaths[table];
-  if (!pathSet || pathSet.size === 0) {
+  if (!pathSet || pathSet.size === 0 || normalizedPaths.size === 0) {
+    return;
+  }
+
+  if (normalizedPaths.has("/")) {
+    pathSet.clear();
     return;
   }
 
   for (const candidatePath of [...pathSet]) {
-    if (
-      candidatePath === normalizedPath ||
-      candidatePath.startsWith(`${normalizedPath}/`)
-    ) {
-      pathSet.delete(candidatePath);
+    // A transient marker is cleared when any of its path ancestors is in the
+    // removal set. Walking the candidate's usually-one-or-two ancestors keeps
+    // a 5,000-row bulk cleanup O(markers * path depth), instead of rescanning
+    // and copying the whole marker set once per removed row.
+    let candidateAncestor = candidatePath;
+    while (candidateAncestor && candidateAncestor !== "/") {
+      if (normalizedPaths.has(candidateAncestor)) {
+        pathSet.delete(candidatePath);
+        break;
+      }
+      const separatorIndex = candidateAncestor.lastIndexOf("/");
+      candidateAncestor = separatorIndex > 0
+        ? candidateAncestor.slice(0, separatorIndex)
+        : "/";
     }
   }
 }
 
 function setTransientPath(table, pathKey, enabled = true) {
+  setTransientPaths(table, [pathKey], enabled);
+}
+
+function isTransientPath(table, pathKey) {
   const normalizedPath = normalizeTransientPath(pathKey);
+  const pathSet = transientPaths[table];
+  if (!pathSet || pathSet.size === 0) {
+    return false;
+  }
+  for (const transientPath of pathSet) {
+    if (
+      transientPath === "/" ||
+      normalizedPath === transientPath ||
+      normalizedPath.startsWith(`${transientPath}/`)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function setTransientPaths(table, pathKeys, enabled = true) {
+  const passiveReaderMarker =
+    PROCESS_ROLE === persistenceRoles.ROLE.READER && enabled === true;
+  if (!passiveReaderMarker) {
+    persistenceRoles.assertRoleMayMutateTable(
+      PROCESS_ROLE,
+      table,
+      enabled ? "mark transient paths for" : "clear transient paths for",
+    );
+    assertPersistenceOwnerHealthy();
+  }
+  const normalizedPaths = [...new Set(
+    (Array.isArray(pathKeys) ? pathKeys : [pathKeys])
+      .map(normalizeTransientPath),
+  )];
   const pathSet = getTransientPathSet(table);
   if (enabled) {
-    pathSet.add(normalizedPath);
+    for (const normalizedPath of normalizedPaths) {
+      pathSet.add(normalizedPath);
+    }
   } else {
-    clearTransientPathsForPrefix(table, normalizedPath);
+    clearTransientPathsForPrefixes(table, normalizedPaths);
   }
 }
 
@@ -508,24 +975,48 @@ function buildFlushSnapshot(table) {
 
 function ensureDataFile(filePath) {
   if (!fs.existsSync(filePath)) {
-    fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    fs.writeFileSync(filePath, JSON.stringify({}, null, 2));
+    safeWriteFileSync(filePath, JSON.stringify({}, null, 2));
   }
 }
 
 function safeWriteFileSync(filePath, contents) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const temporaryPath = tempFilePath(filePath);
-  fs.writeFileSync(temporaryPath, contents, "utf8");
-  if (fs.existsSync(filePath)) {
+  let backupStage = null;
+  let dataStage = null;
+  try {
+    // Acquire before preparing any owner publication, then revalidate the
+    // exact durable fence after the comparatively expensive write + fsync.
+    ensureSqliteReady();
+    const ownerFence = requirePersistenceOwnerFence();
+    if (fs.existsSync(filePath)) {
+      try {
+        backupStage = stageFileCopyAtomicSync(filePath, `${filePath}.bak`);
+      } catch (error) {
+        dbWarn(`backup copy failed for ${path.basename(filePath)}: ${error.message}`);
+      }
+    }
+    dataStage = stageFileAtomicSync(filePath, contents);
+    sqliteStore.withPersistenceOwnerPublicationSync(ownerFence, () => {
+      if (backupStage) backupStage.publish();
+      dataStage.publish();
+    });
+  } catch (error) {
+    if (error && error.code === "PERSISTENCE_OWNER_STALE") {
+      failPersistenceOwner(error);
+      throw persistenceOwnerFailure;
+    }
+    throw error;
+  } finally {
     try {
-      fs.copyFileSync(filePath, `${filePath}.bak`);
-    } catch (error) {
-      dbWarn(`backup copy failed for ${path.basename(filePath)}: ${error.message}`);
+      if (backupStage) backupStage.discard();
+    } catch (_) {
+      // ignored: removing a staged backup file is cleanup; the write's outcome is already decided
+    }
+    try {
+      if (dataStage) dataStage.discard();
+    } catch (_) {
+      // ignored: removing a staged data file is cleanup; the write's outcome is already decided
     }
   }
-  fs.copyFileSync(temporaryPath, filePath);
-  fs.unlinkSync(temporaryPath);
 }
 
 function readParsedJsonFile(filePath) {
@@ -569,6 +1060,7 @@ function getRecoveryCandidates(table) {
         try {
           return fs.statSync(right).mtimeMs - fs.statSync(left).mtimeMs;
         } catch (error) {
+          // ignored: a temp file that vanished during the sort keeps its place (0)
           return 0;
         }
       });
@@ -592,6 +1084,37 @@ function tryRecoverTableFile(table) {
   return null;
 }
 
+function passiveJsonReadError(table, kind, cause = null) {
+  const filePath = dataFilePath(table);
+  const missing = kind === "missing";
+  const error = new Error(
+    `gameStore role ${PROCESS_ROLE} cannot load ${table}: ${filePath} ` +
+      `${missing ? "does not exist" : "is not valid JSON"}; passive readers do not repair or publish store files`,
+    cause ? { cause } : undefined,
+  );
+  error.code = missing
+    ? "GAMESTORE_READER_JSON_MISSING"
+    : "GAMESTORE_READER_JSON_INVALID";
+  error.processRole = PROCESS_ROLE;
+  error.table = table;
+  error.filePath = filePath;
+  return error;
+}
+
+function roleMayPublishTable(table) {
+  return persistenceRoles.roleMayMutateTable(PROCESS_ROLE, table);
+}
+
+// Whether this process's role is allowed to create or write `table`.
+//
+// Read paths that bootstrap durable state on demand -- seeding a table, writing
+// back a normalised payload -- ask this first so a passive process can skip the
+// part it may not persist and still hand back the derived value, instead of
+// throwing GAMESTORE_PROCESS_OWNERSHIP_VIOLATION out of a getter.
+function mayMutateTable(table) {
+  return roleMayPublishTable(table);
+}
+
 // ── Cache loading ───────────────────────────────────────────────────
 
 // If a legacy data.json with content exists for a not-yet-migrated table, hand
@@ -610,19 +1133,23 @@ function readLegacyJsonSeed(table) {
 
 function loadSqliteTable(table) {
   ensureSqliteReady();
-  // First load only: seed from the legacy data.json (if any), then record the
-  // migration so future loads read SQLite alone and deletions stay deleted.
-  if (!sqliteStore.isMigrated(table)) {
+  const maySeed = OWNS_PERSISTENCE &&
+    persistenceRoles.roleMayMutateTable(PROCESS_ROLE, table);
+  // Only the table's durable owner may perform first-load JSON seeding. Reader
+  // and sibling-owner processes SELECT an existing baseline without creating a
+  // table or touching _migrations.
+  if (maySeed && !sqliteStore.isMigrated(table)) {
+    const ownerFence = requirePersistenceOwnerFence();
     const seed = readLegacyJsonSeed(table);
     if (seed && Object.keys(seed).length > 0) {
-      sqliteStore.replaceAll(table, seed);
+      sqliteStore.replaceAll(table, seed, ownerFence);
     }
-    sqliteStore.markMigrated(table);
+    sqliteStore.markMigrated(table, ownerFence);
   }
   // Build the cache (assembled) and the flush baseline (one entry per stored
   // row) from the raw rows, so the baseline keys line up with what
   // flushSqliteTable diffs — including per-entity rows for wrapper tables.
-  const rawRows = sqliteStore.loadRows(table);
+  const rawRows = sqliteStore.loadExistingRows(table);
   const parsedRows = {};
   const baseline = new Map();
   let bytes = 0;
@@ -643,6 +1170,21 @@ function loadTable(table) {
     return loadSqliteTable(table);
   }
   const filePath = dataFilePath(table);
+  if (!roleMayPublishTable(table)) {
+    if (!fs.existsSync(filePath)) {
+      throw passiveJsonReadError(table, "missing");
+    }
+    const parsed = readParsedJsonFile(filePath);
+    if (!parsed.success) {
+      throw passiveJsonReadError(table, "invalid", parsed.error);
+    }
+    cache[table] = parsed.data;
+    return Buffer.byteLength(parsed.raw, "utf8");
+  }
+  // An owner must prove its durable lease before observing, caching, creating,
+  // or repairing JSON state. This prevents a contender from constructing a
+  // stale mutable cache while another process owns the role.
+  ensureSqliteReady();
   ensureDataFile(filePath);
   const parsedMain = readParsedJsonFile(filePath);
   if (parsedMain.success) {
@@ -674,19 +1216,46 @@ function loadTable(table) {
  */
 function preloadAll() {
   if (preloaded) return;
-  preloaded = true;
 
   const totalStart = Date.now();
   // First run / fresh container: the data directory may not exist yet.
-  fs.mkdirSync(DATA_DIR, { recursive: true });
+  if (!fs.existsSync(DATA_DIR)) {
+    if (PROCESS_ROLE === persistenceRoles.ROLE.READER) {
+      const error = new Error(
+        `gameStore reader data directory does not exist: ${DATA_DIR}`,
+      );
+      error.code = "GAMESTORE_READER_DATA_DIR_MISSING";
+      error.filePath = DATA_DIR;
+      throw error;
+    }
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
   const entries = fs.readdirSync(DATA_DIR, { withFileTypes: true });
-  const tables = entries
-    .filter((e) => e.isDirectory() && fs.existsSync(dataFilePath(e.name)))
-    .map((e) => e.name);
+  const tableDirectories = entries
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name);
+  if (PROCESS_ROLE === persistenceRoles.ROLE.READER) {
+    const missingJson = tableDirectories.find((table) =>
+      !isSqliteTable(table) && !fs.existsSync(dataFilePath(table)));
+    if (missingJson) {
+      throw passiveJsonReadError(missingJson, "missing");
+    }
+  }
+  const tables = tableDirectories.filter((table) =>
+    fs.existsSync(dataFilePath(table)) &&
+    (
+      !isSqliteTable(table) ||
+      persistenceRoles.roleMayMutateTable(PROCESS_ROLE, table)
+    ));
 
-  // SQLite-backed tables may not have a data.json directory; ensure they load.
+  // SQLite-backed tables may not have a data.json directory. Automatically
+  // preload only this process's owned tables; foreign durable state remains
+  // available through an explicit strict readPersisted call.
   for (const sqliteTable of SQLITE_TABLES) {
-    if (!tables.includes(sqliteTable)) {
+    if (
+      persistenceRoles.roleMayMutateTable(PROCESS_ROLE, sqliteTable) &&
+      !tables.includes(sqliteTable)
+    ) {
       tables.push(sqliteTable);
     }
   }
@@ -697,8 +1266,10 @@ function preloadAll() {
   const timings = [];
 
   for (const table of tables) {
+    renewPersistenceOwnerLeaseAtBoundary();
     const t0 = Date.now();
     const bytes = loadTable(table);
+    renewPersistenceOwnerLeaseAtBoundary();
     const elapsed = Date.now() - t0;
     totalBytes += bytes;
     timings.push({ table, bytes, elapsed });
@@ -721,6 +1292,7 @@ function preloadAll() {
     `${pc.green("cache ready")} — ${tables.length} tables, ` +
     `${totalMB} MB loaded in ${pc.bold(totalElapsed + "ms")}`,
   );
+  preloaded = true;
 }
 
 // ── Debounced async flush ───────────────────────────────────────────
@@ -838,6 +1410,8 @@ function handlePersistenceWorkerRecovered(operations = []) {
 // the last-persisted baseline and upserting/deleting only the rows that
 // actually changed — no whole-table rewrite.
 function flushSqliteTable(table, options = {}) {
+  persistenceRoles.assertRoleMayMutateTable(PROCESS_ROLE, table, "flush");
+  assertPersistenceOwnerHealthy();
   ensureSqliteReady();
   if (
     persistenceWorker.isEnabled() &&
@@ -926,7 +1500,12 @@ function flushSqliteTable(table, options = {}) {
   // The journal INSERT is synchronous by design: the exact batch and its
   // AUTOINCREMENT identity must be durable before dirty tracking is released or
   // any asynchronous worker can observe the operation.
-  const operation = sqliteStore.enqueuePersistenceOperation(table, upserts, deletes);
+  const operation = sqliteStore.enqueuePersistenceOperation(
+    table,
+    upserts,
+    deletes,
+    requirePersistenceOwnerFence(),
+  );
   const useWorker = persistenceWorker.isEnabled() && options.sync !== true;
   inFlightFlushes.set(table, { ...operation, submittedToWorker: useWorker });
   fullDirty.delete(table);
@@ -951,6 +1530,7 @@ function flushSqliteTable(table, options = {}) {
       const reconciled = sqliteStore.reconcilePersistenceOperation(
         operation.operationId,
         table,
+        requirePersistenceOwnerFence(),
       );
       if (!reconciled) {
         throw new Error(
@@ -984,6 +1564,7 @@ function handlePersistenceWorkerError(table, error, failure) {
 persistenceWorker.onAcknowledged(handlePersistenceWorkerAcknowledged);
 persistenceWorker.onRecovered(handlePersistenceWorkerRecovered);
 persistenceWorker.onError(handlePersistenceWorkerError);
+persistenceWorker.onOwnerError(failPersistenceOwner);
 persistenceCallbacksReady = true;
 
 // Record which stored row a successful write/remove touched, for the flush fast
@@ -1026,20 +1607,51 @@ function markRowDirty(table, segments) {
   set.add(first); // flat / scalar top-level row
 }
 
-function scheduleFlush(table) {
-  dirty.add(table);
-
-  if (flushTimers[table]) {
-    clearTimeout(flushTimers[table]);
-    delete flushTimers[table];
+// A root write normally cannot prove which rows changed, so it correctly falls
+// back to a full diff. Owner modules that already have a complete mutation
+// change-set may provide exact paths and retain root-write cache semantics while
+// still localizing the durable rows. An empty/invalid hint is never trusted.
+function markRootWriteDirty(table, knownChangedPaths) {
+  if (!Array.isArray(knownChangedPaths) || knownChangedPaths.length === 0) {
+    markRowDirty(table, []);
+    return;
   }
 
-  if (suspendedTableFlushes.has(table)) return;
-  if (manualFlushTables.has(table)) return;
+  for (const pathKey of knownChangedPaths) {
+    if (typeof pathKey !== "string" || !pathKey.startsWith("/")) {
+      markRowDirty(table, []);
+      return;
+    }
+    const segments = getSegments(pathKey);
+    if (segments.length === 0) {
+      markRowDirty(table, []);
+      return;
+    }
+    markRowDirty(table, segments);
+    if (fullDirty.has(table)) {
+      return;
+    }
+  }
+}
 
-  flushTimers[table] = setTimeout(() => {
-    flushTable(table);
-  }, FLUSH_DELAY_MS);
+function getTableMutationRevision(table) {
+  const normalizedTable = String(table || "").trim();
+  return normalizedTable
+    ? Math.max(0, Number(tableMutationRevisions.get(normalizedTable)) || 0)
+    : 0;
+}
+
+function bumpTableMutationRevision(table) {
+  const normalizedTable = String(table || "").trim();
+  if (!normalizedTable) return 0;
+  const nextRevision = getTableMutationRevision(normalizedTable) + 1;
+  tableMutationRevisions.set(normalizedTable, nextRevision);
+  return nextRevision;
+}
+
+function assertTablePersistencePolicyCanChange(table, operation) {
+  persistenceRoles.assertRoleMayMutateTable(PROCESS_ROLE, table, operation);
+  assertPersistenceOwnerHealthy();
 }
 
 function setTableAutoFlush(table, enabled = true) {
@@ -1047,6 +1659,7 @@ function setTableAutoFlush(table, enabled = true) {
   if (!normalizedTable) {
     return { success: false, errorMsg: "TABLE_REQUIRED" };
   }
+  assertTablePersistencePolicyCanChange(normalizedTable, "change auto-flush policy for");
   if (enabled === false) {
     manualFlushTables.add(normalizedTable);
     if (flushTimers[normalizedTable]) {
@@ -1068,6 +1681,7 @@ function registerTableFlushPrerequisite(table, key, callback) {
   if (!normalizedTable || !normalizedKey || typeof callback !== "function") {
     return { success: false, errorMsg: "FLUSH_PREREQUISITE_INVALID" };
   }
+  assertTablePersistencePolicyCanChange(normalizedTable, "register flush prerequisite for");
   let prerequisites = tableFlushPrerequisites.get(normalizedTable);
   if (!prerequisites) {
     prerequisites = new Map();
@@ -1080,12 +1694,16 @@ function registerTableFlushPrerequisite(table, key, callback) {
 function unregisterTableFlushPrerequisite(table, key) {
   const normalizedTable = String(table || "").trim();
   const normalizedKey = String(key || "").trim();
+  if (!normalizedTable || !normalizedKey) {
+    return { success: false, errorMsg: "FLUSH_PREREQUISITE_INVALID" };
+  }
+  assertTablePersistencePolicyCanChange(normalizedTable, "unregister flush prerequisite for");
   const prerequisites = tableFlushPrerequisites.get(normalizedTable);
-  const removed = Boolean(prerequisites && prerequisites.delete(normalizedKey));
+  const removed = prerequisites ? prerequisites.delete(normalizedKey) : false;
   if (prerequisites && prerequisites.size === 0) {
     tableFlushPrerequisites.delete(normalizedTable);
   }
-  return { success: true, removed };
+  return { success: true, removed, key: normalizedKey };
 }
 
 function runTableFlushPrerequisites(table) {
@@ -1132,8 +1750,54 @@ function runTableFlushPrerequisites(table) {
   }
 }
 
-function flushTable(table, options = {}) {
-  if (suspendedTableFlushes.has(table) && options.force !== true) {
+function suspendTableFlush(table, reason = "PERSISTENCE_SUSPENDED") {
+  const normalizedTable = String(table || "").trim();
+  if (!normalizedTable) {
+    return { success: false, errorMsg: "TABLE_REQUIRED" };
+  }
+  assertTablePersistencePolicyCanChange(normalizedTable, "suspend flushes for");
+  if (flushTimers[normalizedTable]) {
+    clearTimeout(flushTimers[normalizedTable]);
+    delete flushTimers[normalizedTable];
+  }
+  suspendedTableFlushes.set(
+    normalizedTable,
+    String(reason || "PERSISTENCE_SUSPENDED"),
+  );
+  return {
+    success: true,
+    suspended: true,
+    reason: suspendedTableFlushes.get(normalizedTable),
+  };
+}
+
+function resumeTableFlush(table) {
+  const normalizedTable = String(table || "").trim();
+  if (!normalizedTable) {
+    return { success: false, errorMsg: "TABLE_REQUIRED" };
+  }
+  assertTablePersistencePolicyCanChange(normalizedTable, "resume flushes for");
+  suspendedTableFlushes.delete(normalizedTable);
+  if (dirty.has(normalizedTable)) scheduleFlush(normalizedTable);
+  return { success: true, suspended: false };
+}
+
+function scheduleFlush(table) {
+  dirty.add(table);
+
+  if (manualFlushTables.has(table) || suspendedTableFlushes.has(table) || shutdownInProgress) return;
+
+  if (flushTimers[table]) {
+    clearTimeout(flushTimers[table]);
+  }
+
+  flushTimers[table] = setTimeout(() => {
+    flushTable(table);
+  }, FLUSH_DELAY_MS);
+}
+
+function flushTable(table) {
+  if (suspendedTableFlushes.has(table)) {
     return {
       success: false,
       errorMsg: "FLUSH_SUSPENDED",
@@ -1153,19 +1817,24 @@ function flushTable(table, options = {}) {
       rows: 0,
     };
   }
-  delete flushTimers[table];
-  const prerequisiteResult = runTableFlushPrerequisites(table);
-  if (!prerequisiteResult.success) {
-    return {
-      ...prerequisiteResult,
-      flushed: false,
-      handedOff: false,
-      pendingDirty: true,
-    };
+  if (flushTimers[table]) {
+    clearTimeout(flushTimers[table]);
   }
-  dirty.delete(table);
+  delete flushTimers[table];
 
   try {
+    persistenceRoles.assertRoleMayMutateTable(PROCESS_ROLE, table, "flush");
+    assertPersistenceOwnerHealthy();
+    const prerequisiteResult = runTableFlushPrerequisites(table);
+    if (!prerequisiteResult.success) {
+      return {
+        ...prerequisiteResult,
+        flushed: false,
+        handedOff: false,
+        pendingDirty: true,
+      };
+    }
+    dirty.delete(table);
     if (isSqliteTable(table)) {
       const wasInFlight = inFlightFlushes.has(table);
       const rows = flushSqliteTable(table);
@@ -1183,48 +1852,23 @@ function flushTable(table, options = {}) {
     const data = buildFlushSnapshot(table);
     const json = JSON.stringify(data, null, 2);
     safeWriteFileSync(dataFilePath(table), json);
-    return { success: true, errorMsg: null, flushed: true, handedOff: false, rows: 1 };
+    return {
+      success: true,
+      errorMsg: null,
+      flushed: true,
+      handedOff: false,
+      rows: 1,
+    };
   } catch (err) {
     dbErr(`flush FAILED for ${table}: ${err.message}`);
     dirty.add(table);
-    return { success: false, errorMsg: "FLUSH_ERROR", flushed: false, handedOff: false };
+    return {
+      success: false,
+      errorMsg: "FLUSH_ERROR",
+      flushed: false,
+      handedOff: false,
+    };
   }
-}
-
-// Force the current dirty batch into the SQLite persistence journal now,
-// without waiting for the ordinary quiet-period debounce. SQLite-backed
-// tables are then applied by the persistence worker; the journal insert made
-// by flushSqliteTable is synchronous, so a successful return is a durable
-// handoff even though the final table update remains asynchronous.
-function flushTableAsync(table) {
-  if (!ensureCached(table)) {
-    log.warn(`[DATABASE] database table: '${table}' not found!`);
-    return { success: false, errorMsg: "TABLE_NOT_FOUND", flushed: false, handedOff: false };
-  }
-  if (flushTimers[table]) {
-    clearTimeout(flushTimers[table]);
-    delete flushTimers[table];
-  }
-  return flushTable(table);
-}
-
-// A domain that detects an uncertain multi-row mutation can quarantine its
-// table before the event loop reaches the debounce timer. The last known-good
-// durable image is then preserved across an orderly shutdown as well as a
-// crash. Only a successful domain audit should resume persistence.
-function suspendTableFlush(table, reason = "PERSISTENCE_SUSPENDED") {
-  if (flushTimers[table]) {
-    clearTimeout(flushTimers[table]);
-    delete flushTimers[table];
-  }
-  suspendedTableFlushes.set(table, String(reason || "PERSISTENCE_SUSPENDED"));
-  return { success: true, suspended: true, reason: suspendedTableFlushes.get(table) };
-}
-
-function resumeTableFlush(table) {
-  suspendedTableFlushes.delete(table);
-  if (dirty.has(table)) scheduleFlush(table);
-  return { success: true, suspended: false };
 }
 
 function reconcileInFlightFlush(table) {
@@ -1234,7 +1878,11 @@ function reconcileInFlightFlush(table) {
   }
   const reconciled = inFlight.submittedToWorker
     ? persistenceWorker.reconcileWrite(SQLITE_DB_PATH, inFlight.operationId)
-    : sqliteStore.reconcilePersistenceOperation(inFlight.operationId, table);
+    : sqliteStore.reconcilePersistenceOperation(
+      inFlight.operationId,
+      table,
+      requirePersistenceOwnerFence(),
+    );
   // The controller normally invokes the acknowledgment callback itself. Keep
   // this fallback explicit for injected controllers used by focused tests.
   if (inFlightFlushes.get(table) === inFlight) {
@@ -1250,12 +1898,14 @@ function reconcileInFlightFlush(table) {
 }
 
 function flushTableSync(table, options = {}) {
+  persistenceRoles.assertRoleMayMutateTable(PROCESS_ROLE, table, "flush");
+  assertPersistenceOwnerHealthy();
   if (!ensureCached(table)) {
     log.warn(`[DATABASE] database table: '${table}' not found!`);
     return { success: false, errorMsg: "TABLE_NOT_FOUND" };
   }
 
-  if (suspendedTableFlushes.has(table) && options.force !== true) {
+  if (suspendedTableFlushes.has(table) && Reflect.get(options, "force") !== true) {
     return {
       success: false,
       errorMsg: "FLUSH_SUSPENDED",
@@ -1312,6 +1962,13 @@ function flushTableSync(table, options = {}) {
 }
 
 function flushTablesSync(tables = []) {
+  if (PROCESS_ROLE === persistenceRoles.ROLE.READER) {
+    persistenceRoles.assertRoleMayMutateTable(
+      PROCESS_ROLE,
+      "__all_tables__",
+      "flush",
+    );
+  }
   const uniqueTables = [...new Set(
     (Array.isArray(tables) ? tables : [tables]).filter((table) => Boolean(table)),
   )];
@@ -1319,7 +1976,9 @@ function flushTablesSync(tables = []) {
   let success = true;
 
   for (const table of uniqueTables) {
+    renewPersistenceOwnerLeaseAtBoundary();
     const result = flushTableSync(table);
+    renewPersistenceOwnerLeaseAtBoundary();
     results.push({ table, ...result });
     if (!result.success) {
       success = false;
@@ -1337,6 +1996,13 @@ function flushTablesSync(tables = []) {
  * nothing is lost when the process exits.
  */
 function flushAllSync() {
+  if (PROCESS_ROLE === persistenceRoles.ROLE.READER) {
+    persistenceRoles.assertRoleMayMutateTable(
+      PROCESS_ROLE,
+      "__all_tables__",
+      "flush",
+    );
+  }
   const dirtyTables = [...new Set([...dirty, ...inFlightFlushes.keys()])];
   const results = [];
   if (dirtyTables.length === 0) {
@@ -1347,7 +2013,20 @@ function flushAllSync() {
 
   let success = true;
   for (const table of dirtyTables) {
-    const result = flushTableSync(table, { log: true });
+    let result;
+    try {
+      renewPersistenceOwnerLeaseAtBoundary();
+      result = flushTableSync(table, { log: true });
+      renewPersistenceOwnerLeaseAtBoundary();
+    } catch (error) {
+      dbErr(`shutdown flush FAILED for ${table}: ${error.message}`);
+      dirty.add(table);
+      result = {
+        success: false,
+        errorMsg: error.code || "FLUSH_ERROR",
+        flushed: false,
+      };
+    }
     results.push({ table, ...result });
     if (!result.success) {
       success = false;
@@ -1358,7 +2037,7 @@ function flushAllSync() {
   if (success) {
     dbLog(pc.green("shutdown flush complete"));
   } else {
-    dbErr("shutdown flush incomplete; one or more dirty tables remain");
+    dbErr("shutdown flush incomplete — unresolved durable state remains");
   }
   return { success, results };
 }
@@ -1366,62 +2045,165 @@ function flushAllSync() {
 // ── Graceful shutdown ───────────────────────────────────────────────
 
 let shutdownInProgress = false;
+let signalShutdownPromise = null;
+let shutdownFlushResult = null;
+let gameStoreShutdownPromise = null;
+const shutdownHooks = new Map();
+const SHUTDOWN_HOOK_TIMEOUT_MS = 10_000;
+
+function registerShutdownHook(name, handler) {
+  const normalizedName = String(name || "").trim();
+  if (!normalizedName || typeof handler !== "function") {
+    throw new TypeError("shutdown hooks require a name and function");
+  }
+  if (shutdownHooks.has(normalizedName)) {
+    throw new Error(`shutdown hook already registered: ${normalizedName}`);
+  }
+  shutdownHooks.set(normalizedName, handler);
+  return () => shutdownHooks.delete(normalizedName);
+}
+
+async function runShutdownHooks(signal) {
+  const results = [];
+  let success = true;
+  for (const [name, handler] of shutdownHooks.entries()) {
+    let timeoutHandle = null;
+    try {
+      await Promise.race([
+        Promise.resolve().then(() => handler(signal)),
+        new Promise((_, reject) => {
+          timeoutHandle = setTimeout(() => {
+            reject(new Error(`timed out after ${SHUTDOWN_HOOK_TIMEOUT_MS}ms`));
+          }, SHUTDOWN_HOOK_TIMEOUT_MS);
+        }),
+      ]);
+      results.push({ name, success: true, error: null });
+    } catch (error) {
+      dbWarn(`shutdown hook ${name} failed: ${error.message}`);
+      success = false;
+      results.push({ name, success: false, error: error.message });
+    } finally {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+    }
+  }
+  return { success, results };
+}
 
 function flushDirtyTablesForShutdown(reason) {
   if (shutdownInProgress) {
-    return { success: false, errorMsg: "SHUTDOWN_FLUSH_ALREADY_RUNNING" };
+    return shutdownFlushResult || { success: false, results: [] };
   }
   shutdownInProgress = true;
-  try {
-    dbLog(`received ${reason}, flushing cache to disk...`);
-    return flushAllSync();
-  } finally {
-    // A rejected prerequisite is intentionally retryable. In particular, the
-    // exit hook gets one last synchronous chance after a signal-path failure.
-    shutdownInProgress = false;
-  }
+  dbLog(`received ${reason}, flushing cache to disk...`);
+  shutdownFlushResult = flushAllSync();
+  return shutdownFlushResult;
 }
 
-function onShutdownSignal(signal, exitCode = 0) {
-  if (process[TEST_STORE_CLEANUP_SYMBOL] === true) {
-    process.exitCode = exitCode;
-    return;
-  }
-  const flushResult = flushDirtyTablesForShutdown(signal);
-  const finalExitCode = flushResult && flushResult.success === true
-    ? exitCode
-    : Math.max(1, Number(exitCode) || 0);
-  process.exit(finalExitCode);
+function persistenceWorkerShutdownSucceeded(result) {
+  return Boolean(
+    result &&
+    !result.error &&
+    (!Array.isArray(result.errors) || result.errors.length === 0) &&
+    (!Array.isArray(result.writeErrors) || result.writeErrors.length === 0) &&
+    (result.active !== true || result.terminated === true),
+  );
 }
 
-for (const signal of ["SIGINT", "SIGTERM", "SIGBREAK", "SIGHUP"]) {
-  try {
-    process.on(signal, () => onShutdownSignal(signal));
-  } catch (error) {
-    dbWarn(`failed to register ${signal} shutdown handler: ${error.message}`);
+function shutdown(reason = "shutdown") {
+  if (gameStoreShutdownPromise) return gameStoreShutdownPromise;
+  if (!OWNS_PERSISTENCE) {
+    shutdownInProgress = true;
+    const flush = { success: true, results: [], passive: true };
+    gameStoreShutdownPromise = Promise.resolve({
+      success: true,
+      code: null,
+      errorMsg: null,
+      flush,
+      results: flush.results,
+      worker: null,
+      released: false,
+      passive: true,
+      reason,
+    });
+    return gameStoreShutdownPromise;
   }
+  gameStoreShutdownPromise = (async () => {
+    const flush = flushDirtyTablesForShutdown(reason);
+    let worker = null;
+    let released = false;
+    let error = null;
+
+    try {
+      worker = await persistenceWorker.shutdown();
+      if (!persistenceWorkerShutdownSucceeded(worker)) {
+        throw persistenceOwnerError(
+          worker && worker.error || "persistence worker shutdown failed",
+          "PERSISTENCE_WORKER_SHUTDOWN_FAILED",
+        );
+      }
+      if (flush.success && persistenceWorker.getOwnerFence()) {
+        released = persistenceWorker.releaseOwner(SQLITE_DB_PATH);
+        if (!released) {
+          throw persistenceOwnerError(
+            "persistence owner release returned false",
+            "PERSISTENCE_OWNER_RELEASE_FAILED",
+          );
+        }
+        persistenceOwnerFence = null;
+        stopPersistenceOwnerRenewal();
+      }
+    } catch (shutdownError) {
+      error = persistenceOwnerError(
+        shutdownError,
+        "GAMESTORE_SHUTDOWN_FAILED",
+      );
+      dbErr(`shutdown finalization failed: ${error.message}`);
+    }
+
+    const success = Boolean(flush.success && !error);
+    return {
+      success,
+      code: success ? null : error && error.code || "GAMESTORE_SHUTDOWN_FAILED",
+      errorMsg: success ? null : error && error.message ||
+        "GameStore shutdown left unresolved durable state",
+      flush,
+      results: flush.results,
+      worker,
+      released,
+    };
+  })();
+  return gameStoreShutdownPromise;
 }
 
-process.on("beforeExit", () => {
-  if (process[TEST_STORE_CLEANUP_SYMBOL] === true) {
-    return;
+// Runs the registered shutdown hooks, then shuts the store down, for a process
+// stopping on a signal or a lost lease. It never touches the process: the
+// entry point that owns the process turns the result into an exit code
+// (ownerProcessShutdown.js). Repeated calls share the first run.
+function shutdownForSignal(signal) {
+  if (signalShutdownPromise) {
+    return signalShutdownPromise;
   }
-  if (dirty.size > 0 || inFlightFlushes.size > 0) {
-    const flushResult = flushDirtyTablesForShutdown("beforeExit");
-    if (!flushResult || flushResult.success !== true) process.exitCode = 1;
-  }
-});
+  signalShutdownPromise = (async () => {
+    dbLog(`received ${signal}, stopping registered runtimes...`);
+    const hooks = await runShutdownHooks(signal);
+    const store = await shutdown(signal);
+    return { success: Boolean(hooks.success && store.success), hooks, store };
+  })().catch((error) => {
+    dbWarn(`graceful shutdown failed: ${error.message}`);
+    flushDirtyTablesForShutdown(`${signal}-fallback`);
+    return { success: false, error };
+  });
+  return signalShutdownPromise;
+}
 
-process.on("exit", () => {
-  if (process[TEST_STORE_CLEANUP_SYMBOL] === true) {
-    return;
-  }
-  // Last-chance sync flush for any remaining dirty tables
-  if (dirty.size > 0 || inFlightFlushes.size > 0) {
-    const flushResult = flushDirtyTablesForShutdown("exit");
-    if (!flushResult || flushResult.success !== true) process.exitCode = 1;
-  }
-});
+// What an exiting process still owes the store: writes not yet on disk, and
+// whether it still holds the persistence owner lease.
+function getShutdownNeeds() {
+  return {
+    unflushedWrites: dirty.size > 0 || inFlightFlushes.size > 0,
+    holdsOwnerLease: Boolean(persistenceWorker.getOwnerFence()),
+  };
+}
 
 // ── Public API (unchanged signature) ────────────────────────────────
 
@@ -1444,7 +2226,9 @@ function tableExists(table) {
   if (table in cache || isSqliteTable(table)) {
     return true;
   }
-  return fs.existsSync(path.join(DATA_DIR, table));
+  return roleMayPublishTable(table)
+    ? fs.existsSync(path.join(DATA_DIR, table))
+    : fs.existsSync(dataFilePath(table));
 }
 
 // Bootstrap a runtime-owned table that may not have been created by the
@@ -1452,27 +2236,15 @@ function tableExists(table) {
 // creates the directory and an empty {} data file on demand, so subsequent
 // read/write calls resolve normally instead of failing with TABLE_NOT_FOUND.
 function ensureTable(table) {
+  persistenceRoles.assertRoleMayMutateTable(PROCESS_ROLE, table, "ensure");
+  assertPersistenceOwnerHealthy();
+  if (shutdownInProgress) {
+    throw new Error("gameStore shutdown is in progress");
+  }
   if (!(table in cache)) {
     loadTable(table);
   }
   return true;
-}
-
-function getTableMutationRevision(table) {
-  const normalizedTable = String(table || "").trim();
-  return normalizedTable
-    ? Math.max(0, Number(tableMutationRevisions[normalizedTable]) || 0)
-    : 0;
-}
-
-function bumpTableMutationRevision(table) {
-  const normalizedTable = String(table || "").trim();
-  if (!normalizedTable) {
-    return 0;
-  }
-  const nextRevision = getTableMutationRevision(normalizedTable) + 1;
-  tableMutationRevisions[normalizedTable] = nextRevision;
-  return nextRevision;
 }
 
 function read(table, pth) {
@@ -1508,7 +2280,58 @@ function read(table, pth) {
   }
 }
 
+// Read the current durable SQLite value without consulting or populating this
+// process's in-memory cache. Cross-process authorities use this only for
+// one-time compatibility seeding: a cached read would never observe an entity
+// created later by the owning process, while importing that owner's service
+// module here would also grant this process accidental write authority.
+function readPersisted(table, pth) {
+  if (!isSqliteTable(table)) {
+    return { success: false, errorMsg: "SQLITE_TABLE_REQUIRED", data: null };
+  }
+  try {
+    ensureSqliteReady();
+    const segments = getSegments(pth);
+    let current = sqliteStore.loadExistingTableObject(table);
+    for (const segment of segments) {
+      if (
+        current === null ||
+        typeof current !== "object" ||
+        !(segment in current)
+      ) {
+        return { success: false, errorMsg: "ENTRY_NOT_FOUND", data: null };
+      }
+      current = current[segment];
+    }
+    return {
+      success: true,
+      errorMsg: null,
+      data: current === undefined ? undefined : cloneForFlush(current),
+    };
+  } catch (error) {
+    log.error(`[DATABASE DURABLE READ ERROR] ${error.message}`);
+    return {
+      success: false,
+      errorMsg: error && error.code === "SQLITE_TABLE_NOT_FOUND"
+        ? error.code
+        : "READ_ERROR",
+      data: null,
+    };
+  }
+}
+
 function write(table, pth, data, options = {}) {
+  const passiveTransientWrite =
+    PROCESS_ROLE === persistenceRoles.ROLE.READER &&
+    options.transient === true &&
+    options.force !== true;
+  if (!passiveTransientWrite) {
+    persistenceRoles.assertRoleMayMutateTable(PROCESS_ROLE, table, "write");
+    assertPersistenceOwnerHealthy();
+  }
+  if (shutdownInProgress) {
+    throw new Error("gameStore shutdown is in progress");
+  }
   if (!ensureCached(table)) {
     log.warn(`[DATABASE] database table: '${table}' not found!`);
     return { success: false, errorMsg: "TABLE_NOT_FOUND" };
@@ -1520,9 +2343,7 @@ function write(table, pth, data, options = {}) {
     if (segments.length === 0) {
       // Full table overwrite
       const sameReference = cache[table] === data;
-      const unchanged = sameReference || options.force === true
-        ? false
-        : isSameValue(cache[table], data);
+      const unchanged = sameReference ? false : isSameValue(cache[table], data);
       if (options.transient === true) {
         setTransientPath(table, "/", true);
       }
@@ -1534,7 +2355,7 @@ function write(table, pth, data, options = {}) {
       }
       bumpTableMutationRevision(table);
       if (!(options.transient === true && options.force !== true)) {
-        markRowDirty(table, segments); // root write — marks the table fullDirty
+        markRootWriteDirty(table, options.knownChangedPaths);
         scheduleFlush(table);
       }
       return { success: true, errorMsg: null };
@@ -1557,17 +2378,15 @@ function write(table, pth, data, options = {}) {
       setTransientPath(table, pth, true);
     }
     const finalKey = segments[segments.length - 1];
-    if (
-      options.force !== true &&
-      Object.prototype.hasOwnProperty.call(current, finalKey) &&
-      isSameValue(current[finalKey], data)
-    ) {
+    if (Object.prototype.hasOwnProperty.call(current, finalKey) && isSameValue(current[finalKey], data)) {
       return { success: true, errorMsg: null };
     }
     current[finalKey] = data;
     bumpTableMutationRevision(table);
-    markRowDirty(table, segments);
-    scheduleFlush(table);
+    if (!(options.transient === true && options.force !== true)) {
+      markRowDirty(table, segments);
+      scheduleFlush(table);
+    }
 
     return { success: true, errorMsg: null };
   } catch (error) {
@@ -1577,6 +2396,11 @@ function write(table, pth, data, options = {}) {
 }
 
 function remove(table, pth) {
+  persistenceRoles.assertRoleMayMutateTable(PROCESS_ROLE, table, "remove from");
+  assertPersistenceOwnerHealthy();
+  if (shutdownInProgress) {
+    throw new Error("gameStore shutdown is in progress");
+  }
   if (!ensureCached(table)) {
     log.warn(`[DATABASE] database table: '${table}' not found!`);
     return { success: false, errorMsg: "TABLE_NOT_FOUND" };
@@ -1613,7 +2437,7 @@ function remove(table, pth) {
 
     delete current[finalKey];
     bumpTableMutationRevision(table);
-    clearTransientPathsForPrefix(table, pth);
+    clearTransientPathsForPrefixes(table, [pth]);
     markRowDirty(table, segments);
     scheduleFlush(table);
 
@@ -1626,28 +2450,57 @@ function remove(table, pth) {
 
 module.exports = {
   read,
+  readPersisted,
   write,
   remove,
   getTableMutationRevision,
+  setTableAutoFlush,
+  registerTableFlushPrerequisite,
+  unregisterTableFlushPrerequisite,
+  suspendTableFlush,
+  resumeTableFlush,
   tableExists,
   ensureTable,
+  mayMutateTable,
   setTransientPath,
+  setTransientPaths,
+  isTransientPath,
   preloadAll,
-  flushTableAsync,
+  // Requests the normal worker-backed flush immediately instead of waiting for
+  // the debounce. When no same-table operation is already in flight, the exact
+  // SQLite operation is journaled synchronously and the transaction remains
+  // off-thread when enabled.
+  flushTableAsync: flushTable,
   flushTableSync,
   flushTablesSync,
   flushAllSync,
-  registerTableFlushPrerequisite,
-  unregisterTableFlushPrerequisite,
-  setTableAutoFlush,
-  suspendTableFlush,
-  resumeTableFlush,
+  acquirePersistenceOwnerLease,
+  renewPersistenceOwnerLease: renewPersistenceOwnerLeaseNow,
+  shutdown,
+  flushDirtyTablesForShutdown,
+  shutdownForSignal,
+  getShutdownNeeds,
+  onPersistenceOwnerLost,
+  registerShutdownHook,
   // Internal hooks for migration tooling and tests.
   _dataDir: DATA_DIR,
   _sqliteDbPath: SQLITE_DB_PATH,
   _sqliteTables: SQLITE_TABLES,
   _closeSqliteForTests: sqliteStore.close,
+  // Runs the normal debounced (worker-bound) flush immediately. Lets a test put
+  // a properly tracked operation in flight without waiting out FLUSH_DELAY_MS or
+  // fabricating a raw persistenceWorker.submitWrite the store never registered.
+  _flushTableAsyncForTests: flushTable,
   _shutdownPersistenceWorkerForTests: persistenceWorker.shutdown,
+  _runShutdownHooksForTests: runShutdownHooks,
   _flushStatsForTests: flushStats,
   _dirtyRowTrackingEnabled: DIRTY_ROWS_TRACKING,
+  _isTableDirtyForTests: (table) => dirty.has(table),
+  _processRole: PROCESS_ROLE,
+  _persistenceOwnerInstance: PERSISTENCE_OWNER_INSTANCE,
+  _persistenceOwnerAcquireWaitMs: PERSISTENCE_OWNER_ACQUIRE_WAIT_MS,
+  _persistenceOwnerFenceForTests: () => (
+    persistenceWorker.getOwnerFence()
+  ),
+  _renewPersistenceOwnerForTests: renewPersistenceOwnerLeaseNow,
 };
